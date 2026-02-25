@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "src",
+    "test",
+    "index.ts",
+    "vitest.config.ts",
+    "*.ts",
+    "*.mts",
+    "*.cts",
+    "**/*.ts",
+    "**/*.mts",
+    "**/*.cts"
+  ],
+  "exclude": [
+    "dist",
+    "node_modules"
+  ]
+}

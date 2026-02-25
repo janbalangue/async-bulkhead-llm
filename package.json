@@ -1,0 +1,64 @@
+{
+  "name": "async-bulkhead-llm",
+  "version": "1.0.0",
+  "description": "Fail-fast admission control for LLM workloads built on async-bulkhead-ts.",
+  "license": "MIT",
+  "author": "",
+  "homepage": "https://github.com/your-org/async-bulkhead-llm",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/async-bulkhead-llm.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-org/async-bulkhead-llm/issues"
+  },
+  "keywords": [
+    "llm",
+    "concurrency",
+    "bulkhead",
+    "backpressure",
+    "admission-control",
+    "rate-limiting",
+    "load-shedding",
+    "token-budget"
+  ],
+  "type": "module",
+  "main": "./dist/cjs/index.cjs",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build:esm": "tsc -p tsconfig.esm.json",
+    "build:cjs": "tsc -p tsconfig.cjs.json && node rename-cjs.mjs",
+    "build:types": "tsc -p tsconfig.types.json",
+    "build": "npm run build:esm && npm run build:cjs && npm run build:types",
+    "lint": "eslint . --max-warnings=0",
+    "lint:fix": "eslint . --fix",
+    "test": "vitest",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "dependencies": {
+    "async-bulkhead-ts": "^0.2.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^25.3.0",
+    "eslint": "^10.0.2",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.56.1",
+    "vitest": "^4.0.18"
+  }
+}
