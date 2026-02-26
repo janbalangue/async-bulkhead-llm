@@ -4,13 +4,13 @@
   "description": "Fail-fast admission control for LLM workloads built on async-bulkhead-ts.",
   "license": "MIT",
   "author": "",
-  "homepage": "https://github.com/your-org/async-bulkhead-llm",
+  "homepage": "https://github.com/janbalangue/async-bulkhead-llm",
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-org/async-bulkhead-llm.git"
+    "url": "https://github.com/janbalangue/async-bulkhead-llm.git"
   },
   "bugs": {
-    "url": "https://github.com/your-org/async-bulkhead-llm/issues"
+    "url": "https://github.com/janbalangue/async-bulkhead-llm/issues"
   },
   "keywords": [
     "llm",
