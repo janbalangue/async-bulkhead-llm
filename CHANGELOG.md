@@ -7,6 +7,21 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.0.3] — 2026-02-26
+
+### Changed
+
+* Aligned package.json license field with the repository license (Apache-2.0)
+* No runtime, API, or type changes
+
+### Notes
+
+* Metadata-only correction
+* Fully compatible with 1.0.0–1.0.2
+* Safe upgrade
+
+---
+
 ## [1.0.2] — 2026-02-26
 
 ### Changed
