@@ -1,6 +1,6 @@
 # async-bulkhead-llm
 
-Fail-fast **admission control for LLM workloads**, built on [async-bulkhead-ts](https://github.com/your-org/async-bulkhead-ts).
+Fail-fast **admission control for LLM workloads**, built on [async-bulkhead-ts](https://github.com/janbalangue/async-bulkhead-ts).
 
 Designed for services that need to enforce **cost ceilings, concurrency limits, and backpressure** at the boundary of their LLM calls — before request fan-out, before hitting provider rate limits, before saturation cascades.
 
