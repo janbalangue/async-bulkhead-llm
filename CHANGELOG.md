@@ -7,6 +7,34 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.0.2] — 2026-02-26
+
+### Changed
+
+* Corrected GitHub URLs in `package.json` (homepage, repository, bugs) to point to the canonical repository
+* No runtime, API, or type changes
+
+### Notes
+
+* Packaging outputs (ESM, CJS, types) unchanged
+* Fully compatible with `1.0.0` and `1.0.1`
+* Safe upgrade — metadata-only correction
+
+---
+
+## [1.0.1] — 2026-02-26
+
+### Changed
+
+* Bumped `async-bulkhead-ts` to `^0.3.0`
+
+### Notes
+
+* No API changes
+* No functional behavior changes in `async-bulkhead-llm`
+
+---
+
 ## [1.0.0] — 2026-02-24
 
 ### Added
