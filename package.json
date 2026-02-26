@@ -1,6 +1,6 @@
 {
   "name": "async-bulkhead-llm",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Fail-fast admission control for LLM workloads built on async-bulkhead-ts.",
   "license": "MIT",
   "author": "",
@@ -51,7 +51,7 @@
     "prepublishOnly": "npm run build && npm test"
   },
   "dependencies": {
-    "async-bulkhead-ts": "^0.2.3"
+    "async-bulkhead-ts": "^0.3.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
