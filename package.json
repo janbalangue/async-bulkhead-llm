@@ -1,6 +1,6 @@
 {
   "name": "async-bulkhead-llm",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Fail-fast admission control for LLM workloads built on async-bulkhead-ts.",
   "license": "MIT",
   "author": "",
