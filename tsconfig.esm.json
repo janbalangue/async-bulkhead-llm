@@ -1,13 +1,13 @@
 {
-  "$schema": "https://json.schemastore.org/tsconfig",
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "module":            "NodeNext",
-    "moduleResolution":  "NodeNext",
-    "outDir":            "./dist/esm",
-    "declaration":       false,
-    "declarationMap":    false,
-    "sourceMap":         true
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "./dist/esm",
+    "rootDir": "./src",
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": true
   },
-  "include": ["src/**/*.ts"],
+  "include": ["src/**/*.ts"]
 }
