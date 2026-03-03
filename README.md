@@ -10,10 +10,16 @@ Designed for services that need to enforce **cost ceilings, concurrency limits, 
 
 - ✅ Hard **max in-flight** concurrency (`maxConcurrent`)
 - ✅ **Token-aware admission** — reserves against estimated input + max output tokens
+- ✅ **Token refund** — reclaim unused budget capacity from actual usage post-completion
 - ✅ **Model-aware estimation** — per-model character ratios for known providers
+- ✅ **Per-request model** — mixed-model routing through a single bulkhead
+- ✅ **Multimodal content** — text blocks counted, non-text blocks ignored
 - ✅ **Fail-fast by default** — shed load early, never silently queue
 - ✅ **Opinionated profiles** — `'interactive'` and `'batch'` presets with escape hatch
 - ✅ **In-flight deduplication** — identical requests share one LLM call
+- ✅ **Custom dedup key** — bring your own equivalence function
+- ✅ **Event hooks** — `on('admit' | 'reject' | 'release' | 'dedup', fn)`
+- ✅ **Graceful shutdown** — `close()` + `drain()`
 - ✅ Optional **AbortSignal** and **timeout** cancellation
 - ✅ `bulkhead.run(request, fn)` — acquire + release handled automatically
 - ✅ Zero dependencies beyond `async-bulkhead-ts`
@@ -51,11 +57,123 @@ const request = {
   max_tokens: 1024,
 };
 
-// Acquire + release handled automatically.
-// Throws LLMBulkheadRejectedError on rejection.
 const result = await bulkhead.run(request, async () => {
   return callYourLLMProvider(request);
 });
+```
+
+---
+
+## What's New in v2
+
+### Token Refund
+
+v1 reserved `input + maxOutput` tokens and held that full reservation until release. Most calls use far fewer output tokens than `max_tokens`. v2 reclaims the difference:
+
+```ts
+// Via run() — extract usage from your provider's response
+const result = await bulkhead.run(
+  request,
+  async () => callLLM(request),
+  {
+    getUsage: (response) => ({
+      input:  response.usage.input_tokens,
+      output: response.usage.output_tokens,
+    }),
+  },
+);
+
+// Via acquire() — pass usage at release time
+const r = await bulkhead.acquire(request);
+if (r.ok) {
+  try {
+    const response = await callLLM(request);
+    return response;
+  } finally {
+    r.token.release({
+      input:  response.usage.input_tokens,
+      output: response.usage.output_tokens,
+    });
+  }
+}
+```
+
+When usage is reported, the refund is `reserved - (actual input + actual output)`. Budget capacity is returned immediately. Without usage, behavior is identical to v1.
+
+### Multimodal Content
+
+`content` may now be a plain string or an array of content blocks:
+
+```ts
+const request = {
+  messages: [{
+    role: 'user',
+    content: [
+      { type: 'text', text: 'Describe this image...' },
+      { type: 'image', source: { type: 'base64', data: '...' } },
+    ],
+  }],
+  max_tokens: 1024,
+};
+```
+
+Built-in estimators extract text from text blocks and ignore non-text blocks. Token estimates for multimodal requests are a lower bound. Provide a custom `estimator` for accurate multimodal estimation.
+
+### Per-Request Model
+
+Route multiple models through a single bulkhead with accurate per-model estimation:
+
+```ts
+const bulkhead = createLLMBulkhead({
+  model:         'claude-sonnet-4',  // default for estimation
+  maxConcurrent: 20,
+  tokenBudget:   { budget: 500_000 },
+});
+
+// Estimator uses request.model when present
+await bulkhead.run(
+  { model: 'claude-haiku-4-5', messages, max_tokens: 512 },
+  async () => callLLM(request),
+);
+```
+
+### Custom Dedup Key
+
+```ts
+const bulkhead = createLLMBulkhead({
+  model:         'claude-sonnet-4',
+  maxConcurrent: 10,
+  deduplication: {
+    keyFn: (request) => {
+      // Your own equivalence logic
+      return hash(request.messages);
+    },
+  },
+});
+```
+
+The default key now includes `messages`, `max_tokens`, and `model`. Return an empty string to opt a specific request out.
+
+### Event Hooks
+
+```ts
+const off = bulkhead.on('release', ({ reservedTokens, refundedTokens, usage }) => {
+  metrics.histogram('llm.tokens.reserved', reservedTokens);
+  metrics.histogram('llm.tokens.refunded', refundedTokens);
+});
+
+// Later:
+off(); // unsubscribe
+```
+
+Events: `'admit'`, `'reject'`, `'release'`, `'dedup'`.
+
+### Graceful Shutdown
+
+```ts
+// In your SIGTERM handler:
+bulkhead.close();       // reject all pending; block future admission
+await bulkhead.drain(); // wait for in-flight work to complete
 ```
 
 ---
@@ -69,17 +187,17 @@ Two built-in presets cover the common cases. Explicit options always override pr
 const bulkhead = createLLMBulkhead({
   model:         'claude-sonnet-4',
   maxConcurrent: 10,
-  profile:       'interactive',   // maxQueue: 0
+  profile:       'interactive',
 });
 
 // Batch — bounded queue, 30s timeout
 const bulkhead = createLLMBulkhead({
   model:         'claude-sonnet-4',
   maxConcurrent: 4,
-  profile:       'batch',         // maxQueue: 20, timeoutMs: 30_000
+  profile:       'batch',
 });
 
-// Escape hatch — plain object, same shape as the options
+// Escape hatch — plain object
 const bulkhead = createLLMBulkhead({
   model:         'claude-sonnet-4',
   maxConcurrent: 4,
@@ -87,39 +205,31 @@ const bulkhead = createLLMBulkhead({
 });
 ```
 
-If no profile is set, the default is fail-fast (`maxQueue: 0`).
-
 ---
 
 ## Token Budget
-
-Enforce a ceiling on total tokens in-flight simultaneously. Admission is always **fail-fast** when the ceiling is hit, regardless of profile or concurrency headroom.
 
 ```ts
 const bulkhead = createLLMBulkhead({
   model:         'claude-sonnet-4',
   maxConcurrent: 10,
   tokenBudget: {
-    budget:    200_000,  // max tokens in-flight at once
+    budget: 200_000,
   },
 });
 ```
 
-Token reservations are calculated pre-admission from `input + maxOutput`. Capacity is returned when each request completes.
+Token reservations are calculated pre-admission from `input + maxOutput`. Capacity is returned when each request completes. When `TokenUsage` is provided at release, the refund reclaims unused capacity immediately.
 
-### How estimation works
+### How Estimation Works
 
 The default estimator is `createModelAwareTokenEstimator` seeded with the bulkhead's `model`. It uses per-model character-to-token ratios for known model families, falling back to a flat `4.0` ratio for unknown models.
 
-Known model families: `claude-3-5-haiku`, `claude-3-5-sonnet`, `claude-3-*`, `claude-sonnet-4`, `claude-opus-4`, `gpt-4o`, `gpt-4-turbo`, `gpt-4`, `gpt-3.5`, `o1`, `o3`, `gemini-1.5`, `gemini-2`.
+v2 checks `request.model` first (when present), then falls back to the bulkhead-level `defaultModel`.
 
-**Accuracy:** ±15% for known models on English prose. Underestimates for code and non-Latin scripts.
-**Suitable for:** load-shedding and cost ceilings.
-**Not suitable for:** cost accounting or billing.
+Known model families: `claude-3-5-haiku`, `claude-3-5-sonnet`, `claude-3-*`, `claude-sonnet-4`, `claude-opus-4`, `claude-haiku-4`, `claude-*-4-5`, `gpt-4o`, `gpt-4-turbo`, `gpt-4.1`, `gpt-4`, `gpt-3.5`, `o1`, `o3`, `o4-mini`, `gemini-1.5`, `gemini-2`, `gemini-2.5`.
 
-### Custom estimator
-
-Bring your own for higher accuracy, or to support Azure deployment names and other non-standard model strings:
+### Custom Estimator
 
 ```ts
 import { Tiktoken } from 'tiktoken';
@@ -132,41 +242,46 @@ const bulkhead = createLLMBulkhead({
   tokenBudget: {
     budget:    200_000,
     estimator: (request) => ({
-      input:     enc.encode(request.messages.map(m => m.content).join('')).length,
+      input:     enc.encode(request.messages.map(m =>
+        typeof m.content === 'string'
+          ? m.content
+          : m.content.filter(b => b.type === 'text').map(b => b.text).join('')
+      ).join('')).length,
       maxOutput: request.max_tokens ?? 2_048,
     }),
   },
 });
 ```
 
-### Estimator utilities
-
-Both estimators are exported for use outside the bulkhead — in logging, pre-flight checks, or request routing:
+### Estimator Utilities
 
 ```ts
-import { naiveTokenEstimator, createModelAwareTokenEstimator } from 'async-bulkhead-llm';
+import {
+  naiveTokenEstimator,
+  createModelAwareTokenEstimator,
+  extractTextLength,
+} from 'async-bulkhead-llm';
 
-// Flat 4.0 ratio, zero configuration
+// Flat 4.0 ratio, multimodal-safe
 const est1 = naiveTokenEstimator(request);
 
-// Per-model ratios, optional override map
+// Per-model ratios
 const estimate = createModelAwareTokenEstimator(
-  { 'my-azure-deployment': 3.7 },     // exact overrides
+  { 'my-azure-deployment': 3.7 },
   {
     defaultModel:   'claude-sonnet-4',
     outputCap:      2_048,
     onUnknownModel: (model) => console.warn(`Unknown model: ${model}`),
   },
 );
-```
 
-`onUnknownModel` fires when neither an override nor a built-in prefix matches. Use it to log, alert, or throw in strict environments.
+// Utility for multimodal content
+const charCount = extractTextLength(message.content);
+```
 
 ---
 
 ## Deduplication
-
-When enabled, requests with identical message content that arrive while a matching call is already in-flight share that call — only one LLM request is made.
 
 ```ts
 const bulkhead = createLLMBulkhead({
@@ -175,27 +290,27 @@ const bulkhead = createLLMBulkhead({
   deduplication: true,
 });
 
-// Both callers get the same result; only one LLM call is made.
 const [r1, r2] = await Promise.all([
   bulkhead.run(request, async () => callLLM(request)),
   bulkhead.run(request, async () => callLLM(request)), // deduped
 ]);
 ```
 
-**v1 key:** `JSON.stringify(request.messages)`. Requests with different `max_tokens` but identical messages are treated as duplicates. Key design is a known limitation in v1.
+v2 default key: `JSON.stringify({ m: request.messages, t: request.max_tokens, o: request.model })`. Requests with different `max_tokens` or `model` are not conflated.
 
-Deduplication stats are tracked:
+Custom key:
 
 ```ts
-bulkhead.stats().deduplication
-// { active: 2, hits: 5 }
+deduplication: {
+  keyFn: (request) => myHash(request.messages),
+}
 ```
+
+Return `""` from `keyFn` to opt a specific request out.
 
 ---
 
 ## Cancellation
-
-Cancel waiting or in-flight requests with an `AbortSignal`:
 
 ```ts
 const ac = new AbortController();
@@ -206,50 +321,43 @@ await bulkhead.run(
   { signal: ac.signal },
 );
 
-// Somewhere else:
-ac.abort(); // cancels if still waiting; signals fn if already in-flight
+ac.abort();
 ```
 
-The signal is passed through to your function. The bulkhead does not forcibly terminate in-flight work — your function is responsible for observing the signal.
-
-Bound waiting time independently with `timeoutMs`:
+Bound waiting time:
 
 ```ts
 await bulkhead.run(request, async () => callLLM(request), { timeoutMs: 5_000 });
 ```
 
-`timeoutMs` applies to the waiting period only. It has no effect when `maxQueue` is 0.
-
 ---
 
 ## Manual Acquire / Release
-
-For cases where `run()` doesn't fit your control flow:
 
 ```ts
 const r = await bulkhead.acquire(request);
 
 if (!r.ok) {
-  // r.reason: 'concurrency_limit' | 'queue_limit' | 'budget_limit' | 'timeout' | 'aborted'
+  // r.reason: 'concurrency_limit' | 'queue_limit' | 'budget_limit'
+  //         | 'timeout' | 'aborted' | 'shutdown'
   return respond503(r.reason);
 }
 
 try {
-  return await callLLM(request);
+  const response = await callLLM(request);
+  return response;
 } finally {
-  r.token.release();
+  // v2: pass usage for refund
+  r.token.release({
+    input:  response.usage.input_tokens,
+    output: response.usage.output_tokens,
+  });
 }
 ```
-
-You must call `token.release()` exactly once if acquisition succeeds.
-
-> **v1 note:** Token budget reservations are not correctable after admission when using `acquire()` directly — the refund mechanism (adjusting reservations based on actual usage) is deferred to v2. For accurate budget accounting, prefer `run()`.
 
 ---
 
 ## Handling Rejections
-
-`run()` throws `LLMBulkheadRejectedError` on rejection:
 
 ```ts
 import { LLMBulkheadRejectedError } from 'async-bulkhead-llm';
@@ -258,16 +366,13 @@ try {
   await bulkhead.run(request, async () => callLLM(request));
 } catch (err) {
   if (err instanceof LLMBulkheadRejectedError) {
-    // err.code   === 'LLM_BULKHEAD_REJECTED'
-    // err.reason === 'concurrency_limit' | 'queue_limit' | 'budget_limit'
-    //             | 'timeout' | 'aborted'
+    // err.reason: 'concurrency_limit' | 'queue_limit' | 'budget_limit'
+    //           | 'timeout' | 'aborted' | 'shutdown'
     return respond503(`Shed: ${err.reason}`);
   }
   throw err;
 }
 ```
-
-`acquire()` returns a result object instead of throwing — check `r.ok` before using the token.
 
 ---
 
@@ -276,48 +381,54 @@ try {
 ```ts
 const s = bulkhead.stats();
 
-s.inFlight       // requests currently executing
-s.pending        // requests waiting in queue
-s.maxConcurrent  // configured limit
-s.maxQueue       // configured queue depth
+s.inFlight
+s.pending
+s.maxConcurrent
+s.maxQueue
+s.closed                             // true after close()
 
-// Present only when tokenBudget is configured:
-s.tokenBudget?.budget           // total ceiling
-s.tokenBudget?.inFlightTokens   // currently reserved
-s.tokenBudget?.available        // remaining headroom
+s.tokenBudget?.budget
+s.tokenBudget?.inFlightTokens
+s.tokenBudget?.available
+s.tokenBudget?.totalRefunded         // v2: cumulative refunded tokens
 
-// Present only when deduplication is enabled:
-s.deduplication?.active   // distinct in-flight keys
-s.deduplication?.hits     // cumulative dedup hits
+s.deduplication?.active
+s.deduplication?.hits
 ```
 
 ---
 
-## Multi-Model Routing
-
-One bulkhead per model is the recommended pattern. Different models have different cost profiles, latency characteristics, and provider rate limits — a unified ceiling can't express those correctly.
-
-For fallback routing, A/B testing, or canary deployments, compose multiple bulkheads with a thin routing layer:
+## Event Hooks
 
 ```ts
-const bulkheads = {
-  sonnet: createLLMBulkhead({ model: 'claude-sonnet-4', maxConcurrent: 10 }),
-  haiku:  createLLMBulkhead({ model: 'claude-haiku-3',  maxConcurrent: 40 }),
-};
+// Subscribe
+const off = bulkhead.on('admit', ({ request, reservedTokens }) => {
+  console.log(`Admitted: ${reservedTokens} tokens reserved`);
+});
 
-async function callWithFallback(request, isPriority: boolean) {
-  const bulkhead = isPriority ? bulkheads.sonnet : bulkheads.haiku;
-  try {
-    return await bulkhead.run(request, () => callLLM(request));
-  } catch (err) {
-    if (err instanceof LLMBulkheadRejectedError && !isPriority) {
-      // Haiku is saturated — shed rather than escalate to Sonnet.
-      throw err;
-    }
-    throw err;
-  }
-}
+// Unsubscribe
+off();
 ```
+
+| Event     | Payload |
+|-----------|---------|
+| `admit`   | `{ request, reservedTokens }` |
+| `reject`  | `{ request, reason }` |
+| `release` | `{ request, reservedTokens, refundedTokens, usage? }` |
+| `dedup`   | `{ request }` |
+
+Listeners are synchronous and fire-and-forget. Exceptions are silently caught.
+
+---
+
+## Graceful Shutdown
+
+```ts
+bulkhead.close();        // stop admission, reject pending waiters
+await bulkhead.drain();  // wait for in-flight work to finish
+```
+
+`close()` is synchronous, idempotent, and irreversible. `drain()` resolves when `inFlight` and `pending` both reach zero.
 
 ---
 
@@ -327,84 +438,79 @@ async function callWithFallback(request, isPriority: boolean) {
 
 ```ts
 type LLMBulkheadOptions = {
-  model:          string;              // required; one bulkhead per model
-  maxConcurrent:  number;              // required
-  maxQueue?:      number;              // default: 0 (fail-fast)
-  timeoutMs?:     number;              // waiting timeout; no effect if maxQueue is 0
-  profile?:       'interactive'        // maxQueue: 0 (default behaviour)
-                | 'batch'              // maxQueue: 20, timeoutMs: 30_000
-                | LLMBulkheadPreset;   // escape hatch: plain options object
+  model:          string;
+  maxConcurrent:  number;
+  maxQueue?:      number;
+  timeoutMs?:     number;
+  profile?:       'interactive' | 'batch' | LLMBulkheadPreset;
   tokenBudget?: {
     budget:      number;
-    estimator?:  TokenEstimator;       // default: createModelAwareTokenEstimator
-    outputCap?:  number;               // default: 2048
+    estimator?:  TokenEstimator;
+    outputCap?:  number;
   };
-  deduplication?: boolean;             // default: false
+  deduplication?: boolean | DeduplicationOptions;
+};
+
+type DeduplicationOptions = {
+  keyFn?: (request: LLMRequest) => string;
 };
 ```
 
-Explicit options always override profile defaults.
-
 ### `bulkhead.run(request, fn, options?)`
-
-Primary API. Acquires a slot, calls `fn`, releases on completion or error.
 
 ```ts
 run<T>(
   request:  LLMRequest,
   fn:       (signal?: AbortSignal) => Promise<T>,
-  options?: { signal?: AbortSignal; timeoutMs?: number },
+  options?: {
+    signal?:    AbortSignal;
+    timeoutMs?: number;
+    getUsage?:  (result: T) => TokenUsage | undefined;
+  },
 ): Promise<T>
 ```
 
-Throws `LLMBulkheadRejectedError` on rejection.
-
 ### `bulkhead.acquire(request, options?)`
-
-Advanced. Returns a result object; you manage the token lifecycle.
 
 ```ts
 acquire(
   request:  LLMRequest,
   options?: { signal?: AbortSignal; timeoutMs?: number },
-): Promise<
-  | { ok: true;  token: { release(): void } }
-  | { ok: false; reason: LLMRejectReason }
->
+): Promise<LLMAcquireResult>
+
+type LLMAcquireResult =
+  | { ok: true;  token: LLMToken }
+  | { ok: false; reason: LLMRejectReason };
+
+type LLMToken = { release(usage?: TokenUsage): void };
 ```
 
 ### `bulkhead.stats()`
 
-Returns current runtime state. See [Stats](#stats) above.
+### `bulkhead.close()`
 
-### `naiveTokenEstimator(request)`
+### `bulkhead.drain()`
 
-Plain function. Flat `4.0` character-per-token ratio. No configuration.
-
-### `createModelAwareTokenEstimator(overrides?, options?)`
-
-Factory. Per-model ratios, longest-prefix match, exact overrides checked first.
+### `bulkhead.on(event, listener)`
 
 ```ts
-createModelAwareTokenEstimator(
-  overrides?: Record<string, number>,  // exact-match; caller values win
-  options?: {
-    defaultModel?:   string;
-    outputCap?:      number;
-    onUnknownModel?: (model: string) => void;
-  },
-): TokenEstimator
+on<K extends keyof LLMEventMap>(
+  event:    K,
+  listener: (payload: LLMEventMap[K]) => void,
+): () => void    // returns unsubscribe
 ```
 
 ### Types
 
 ```ts
-type LLMRequest     = { messages: LLMMessage[]; max_tokens?: number };
-type LLMMessage     = { role: string; content: string };
+type LLMRequest     = { model?: string; messages: LLMMessage[]; max_tokens?: number };
+type LLMMessage     = { role: string; content: string | ContentBlock[] };
+type ContentBlock   = TextContentBlock | OpaqueContentBlock;
+type TextContentBlock  = { type: 'text'; text: string };
+type OpaqueContentBlock = { type: string; [key: string]: unknown };
+
 type TokenEstimate  = { input: number; maxOutput: number };
 type TokenEstimator = (request: LLMRequest) => TokenEstimate;
-
-// Forward-looking: not acted on in v1, useful for annotating provider responses.
 type TokenUsage     = { input: number; output: number };
 
 type LLMRejectReason =
@@ -412,8 +518,15 @@ type LLMRejectReason =
   | 'queue_limit'
   | 'budget_limit'
   | 'timeout'
-  | 'aborted';
+  | 'aborted'
+  | 'shutdown';
 ```
+
+---
+
+## Migration from v1
+
+Most callers need zero changes. See [CHANGELOG](./CHANGELOG.md) for a detailed migration guide.
 
 ---
 
@@ -426,23 +539,13 @@ This library enforces backpressure at the boundary of your LLM calls. It does no
 - **Distributed rate limiting** — use a shared token bucket; bulkheads are per-process
 - **Model selection** — route above the bulkhead layer; each bulkhead instance is model-specific
 
-Token estimation is deliberately approximate. The estimator's job is to prevent gross over-admission — not to predict your invoice. An estimator that's wrong by 20% still prevents the most common cost explosion: a burst of large-context requests all admitted simultaneously.
-
-The refund mechanism (correcting reservations based on actual usage after a call completes) is on the roadmap for v2. In v1, reservations are based on `input + maxOutput` and held until release.
-
----
-
-## Multimodal
-
-`content` must be a plain string in v1. Multimodal content (images, documents, tool results as structured blocks) is not supported by the built-in estimators — non-string content is ignored, causing underestimation. Treat token budget results as a lower bound for multimodal requests.
-
-Full multimodal support is planned for v2.
+Token estimation is deliberately approximate. The refund mechanism improves budget utilization but does not make estimation exact — it corrects after the fact based on actual usage.
 
 ---
 
 ## Compatibility
 
-- Node.js: 20+ (24 LTS recommended)
+- Node.js: 20+
 - Module formats: ESM and CommonJS
 
 ---

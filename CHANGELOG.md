@@ -7,6 +7,59 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+
+## [2.0.0] — 2026-03-03
+
+### Breaking Changes
+
+* **Multimodal content:** `LLMMessage.content` is now `string | ContentBlock[]`. Plain strings remain valid — no changes required for text-only callers. Code that assumed `content` is always a `string` (e.g. `m.content.length`) must be updated to use `extractTextLength()` or handle both shapes.
+* **Deduplication key:** the default key now includes `max_tokens` and `model` in addition to message content. Requests with identical messages but different `max_tokens` are no longer treated as duplicates (they were in v1). This is a behavioral change with no API signature change.
+* **`LLMToken` replaces `Token`:** the token returned by `acquire()` now accepts optional `TokenUsage` at release time: `token.release(usage?)`. Callers that call `release()` with no arguments are unaffected.
+* **`LLMStats.tokenBudget` shape:** added `totalRefunded` field to the token budget stats block.
+
+### Added
+
+* **Token refund mechanism.** When `TokenUsage` is passed to `token.release(usage)` or extracted via `getUsage` in `run()`, the bulkhead returns the difference between the pre-admission reservation and actual consumption to the budget immediately. This dramatically improves budget utilization — requests that use fewer output tokens than `max_tokens` no longer hold phantom capacity.
+* **`run()` `getUsage` option.** `run(request, fn, { getUsage })` accepts a function that extracts `TokenUsage` from the result of `fn`. The refund is applied automatically on successful completion.
+* **Per-request model override.** `LLMRequest.model` is now an optional field. When present, the model-aware estimator uses it for ratio lookup instead of the bulkhead-level `defaultModel`. Supports A/B testing, canary deployments, and mixed-model routing.
+* **Multimodal content blocks.** `LLMMessage.content` accepts `ContentBlock[]` with typed `TextContentBlock` and `OpaqueContentBlock` variants. Built-in estimators extract text from text blocks and ignore non-text blocks. `extractTextLength()` is exported as a utility.
+* **Custom deduplication key.** `deduplication` now accepts `DeduplicationOptions` with a `keyFn` property. The default key function includes `messages`, `max_tokens`, and `model`. Return an empty string from `keyFn` to opt a specific request out of deduplication.
+* **Event system.** `bulkhead.on(event, listener)` subscribes to lifecycle events: `'admit'`, `'reject'`, `'release'`, `'dedup'`. Returns an unsubscribe function. Listeners are called synchronously; exceptions are silently caught.
+* **Graceful shutdown.** `bulkhead.close()` stops admission permanently. `bulkhead.drain()` returns a promise that resolves when all in-flight work completes. Compose as `close()` → `drain()` for clean shutdown. Both are forwarded from `async-bulkhead-ts`.
+* **Expanded model ratios.** Built-in ratio table now includes: `claude-haiku-4`, `claude-sonnet-4-5`, `claude-opus-4-5`, `claude-haiku-4-5`, `gpt-4.1`, `o4-mini`, `gemini-2.5`.
+* **`LLMStats.tokenBudget.totalRefunded`** — cumulative tokens returned to the budget via the refund mechanism.
+
+### Changed
+
+* `createModelAwareTokenEstimator` now checks `request.model` before `defaultModel` for ratio lookup.
+* Default deduplication key includes `max_tokens` and `model` (see Breaking Changes).
+* Prefix matching in the estimator now uses an iterative longest-match scan instead of `filter + sort`, avoiding an allocation per call.
+* `LLMBulkhead` return type now includes `close`, `drain`, and `on` methods.
+
+### Removed
+
+* Nothing removed. All v1 public types remain exported.
+
+### Migration Guide
+
+**From v1 → v2, most callers need zero changes.** The common path — `createLLMBulkhead(opts)` → `bulkhead.run(request, fn)` — is fully backward-compatible for text-only requests.
+
+Changes required only if you:
+
+1. **Access `content` directly on `LLMMessage`:** replace `m.content.length` with `extractTextLength(m.content)` or guard with `typeof m.content === 'string'`.
+2. **Rely on dedup treating different `max_tokens` as identical:** pass a custom `keyFn` that omits `max_tokens`: `deduplication: { keyFn: (r) => JSON.stringify(r.messages) }`.
+3. **Inspect `tokenBudget` stats structurally:** the new `totalRefunded` field is always present when `tokenBudget` is configured.
+
+### Design Notes
+
+* Token refund is opt-in and zero-cost when not used. Calling `release()` with no argument behaves identically to v1.
+* `getUsage` is intentionally separated from `fn` to avoid coupling the LLM call signature to the bulkhead. The caller extracts usage from whatever their provider returns.
+* The event system is deliberately minimal — synchronous, fire-and-forget, no async listeners. It's designed for metrics counters and logging, not for control flow.
+* `close()` and `drain()` are thin forwards to `async-bulkhead-ts`. The LLM layer adds no new shutdown semantics — it inherits the base library's guarantees.
+* Multimodal estimation is intentionally conservative. Non-text blocks contribute zero to the estimate. Callers who need accurate multimodal estimation should provide a custom `estimator`.
+
+---
+
 ## [1.0.3] — 2026-02-26
 
 ### Changed

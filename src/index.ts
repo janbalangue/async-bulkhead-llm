@@ -6,30 +6,65 @@ import {
   type RejectReason as BaseRejectReason,
 } from "async-bulkhead-ts";
 
-// ---- Request types ----
+// ────────────────────────────────────────────
+// Content block types (multimodal support)
+// ────────────────────────────────────────────
 
 /**
- * Minimal request shape shared across estimators.
+ * A text content block. The only block type that contributes to
+ * character-based token estimation.
+ */
+export type TextContentBlock = {
+  type: "text";
+  text: string;
+};
+
+/**
+ * A non-text content block (image, tool_result, document, etc.).
  *
- * `content` must be a plain string. Multimodal content blocks (images, documents)
- * are not supported in v1 — non-string content will be ignored by estimators,
- * causing underestimation. Treat token budget results as a lower bound for
- * multimodal requests.
+ * Built-in estimators ignore non-text blocks — token estimates for
+ * multimodal requests should be treated as a lower bound.
+ * Provide a custom estimator for accurate multimodal estimation.
+ */
+export type OpaqueContentBlock = {
+  type: string;
+  [key: string]: unknown;
+};
+
+export type ContentBlock = TextContentBlock | OpaqueContentBlock;
+
+// ────────────────────────────────────────────
+// Request types
+// ────────────────────────────────────────────
+
+/**
+ * Minimal message shape shared across estimators.
  *
- * Structural compatibility: most provider SDK request types satisfy this
- * interface without adaptation, provided `content` is a plain string.
+ * `content` may be a plain string (backward-compatible with v1) or
+ * an array of content blocks for multimodal requests.
  */
 export type LLMMessage = {
   role: string;
-  content: string;
+  content: string | ContentBlock[];
 };
 
+/**
+ * Minimal request shape.
+ *
+ * `model` is optional at the request level. When present, the estimator
+ * uses it for ratio lookup instead of the bulkhead-level default.
+ * This supports A/B testing, canary deployments, and mixed-model routing
+ * through a single bulkhead.
+ */
 export type LLMRequest = {
+  model?: string;
   messages: LLMMessage[];
   max_tokens?: number;
 };
 
-// ---- Token estimation types ----
+// ────────────────────────────────────────────
+// Token estimation types
+// ────────────────────────────────────────────
 
 export type TokenEstimate = {
   input: number;
@@ -41,15 +76,18 @@ export type TokenEstimator = (request: LLMRequest) => TokenEstimate;
 /**
  * Actual token usage returned by the provider after a call completes.
  *
- * Not acted on in v1 — exported as a forward-looking type for v2 refund support.
- * Callers can use this type today to annotate their own provider response handling.
+ * In v2, this drives the refund mechanism: when usage is reported at
+ * release time, the difference between the pre-admission reservation
+ * and actual consumption is returned to the budget immediately.
  */
 export type TokenUsage = {
   input: number;
   output: number;
 };
 
-// ---- Reject reason ----
+// ────────────────────────────────────────────
+// Reject reason
+// ────────────────────────────────────────────
 
 export type LLMRejectReason = BaseRejectReason | "budget_limit";
 
@@ -62,20 +100,20 @@ export class LLMBulkheadRejectedError extends Error {
   }
 }
 
-// ---- Stats ----
+// ────────────────────────────────────────────
+// Stats
+// ────────────────────────────────────────────
 
 export type LLMStats = Stats & {
-  /**
-   * Present only when `tokenBudget` is configured.
-   */
+  /** Present only when `tokenBudget` is configured. */
   tokenBudget?: {
     budget: number;
     inFlightTokens: number;
     available: number;
+    /** Cumulative tokens returned to the budget via the refund mechanism. */
+    totalRefunded: number;
   };
-  /**
-   * Present only when `deduplication` is enabled.
-   */
+  /** Present only when deduplication is enabled. */
   deduplication?: {
     /** Number of distinct in-flight deduplication keys. */
     active: number;
@@ -84,7 +122,32 @@ export type LLMStats = Stats & {
   };
 };
 
-// ---- Profile / preset ----
+// ────────────────────────────────────────────
+// Event system
+// ────────────────────────────────────────────
+
+export type LLMEventMap = {
+  /** Fired after a request is admitted (slot + budget acquired). */
+  admit: { request: LLMRequest; reservedTokens: number };
+  /** Fired when a request is rejected at any stage. */
+  reject: { request: LLMRequest; reason: LLMRejectReason };
+  /** Fired when a slot is released. */
+  release: {
+    request: LLMRequest;
+    reservedTokens: number;
+    refundedTokens: number;
+    usage?: TokenUsage;
+  };
+  /** Fired when a request joins an existing in-flight call via dedup. */
+  dedup: { request: LLMRequest };
+};
+
+export type LLMEventType = keyof LLMEventMap;
+type Listener<K extends LLMEventType> = (payload: LLMEventMap[K]) => void;
+
+// ────────────────────────────────────────────
+// Profile / preset
+// ────────────────────────────────────────────
 
 export type LLMBulkheadPreset = {
   maxQueue?: number;
@@ -94,14 +157,15 @@ export type LLMBulkheadPreset = {
 /**
  * Built-in presets for common deployment patterns.
  * Explicit options always override preset defaults.
- * Pass a plain `LLMBulkheadPreset` object to escape the named presets entirely.
  */
 export const PROFILES: Record<"interactive" | "batch", LLMBulkheadPreset> = {
   interactive: { maxQueue: 0 },
   batch: { maxQueue: 20, timeoutMs: 30_000 },
 };
 
-// ---- Token budget options ----
+// ────────────────────────────────────────────
+// Token budget options
+// ────────────────────────────────────────────
 
 export type TokenBudgetOptions = {
   /**
@@ -124,15 +188,34 @@ export type TokenBudgetOptions = {
   outputCap?: number;
 };
 
-// ---- Core options ----
+// ────────────────────────────────────────────
+// Deduplication options
+// ────────────────────────────────────────────
+
+export type DeduplicationOptions = {
+  /**
+   * Custom function to derive a deduplication key from a request.
+   * Requests with the same key that arrive while a matching call is
+   * already in-flight share that call.
+   *
+   * Default: `JSON.stringify({ m: request.messages, t: request.max_tokens })`.
+   *
+   * Return an empty string to opt a specific request out of deduplication.
+   */
+  keyFn?: (request: LLMRequest) => string;
+};
+
+// ────────────────────────────────────────────
+// Core options
+// ────────────────────────────────────────────
 
 export type LLMBulkheadOptions = {
   /**
    * Model identifier. Used by the default estimator for ratio lookup.
    *
-   * One bulkhead per model is the strongly recommended deployment pattern —
-   * different models have different cost, latency, and rate-limit profiles.
-   * See README for a multi-model routing recipe.
+   * One bulkhead per model is the strongly recommended deployment pattern.
+   * When routing multiple models through one bulkhead, set `model` on
+   * individual `LLMRequest` objects for accurate estimation.
    */
   model: string;
 
@@ -154,15 +237,6 @@ export type LLMBulkheadOptions = {
   /**
    * Opinionated defaults for common deployment patterns.
    * Explicit options always override profile defaults.
-   *
-   * - `'interactive'` — fail-fast, no waiting (`maxQueue: 0`)
-   * - `'batch'`       — bounded queue, 30s timeout (`maxQueue: 20, timeoutMs: 30_000`)
-   *
-   * Escape hatch: pass a plain `LLMBulkheadPreset` object for custom defaults.
-   *
-   * @example
-   * profile: 'batch'
-   * profile: { maxQueue: 5, timeoutMs: 5_000 }
    */
   profile?: "interactive" | "batch" | LLMBulkheadPreset;
 
@@ -174,24 +248,64 @@ export type LLMBulkheadOptions = {
   tokenBudget?: TokenBudgetOptions;
 
   /**
-   * Deduplicate identical in-flight requests.
-   * Requests with the same deduplication key share one in-flight call.
+   * Enable in-flight request deduplication.
    *
-   * v1 key: `JSON.stringify(request.messages)`. Key design is a known
-   * limitation in v1 — callers with non-string content or custom key
-   * requirements should await v2.
-   *
-   * Default: false.
+   * - `true` — use the default key function
+   * - `DeduplicationOptions` — customize the key function
+   * - `false` / omitted — disabled
    */
-  deduplication?: boolean;
+  deduplication?: boolean | DeduplicationOptions;
 };
 
-// ---- Estimator internals ----
+// ────────────────────────────────────────────
+// LLM token (extended with refund)
+// ────────────────────────────────────────────
+
+/**
+ * Admission token returned by `acquire()`.
+ *
+ * Call `release()` exactly once when the request completes.
+ * Pass `TokenUsage` to enable the refund mechanism — the bulkhead
+ * returns the difference between the pre-admission reservation and
+ * actual consumption to the budget immediately.
+ */
+export type LLMToken = {
+  release(usage?: TokenUsage): void;
+};
+
+export type LLMAcquireResult =
+  | { ok: true; token: LLMToken }
+  | { ok: false; reason: LLMRejectReason };
+
+// ────────────────────────────────────────────
+// Estimator internals
+// ────────────────────────────────────────────
 
 const DEFAULT_OUTPUT_CAP = 2_048;
 const NAIVE_CHAR_RATIO = 4.0;
 
-/** Shared helper used by both estimators. */
+/**
+ * Extract total character count from message content.
+ * Handles both plain strings and multimodal content block arrays.
+ * Non-text blocks are ignored (contribute 0 characters).
+ */
+export function extractTextLength(
+  content: string | ContentBlock[],
+): number {
+  if (typeof content === "string") return content.length;
+  let len = 0;
+  for (const block of content) {
+    if (
+      block.type === "text" &&
+      "text" in block &&
+      typeof (block as TextContentBlock).text === "string"
+    ) {
+      len += (block as TextContentBlock).text.length;
+    }
+  }
+  return len;
+}
+
 function resolveMaxOutput(request: LLMRequest, fallback: number): number {
   return request.max_tokens ?? fallback;
 }
@@ -199,13 +313,15 @@ function resolveMaxOutput(request: LLMRequest, fallback: number): number {
 /**
  * Estimates token usage using a flat 4-characters-per-token ratio.
  *
+ * Handles both plain string and multimodal content.
+ * Non-text content blocks are ignored (treated as zero tokens).
+ *
  * Accuracy: ±25% for English prose.
- * Underestimates for code and non-Latin scripts.
  * Suitable for load-shedding; not suitable for cost accounting.
  */
 export function naiveTokenEstimator(request: LLMRequest): TokenEstimate {
   const inputChars = request.messages.reduce(
-    (sum, m) => sum + m.content.length,
+    (sum, m) => sum + extractTextLength(m.content),
     0,
   );
   return {
@@ -217,31 +333,43 @@ export function naiveTokenEstimator(request: LLMRequest): TokenEstimate {
 /**
  * Per-model character-to-token ratios.
  * Flat array of [prefix, ratio] pairs — longest matching prefix wins.
- * Keyed at the model-family level; snapshot suffixes are handled by prefix matching.
  */
-const BUILT_IN_RATIOS: Array<[string, number]> = [
+const BUILT_IN_RATIOS: ReadonlyArray<readonly [string, number]> = [
+  // Anthropic — Claude 3.x
   ["claude-3-5-haiku", 3.8],
   ["claude-3-5-sonnet", 3.9],
   ["claude-3-opus", 3.9],
   ["claude-3-sonnet", 3.9],
   ["claude-3-haiku", 3.8],
+  // Anthropic — Claude 4.x
   ["claude-sonnet-4", 3.9],
   ["claude-opus-4", 3.9],
+  ["claude-haiku-4", 3.8],
+  // Anthropic — Claude 4.5
+  ["claude-sonnet-4-5", 3.9],
+  ["claude-opus-4-5", 3.9],
+  ["claude-haiku-4-5", 3.8],
+  // OpenAI — GPT
   ["gpt-4o", 3.7],
   ["gpt-4-turbo", 3.7],
+  ["gpt-4.1", 3.7],
   ["gpt-4", 3.7],
   ["gpt-3.5", 3.8],
+  // OpenAI — reasoning
   ["o1", 3.7],
   ["o3", 3.7],
-  ["gemini-1.5", 3.8],
+  ["o4-mini", 3.7],
+  // Google — Gemini
+  ["gemini-2.5", 3.8],
   ["gemini-2", 3.8],
+  ["gemini-1.5", 3.8],
 ];
 
 export type ModelAwareEstimatorOptions = {
   /**
-   * Model string used for ratio lookup when the estimator is called without
-   * per-request model information. Should match the `model` field on the
-   * owning `LLMBulkhead`.
+   * Model string used for ratio lookup when the request does not
+   * carry its own `model` field. Should match the `model` field on
+   * the owning `LLMBulkhead`.
    */
   defaultModel?: string | undefined;
 
@@ -253,7 +381,6 @@ export type ModelAwareEstimatorOptions = {
 
   /**
    * Called when the model string matches no built-in prefix and no override.
-   * Use to log a warning or throw in strict environments.
    * The estimator falls back to the naive 4.0 ratio when this fires.
    */
   onUnknownModel?: ((model: string) => void) | undefined;
@@ -264,19 +391,9 @@ export type ModelAwareEstimatorOptions = {
  *
  * Accuracy: ±15% for known models on English prose.
  * Falls back to naiveTokenEstimator (ratio 4.0) for unknown models.
- * Extend the model map via the `overrides` parameter.
- * Suitable for load-shedding; not suitable for cost accounting.
  *
- * Matching rules:
- * - `overrides` keys are exact-matched first (case-sensitive as provided,
- *   also tried lowercased). Exact match always wins over prefix scan.
- * - Built-in ratios are prefix-matched; longest prefix wins.
- * - Model string is lowercased before prefix scan.
- * - Unknown models fire `onUnknownModel` and fall back to ratio 4.0.
- *
- * Azure OpenAI deployment names (e.g. `'my-gpt4-prod'`) will not match any
- * built-in prefix. Pass an override keyed on your deployment name, or
- * provide `onUnknownModel` to surface the miss.
+ * v2: respects `request.model` when present, falling back to `defaultModel`.
+ * v2: handles multimodal content (text blocks counted, others ignored).
  */
 export function createModelAwareTokenEstimator(
   overrides?: Record<string, number>,
@@ -285,7 +402,7 @@ export function createModelAwareTokenEstimator(
   const outputCap = opts.outputCap ?? DEFAULT_OUTPUT_CAP;
 
   function lookupRatio(model: string): number {
-    // Option B: exact overrides checked before prefix scan.
+    // Exact overrides checked first (case-sensitive, then lowercased).
     if (overrides) {
       const exact = overrides[model] ?? overrides[model.toLowerCase()];
       if (exact != null) return exact;
@@ -293,21 +410,26 @@ export function createModelAwareTokenEstimator(
 
     // Prefix scan: lowercase, longest match wins.
     const normalized = model.toLowerCase();
-    const matched = BUILT_IN_RATIOS.filter(([prefix]) =>
-      normalized.startsWith(prefix),
-    ).sort((a, b) => b[0].length - a[0].length)[0];
+    let bestLen = 0;
+    let bestRatio = -1;
+    for (const [prefix, ratio] of BUILT_IN_RATIOS) {
+      if (normalized.startsWith(prefix) && prefix.length > bestLen) {
+        bestLen = prefix.length;
+        bestRatio = ratio;
+      }
+    }
 
-    if (matched) return matched[1];
+    if (bestRatio > 0) return bestRatio;
 
     opts.onUnknownModel?.(model);
     return NAIVE_CHAR_RATIO;
   }
 
   return (request: LLMRequest): TokenEstimate => {
-    const model = opts.defaultModel ?? "";
+    const model = request.model ?? opts.defaultModel ?? "";
     const ratio = lookupRatio(model);
     const inputChars = request.messages.reduce(
-      (sum, m) => sum + m.content.length,
+      (sum, m) => sum + extractTextLength(m.content),
       0,
     );
     return {
@@ -317,7 +439,9 @@ export function createModelAwareTokenEstimator(
   };
 }
 
-// ---- Option resolution ----
+// ────────────────────────────────────────────
+// Option resolution
+// ────────────────────────────────────────────
 
 function resolvePreset(
   profile: LLMBulkheadOptions["profile"],
@@ -327,16 +451,39 @@ function resolvePreset(
   return profile;
 }
 
-// ---- Acquire result (internal; surface matches base library) ----
+function resolveDedup(
+  opt: LLMBulkheadOptions["deduplication"],
+): { enabled: boolean; keyFn: (request: LLMRequest) => string } {
+  if (!opt) return { enabled: false, keyFn: defaultDedupKey };
+  if (opt === true) return { enabled: true, keyFn: defaultDedupKey };
+  return { enabled: true, keyFn: opt.keyFn ?? defaultDedupKey };
+}
 
-type InternalAcquireResult =
-  | { ok: true; token: Token }
-  | { ok: false; reason: LLMRejectReason };
+/**
+ * Default deduplication key.
+ *
+ * v2: includes `max_tokens` and `model` so that requests with
+ * identical messages but different output limits or models are
+ * not conflated.
+ */
+function defaultDedupKey(request: LLMRequest): string {
+  try {
+    return JSON.stringify({
+      m: request.messages,
+      t: request.max_tokens,
+      o: request.model,
+    });
+  } catch {
+    return "";
+  }
+}
 
-// ---- createLLMBulkhead ----
+// ────────────────────────────────────────────
+// createLLMBulkhead
+// ────────────────────────────────────────────
 
 export function createLLMBulkhead(opts: LLMBulkheadOptions) {
-  // Validate
+  // ---- Validate ----
   if (!opts.model || typeof opts.model !== "string") {
     throw new Error("model must be a non-empty string");
   }
@@ -344,12 +491,12 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     throw new Error("maxConcurrent must be a positive integer");
   }
 
-  // Resolve profile defaults; explicit opts always win
+  // ---- Resolve profile defaults ----
   const preset = resolvePreset(opts.profile);
   const maxQueue = opts.maxQueue ?? preset.maxQueue ?? 0;
   const timeoutMs = opts.timeoutMs ?? preset.timeoutMs;
 
-  // Internal bulkhead from async-bulkhead-ts
+  // ---- Internal bulkhead from async-bulkhead-ts ----
   const bulkhead = createBulkhead({
     maxConcurrent: opts.maxConcurrent,
     maxQueue,
@@ -365,11 +512,35 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     });
 
   let inFlightTokens = 0;
+  let totalRefunded = 0;
 
   // ---- Deduplication state ----
-  // v1 key: JSON.stringify(messages). Key design deferred to v2.
+  const dedup = resolveDedup(opts.deduplication);
   const dedupMap = new Map<string, Promise<unknown>>();
   let dedupHits = 0;
+
+  // ---- Event emitter state ----
+  const listeners: { [K in LLMEventType]: Set<Listener<K>> } = {
+    admit: new Set(),
+    reject: new Set(),
+    release: new Set(),
+    dedup: new Set(),
+  };
+
+  function emit<K extends LLMEventType>(
+    event: K,
+    payload: LLMEventMap[K],
+  ): void {
+    for (const fn of listeners[event]) {
+      try {
+        fn(payload);
+      } catch {
+        // listeners must not throw into the bulkhead
+      }
+    }
+  }
+
+  // ---- Internal helpers ----
 
   function createDeferred<T>() {
     let resolve!: (value: T | PromiseLike<T>) => void;
@@ -381,10 +552,8 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     return { promise, resolve, reject };
   }
 
-  // ---- Internal helpers ----
-
   /**
-   * Attempt token budget admission synchronously before queuing.
+   * Attempt token budget admission synchronously.
    * Returns the reserved token count (0 when budget is disabled),
    * or null if the budget ceiling is exceeded.
    */
@@ -397,43 +566,62 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     return needed;
   }
 
-  function releaseTokens(reserved: number): void {
+  function releaseTokens(reserved: number, usage?: TokenUsage): number {
+    let refunded = 0;
+    if (usage && reserved > 0) {
+      const actual = usage.input + usage.output;
+      if (actual < reserved) {
+        refunded = reserved - actual;
+        totalRefunded += refunded;
+      }
+    }
     inFlightTokens = Math.max(0, inFlightTokens - reserved);
+    return refunded;
   }
 
   /**
-   * Wraps a base Token so that release() also returns the token reservation.
-   * The wrapped token is the single place that tracks both concerns atomically.
+   * Wraps a base Token so that release() also returns the token
+   * reservation and optionally applies the refund.
    */
-  function wrapToken(base: Token, reserved: number): Token {
+  function wrapToken(
+    base: Token,
+    reserved: number,
+    request: LLMRequest,
+  ): LLMToken {
     let released = false;
     return {
-      release() {
+      release(usage?: TokenUsage) {
         if (released) return;
         released = true;
         try {
           base.release();
         } finally {
-          releaseTokens(reserved);
+          const refunded = releaseTokens(reserved, usage);
+          emit("release", {
+            request,
+            reservedTokens: reserved,
+            refundedTokens: refunded,
+            ...(usage !== undefined && { usage }),
+          });
         }
       },
     };
   }
 
   // ---- Internal acquire ----
-  // Shared by the public `acquire()` and `run()` paths.
 
   async function _acquire(
     request: LLMRequest,
     ao: AcquireOptions,
-  ): Promise<InternalAcquireResult> {
-    // Token budget: read-only pre-check before entering the queue.
-    // Do NOT reserve here — budget may shift while we wait.
+  ): Promise<LLMAcquireResult> {
+    // Token budget: pre-check before entering the queue.
     if (budget) {
       const estimate = estimator(request);
       const needed = estimate.input + estimate.maxOutput;
-      if (inFlightTokens + needed > budget.budget)
+      if (inFlightTokens + needed > budget.budget) {
+        emit("reject", { request, reason: "budget_limit" });
         return { ok: false, reason: "budget_limit" };
+      }
     }
 
     const mergedOptions: AcquireOptions = {};
@@ -444,18 +632,20 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     const r = await bulkhead.acquire(mergedOptions);
 
     if (!r.ok) {
+      emit("reject", { request, reason: r.reason });
       return { ok: false, reason: r.reason };
     }
 
-    // Post-admission: now reserve tokens. Re-check because other
-    // requests may have been admitted while this one was queued.
+    // Post-admission: reserve tokens now.
     const reserved = tryReserveTokens(request);
     if (reserved === null) {
-      r.token.release(); // return the concurrency slot
+      r.token.release();
+      emit("reject", { request, reason: "budget_limit" });
       return { ok: false, reason: "budget_limit" };
     }
 
-    return { ok: true, token: wrapToken(r.token, reserved) };
+    emit("admit", { request, reservedTokens: reserved });
+    return { ok: true, token: wrapToken(r.token, reserved, request) };
   }
 
   // ---- Public API ----
@@ -463,17 +653,13 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
   /**
    * Acquire a slot manually.
    *
-   * Advanced usage. Token budget reservations are not correctable post-call
-   * without `run()` in v1 (refund mechanism deferred to v2). For most
-   * use cases, prefer `run()`.
-   *
-   * Throws a `LLMBulkheadRejectedError` only indirectly via the returned
-   * `AcquireResult` — callers must check `r.ok`.
+   * The returned token accepts optional `TokenUsage` at release time
+   * to trigger the refund mechanism. For most use cases, prefer `run()`.
    */
   async function acquire(
     request: LLMRequest,
     ao: AcquireOptions = {},
-  ): Promise<InternalAcquireResult> {
+  ): Promise<LLMAcquireResult> {
     return _acquire(request, ao);
   }
 
@@ -481,21 +667,26 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
    * Primary API. Acquire → call `fn` → release, automatically.
    *
    * Throws `LLMBulkheadRejectedError` on rejection.
-   * The provided `AbortSignal` (if any) is passed through to `fn`,
-   * allowing in-flight work to observe cancellation.
    *
-   * Note: cancellation affects admission only; in-flight work is not
-   * forcibly terminated by the bulkhead.
+   * When `getUsage` is provided in options, it is called with the result
+   * of `fn` to extract actual token usage. The refund mechanism then
+   * returns the difference between the reservation and actual consumption
+   * to the budget.
    */
   async function run<T>(
     request: LLMRequest,
     fn: (signal?: AbortSignal) => Promise<T>,
-    ao: AcquireOptions = {},
+    ao: AcquireOptions & {
+      getUsage?: (result: T) => TokenUsage | undefined;
+    } = {},
   ): Promise<T> {
+    const { getUsage, ...acquireOpts } = ao;
+
+    // ---- Deduplication ----
     let dedupKey = "";
-    if (opts.deduplication) {
+    if (dedup.enabled) {
       try {
-        dedupKey = JSON.stringify(request.messages);
+        dedupKey = dedup.keyFn(request);
       } catch {
         dedupKey = "";
       }
@@ -508,19 +699,17 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
           reject: (e?: unknown) => void;
         }
       | undefined;
-
-    // If we create a deferred, this is what BOTH leader and followers should await.
     let resultPromise: Promise<T> | undefined;
 
-    if (opts.deduplication && dedupKey !== "") {
+    if (dedup.enabled && dedupKey !== "") {
       const existing = dedupMap.get(dedupKey);
       if (existing) {
         dedupHits++;
+        emit("dedup", { request });
         return existing as Promise<T>;
       }
       deferred = createDeferred<T>();
       resultPromise = deferred.promise;
-
       dedupMap.set(dedupKey, deferred.promise);
 
       const cleanup = () => {
@@ -531,41 +720,50 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
           // never throw from cleanup
         }
       };
-
       void deferred.promise.then(cleanup, cleanup);
     }
 
     try {
-      const r = await _acquire(request, ao);
+      const r = await _acquire(request, acquireOpts);
       if (!r.ok) {
         throw new LLMBulkheadRejectedError(r.reason);
       }
 
       const work = (async () => {
+        let result: T;
         try {
-          return await fn(ao.signal);
-        } finally {
-          r.token.release();
+          result = await fn(ao.signal);
+        } catch (err) {
+          r.token.release(); // no usage on error
+          throw err;
         }
+
+        // Extract usage for refund.
+        let usage: TokenUsage | undefined;
+        if (getUsage) {
+          try {
+            usage = getUsage(result);
+          } catch {
+            // bad getUsage must not break release
+          }
+        }
+        r.token.release(usage);
+        return result;
       })();
 
       if (deferred) {
         void work.then(
-          (v) => {
-            deferred.resolve(v);
-          },
-          (e) => {
-            deferred.reject(e);
-          },
+          (v) => deferred.resolve(v),
+          (e) => deferred.reject(e),
         );
-        return resultPromise!; // leader awaits the same promise as followers
+        return resultPromise!;
       }
 
       return work;
     } catch (err) {
       if (deferred) {
         deferred.reject(err);
-        return resultPromise!; // IMPORTANT: avoid throwing here -> no unhandled deferred rejection
+        return resultPromise!;
       }
       throw err;
     }
@@ -581,10 +779,11 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         budget: budget.budget,
         inFlightTokens,
         available: Math.max(0, budget.budget - inFlightTokens),
+        totalRefunded,
       };
     }
 
-    if (opts.deduplication) {
+    if (dedup.enabled) {
       result.deduplication = {
         active: dedupMap.size,
         hits: dedupHits,
@@ -594,7 +793,42 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     return result;
   }
 
-  return { acquire, run, stats };
+  /**
+   * Stop admission permanently. All pending waiters in the underlying
+   * bulkhead are rejected with `'shutdown'`. Future `acquire`/`run`
+   * calls reject immediately. In-flight work is not interrupted.
+   */
+  function close(): void {
+    bulkhead.close();
+  }
+
+  /**
+   * Returns a promise that resolves when all in-flight work and
+   * pending waiters have completed. Works with or without `close()`.
+   * Compose as `close()` → `drain()` for graceful shutdown.
+   */
+  function drain(): Promise<void> {
+    return bulkhead.drain();
+  }
+
+  /**
+   * Subscribe to a bulkhead lifecycle event.
+   * Returns an unsubscribe function.
+   *
+   * Listeners are called synchronously from the bulkhead's internal
+   * control flow. They must not throw — exceptions are silently caught.
+   */
+  function on<K extends LLMEventType>(
+    event: K,
+    listener: Listener<K>,
+  ): () => void {
+    listeners[event].add(listener);
+    return () => {
+      listeners[event].delete(listener);
+    };
+  }
+
+  return { acquire, run, stats, close, drain, on };
 }
 
 export type LLMBulkhead = ReturnType<typeof createLLMBulkhead>;
