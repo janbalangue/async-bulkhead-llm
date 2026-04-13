@@ -27,10 +27,67 @@ Designed for services that need to enforce **cost ceilings, concurrency limits, 
 - ✅ Node.js **20+**
 
 Non-goals (by design):
+
 - ❌ No retries
 - ❌ No provider SDK — bring your own client
 - ❌ No distributed coordination
 - ❌ No cost accounting — token estimation is for load-shedding only
+
+---
+
+## Competitive Matrix (LLM Workloads)
+
+| Capability / Library | async-bulkhead-llm | LangChain / LlamaIndex | OpenAI SDK (raw) | p-limit / Bottleneck | cockatiel / polly |
+|---------------------|--------------------|------------------------|------------------|---------------------|-------------------|
+| **Primary goal** | LLM admission control (cost + concurrency) | Orchestration / pipelines | API client | Concurrency / scheduling | Resilience patterns |
+| **Fail-fast by default** | ✅ Yes | ❌ No | ❌ No | ❌ No | ⚠️ Depends |
+| **Token-aware admission** | ✅ Yes (pre-admission budget) | ❌ No | ❌ No | ❌ No | ❌ No |
+| **Token refund (post-call correction)** | ✅ Yes | ❌ No | ❌ No | ❌ No | ❌ No |
+| **Cost ceiling enforcement** | ✅ Yes (`tokenBudget`) | ❌ No | ❌ No | ❌ No | ❌ No |
+| **Concurrency limits** | ✅ Yes | ⚠️ Indirect | ❌ No | ✅ Yes | ⚠️ Indirect |
+| **Bounded queue (optional)** | ✅ Yes | ⚠️ Internal | ❌ No | ✅ Yes | ⚠️ Indirect |
+| **Fail-fast overload handling** | ✅ Core feature | ❌ No | ❌ No | ❌ No | ⚠️ Indirect |
+| **In-flight deduplication** | ✅ Yes | ⚠️ Partial caching | ❌ No | ❌ No | ❌ No |
+| **Custom dedup key** | ✅ Yes | ❌ No | ❌ No | ❌ No | ❌ No |
+| **Model-aware estimation** | ✅ Yes | ❌ No | ❌ No | ❌ No | ❌ No |
+| **Per-request model routing** | ✅ Yes | ✅ Yes | ✅ Yes | ❌ No | ❌ No |
+| **Multimodal-aware estimation** | ✅ Yes (text-only counted) | ❌ No | ❌ No | ❌ No | ❌ No |
+| **Abort / timeout (admission)** | ✅ Yes | ⚠️ Partial | ⚠️ SDK-level | ⚠️ Partial | ✅ Yes |
+| **Event hooks (metrics/logging)** | ✅ Yes | ❌ No | ❌ No | ❌ No | ⚠️ Limited |
+| **Graceful shutdown (drain/close)** | ✅ Yes | ❌ No | ❌ No | ❌ No | ❌ No |
+| **Retries / fallback** | ❌ No | ⚠️ Yes | ❌ No | ❌ No | ✅ Yes |
+| **LLM orchestration (chains/agents)** | ❌ No | ✅ Yes | ❌ No | ❌ No | ❌ No |
+
+---
+
+### Quick positioning
+
+- **LangChain / LlamaIndex** → *what to run* (orchestration)  
+- **OpenAI SDK** → *how to call the provider*  
+- **p-limit / Bottleneck** → *how many tasks run*  
+- **cockatiel / polly** → *what happens after failure*  
+- **async-bulkhead-llm** → **whether a request should run at all**
+
+---
+
+### Rule of thumb
+
+> If you want to **build LLM pipelines**, use LangChain.  
+> If you want to **protect your system and budget under load**, use async-bulkhead-llm.
+
+---
+
+### Key differentiator
+
+> **Most LLM tooling optimizes execution.  
+> async-bulkhead-llm optimizes survival under load.**
+
+It enforces:
+- **concurrency ceilings**
+- **token budget ceilings**
+- **fail-fast admission**
+
+before a request ever reaches your provider.
 
 ---
 
