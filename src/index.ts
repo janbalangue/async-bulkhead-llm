@@ -6,6 +6,8 @@ import {
   type RejectReason as BaseRejectReason,
 } from "async-bulkhead-ts";
 
+type BulkheadSignal = NonNullable<AcquireOptions["signal"]>;
+
 // ────────────────────────────────────────────
 // Content block types (multimodal support)
 // ────────────────────────────────────────────
@@ -104,8 +106,22 @@ export class LLMBulkheadRejectedError extends Error {
 // Stats
 // ────────────────────────────────────────────
 
-export type LLMStats = Stats & {
-  /** Present only when `tokenBudget` is configured. */
+export type LLMRequestStats = {
+  /** Successful LLM admissions (slot + budget acquired). */
+  admitted: number;
+  /** Successful LLM releases via the wrapped LLM token. */
+  released: number;
+  /** Total LLM-layer rejections. */
+  rejected: number;
+  /** LLM-layer rejections by reason. */
+  rejectedByReason: Partial<Record<LLMRejectReason, number>>;
+};
+
+export type LLMStats = {
+  /** Underlying async-bulkhead-ts stats. */
+  bulkhead: Stats;
+  /** LLM-layer request stats. */
+  llm: LLMRequestStats;  /** Present only when `tokenBudget` is configured. */
   tokenBudget?: {
     budget: number;
     inFlightTokens: number;
@@ -513,6 +529,10 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
 
   let inFlightTokens = 0;
   let totalRefunded = 0;
+  let llmAdmitted = 0;
+  let llmReleased = 0;
+  let llmRejected = 0;
+  const llmRejectedByReason: Partial<Record<LLMRejectReason, number>> = {};
 
   // ---- Deduplication state ----
   const dedup = resolveDedup(opts.deduplication);
@@ -540,6 +560,19 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     }
   }
 
+  function noteLLMAdmit(): void {
+    llmAdmitted++;
+  }
+
+  function noteLLMRelease(): void {
+    llmReleased++;
+  }
+
+  function noteLLMReject(reason: LLMRejectReason): void {
+    llmRejected++;
+    llmRejectedByReason[reason] =
+      (llmRejectedByReason[reason] ?? 0) + 1;
+  }
   // ---- Internal helpers ----
 
   function createDeferred<T>() {
@@ -597,6 +630,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
           base.release();
         } finally {
           const refunded = releaseTokens(reserved, usage);
+          noteLLMRelease();
           emit("release", {
             request,
             reservedTokens: reserved,
@@ -619,6 +653,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       const estimate = estimator(request);
       const needed = estimate.input + estimate.maxOutput;
       if (inFlightTokens + needed > budget.budget) {
+        noteLLMReject("budget_limit");
         emit("reject", { request, reason: "budget_limit" });
         return { ok: false, reason: "budget_limit" };
       }
@@ -632,6 +667,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     const r = await bulkhead.acquire(mergedOptions);
 
     if (!r.ok) {
+      noteLLMReject(r.reason);
       emit("reject", { request, reason: r.reason });
       return { ok: false, reason: r.reason };
     }
@@ -640,10 +676,12 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     const reserved = tryReserveTokens(request);
     if (reserved === null) {
       r.token.release();
+      noteLLMReject("budget_limit");
       emit("reject", { request, reason: "budget_limit" });
       return { ok: false, reason: "budget_limit" };
     }
 
+    noteLLMAdmit();
     emit("admit", { request, reservedTokens: reserved });
     return { ok: true, token: wrapToken(r.token, reserved, request) };
   }
@@ -675,7 +713,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
    */
   async function run<T>(
     request: LLMRequest,
-    fn: (signal?: AbortSignal) => Promise<T>,
+    fn: (signal?: BulkheadSignal) => Promise<T>,
     ao: AcquireOptions & {
       getUsage?: (result: T) => TokenUsage | undefined;
     } = {},
@@ -772,7 +810,15 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
   /** Runtime stats. Optional fields are present only when the feature is enabled. */
   function stats(): LLMStats {
     const base = bulkhead.stats();
-    const result: LLMStats = { ...base };
+    const result: LLMStats = {
+      bulkhead: base,
+      llm: {
+        admitted: llmAdmitted,
+        released: llmReleased,
+        rejected: llmRejected,
+        rejectedByReason: { ...llmRejectedByReason },
+      },
+    };
 
     if (budget) {
       result.tokenBudget = {

@@ -7,6 +7,78 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.0.0] —
+
+### Breaking Changes
+
+* **`LLMStats` shape changed.** `bulkhead.stats()` no longer returns base `Stats` fields at the top level.
+  Base bulkhead stats now live under `stats().bulkhead`, and LLM-layer counters now live under
+  `stats().llm`.
+* Code that previously accessed:
+  * `stats().inFlight`
+  * `stats().pending`
+  * `stats().maxConcurrent`
+  * `stats().maxQueue`
+  * `stats().closed`
+  
+  must now read:
+  * `stats().bulkhead.inFlight`
+  * `stats().bulkhead.pending`
+  * `stats().bulkhead.maxConcurrent`
+  * `stats().bulkhead.maxQueue`
+  * `stats().bulkhead.closed`
+
+### Added
+
+* `stats().llm` block with LLM-layer request counters:
+  * `admitted`
+  * `released`
+  * `rejected`
+  * `rejectedByReason`
+
+### Changed
+
+* The `run()` callback signal type now derives from `AcquireOptions["signal"]`
+  instead of referring to the global `AbortSignal` type directly.
+* Test utilities now avoid direct dependency on ambient `AbortController` globals.
+* Bumped `async-bulkhead-ts` to `^0.4.1`. :contentReference[oaicite:1]{index=1}
+
+### Migration Guide
+
+**From v2 → v3, update stats access only.**
+
+Before:
+
+```ts
+const s = bulkhead.stats();
+s.inFlight;
+s.pending;
+```
+
+After:
+
+```ts
+const s = bulkhead.stats();
+s.bulkhead.inFlight;
+s.bulkhead.pending;
+```
+
+LLM-layer counters are now separate:
+
+```ts
+const s = bulkhead.stats();
+s.llm.admitted;
+s.llm.rejected;
+s.llm.rejectedByReason.budget_limit;
+```
+
+### Notes
+
+* No change to admission semantics, token budget semantics, deduplication behavior,
+  or graceful shutdown behavior.
+* This release separates underlying bulkhead telemetry from LLM-layer request telemetry.
+
+---
 
 ## [2.0.0] — 2026-03-03
 

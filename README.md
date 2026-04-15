@@ -83,6 +83,7 @@ Non-goals (by design):
 > async-bulkhead-llm optimizes survival under load.**
 
 It enforces:
+
 - **concurrency ceilings**
 - **token budget ceilings**
 - **fail-fast admission**
@@ -118,6 +119,20 @@ const result = await bulkhead.run(request, async () => {
   return callYourLLMProvider(request);
 });
 ```
+
+---
+
+## What's New in v3
+
+### Stats are now namespaced
+
+`bulkhead.stats()` now separates:
+
+- underlying bulkhead stats → stats().bulkhead
+- LLM-layer request stats → stats().llm
+
+This avoids conflating base bulkhead slot lifecycle with higher-level LLM request outcomes
+such as 'budget_limit'.
 
 ---
 
@@ -438,11 +453,16 @@ try {
 ```ts
 const s = bulkhead.stats();
 
-s.inFlight
-s.pending
-s.maxConcurrent
-s.maxQueue
-s.closed                             // true after close()
+s.bulkhead.inFlight
+s.bulkhead.pending
+s.bulkhead.maxConcurrent
+s.bulkhead.maxQueue
+s.bulkhead.closed                    // true after close()
+
+s.llm.admitted
+s.llm.released
+s.llm.rejected
+s.llm.rejectedByReason?.budget_limit                        // true after close()
 
 s.tokenBudget?.budget
 s.tokenBudget?.inFlightTokens
@@ -451,6 +471,28 @@ s.tokenBudget?.totalRefunded         // v2: cumulative refunded tokens
 
 s.deduplication?.active
 s.deduplication?.hits
+```
+
+```ts
+type LLMStats = {
+  bulkhead: Stats;
+  llm: {
+    admitted: number;
+    released: number;
+    rejected: number;
+    rejectedByReason: Partial<Record<LLMRejectReason, number>>;
+  };
+  tokenBudget?: {
+    budget: number;
+    inFlightTokens: number;
+    available: number;
+    totalRefunded: number;
+  };
+  deduplication?: {
+    active: number;
+    hits: number;
+  };
+};
 ```
 
 ---
@@ -581,9 +623,36 @@ type LLMRejectReason =
 
 ---
 
-## Migration from v1
+## Migration
 
-Most callers need zero changes. See [CHANGELOG](./CHANGELOG.md) for a detailed migration guide.
+### v2 → v3
+
+Update stats access from top-level fields to the `bulkhead` block:
+
+```ts
+const s = bulkhead.stats();
+
+// v2
+s.inFlight;
+s.pending;
+
+// v3
+s.bulkhead.inFlight;
+s.bulkhead.pending;
+```
+
+LLM-layer counters are now available separately:
+
+```ts
+const s = bulkhead.stats();
+s.llm.admitted;
+s.llm.rejected;
+s.llm.rejectedByReason?.budget_limit;
+```
+
+### v1 → v2
+
+See [CHANGELOG](./CHANGELOG.md) for the v2 migration guide.
 
 ---
 

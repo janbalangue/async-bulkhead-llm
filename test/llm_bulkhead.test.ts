@@ -11,6 +11,22 @@ import {
   type TokenUsage,
   type LLMEventMap,
 } from "../src/index";
+import type { AcquireOptions } from "async-bulkhead-ts";
+
+
+type TestAbortController = {
+  signal: NonNullable<AcquireOptions["signal"]>;
+  abort(reason?: unknown): void;
+};
+
+function makeAbortController(): TestAbortController {
+  const AbortControllerCtor = (
+    globalThis as typeof globalThis & {
+      AbortController: new () => TestAbortController;
+    }
+  ).AbortController;
+  return new AbortControllerCtor();
+}
 
 // ── Helpers ──────────────────────────────────────────────────
 
@@ -475,7 +491,7 @@ describe("token budget", () => {
     const r = await b.acquire(makeRequest());
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("budget_limit");
-    expect(b.stats().pending).toBe(0);
+    expect(b.stats().bulkhead.pending).toBe(0);
   });
 
   it("token reservation is released when request completes via run()", async () => {
@@ -778,10 +794,10 @@ describe("concurrency limits", () => {
     const r1 = await b.acquire(makeRequest());
     const r2 = await b.acquire(makeRequest());
 
-    expect(b.stats().inFlight).toBe(2);
+    expect(b.stats().bulkhead.inFlight).toBe(2);
     if (r1.ok) r1.token.release();
     if (r2.ok) r2.token.release();
-    expect(b.stats().inFlight).toBe(0);
+    expect(b.stats().bulkhead.inFlight).toBe(0);
   });
 });
 
@@ -849,7 +865,7 @@ describe("queue and waiting", () => {
     });
 
     const r1 = await b.acquire(makeRequest());
-    const ac = new AbortController();
+    const ac = makeAbortController();
     const r2P = b.acquire(makeRequest(), { signal: ac.signal });
     expect(await isSettled(r2P, 5)).toBe(false);
 
@@ -857,7 +873,7 @@ describe("queue and waiting", () => {
     const r2 = await r2P;
     expect(r2.ok).toBe(false);
     if (!r2.ok) expect(r2.reason).toBe("aborted");
-    expect(b.stats().pending).toBe(0);
+    expect(b.stats().bulkhead.pending).toBe(0);
     if (r1.ok) r1.token.release();
   });
 });
@@ -880,7 +896,7 @@ describe("run()", () => {
       }),
     ).rejects.toThrow("boom");
 
-    expect(b.stats().inFlight).toBe(0);
+    expect(b.stats().bulkhead.inFlight).toBe(0);
   });
 
   it("throws LLMBulkheadRejectedError on concurrency rejection", async () => {
@@ -919,8 +935,8 @@ describe("run()", () => {
 
   it("passes AbortSignal through to fn", async () => {
     const b = createLLMBulkhead({ model: "claude-sonnet-4", maxConcurrent: 1 });
-    const ac = new AbortController();
-    let receivedSignal: AbortSignal | undefined;
+    const ac = makeAbortController();
+    let receivedSignal: AcquireOptions["signal"] | undefined;
 
     await b.run(
       makeRequest(),
@@ -949,7 +965,7 @@ describe("run()", () => {
     const [r1, r2] = await Promise.all([p1, p2]);
     expect(r1).toBe("first");
     expect(r2).toBe("second");
-    expect(b.stats().inFlight).toBe(0);
+    expect(b.stats().bulkhead.inFlight).toBe(0);
   });
 });
 
@@ -1342,7 +1358,7 @@ describe("close and drain", () => {
     await b.drain();
     await p;
 
-    expect(b.stats().inFlight).toBe(0);
+    expect(b.stats().bulkhead.inFlight).toBe(0);
   });
 
   it("close() + drain() composes for graceful shutdown", async () => {
@@ -1365,7 +1381,7 @@ describe("close and drain", () => {
     const [r1, r2] = await Promise.all([p1, p2]);
     expect(r1).toBe("a");
     expect(r2).toBe("b");
-    expect(b.stats().inFlight).toBe(0);
+    expect(b.stats().bulkhead.inFlight).toBe(0);
   });
 });
 
@@ -1382,15 +1398,47 @@ describe("TokenUsage type", () => {
 // ── Stats ────────────────────────────────────────────────────
 
 describe("stats()", () => {
-  it("base stats fields are always present", () => {
+  it("base stats fields are namespaced under bulkhead", () => {
     const b = createLLMBulkhead({ model: "claude-sonnet-4", maxConcurrent: 5 });
     const s = b.stats();
-    expect(typeof s.inFlight).toBe("number");
-    expect(typeof s.pending).toBe("number");
-    expect(s.maxConcurrent).toBe(5);
-    expect(s.maxQueue).toBe(0);
+    expect(typeof s.bulkhead.inFlight).toBe("number");
+    expect(typeof s.bulkhead.pending).toBe("number");
+    expect(s.bulkhead.maxConcurrent).toBe(5);
+    expect(s.bulkhead.maxQueue).toBe(0);
   });
 
+  it("tracks LLM-layer counters separately from base bulkhead counters", async () => {
+    const b = createLLMBulkhead({
+      model: "claude-sonnet-4",
+      maxConcurrent: 2,
+      tokenBudget: {
+        budget: 10,
+        estimator: () => ({ input: 8, maxOutput: 0 }),
+      },
+    });
+
+    const [r1, r2] = await Promise.all([
+      b.acquire(makeRequest("a")),
+      b.acquire(makeRequest("b")),
+    ]);
+
+    expect(r1.ok || r2.ok).toBe(true);
+    expect(r1.ok && r2.ok).toBe(false);
+
+    const rejected = r1.ok ? r2 : r1;
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) expect(rejected.reason).toBe("budget_limit");
+
+    const s = b.stats();
+    expect(s.bulkhead.totalAdmitted).toBe(2);
+    expect(s.llm.admitted).toBe(1);
+    expect(s.llm.rejected).toBe(1);
+    expect(s.llm.rejectedByReason.budget_limit).toBe(1);
+
+    if (r1.ok) r1.token.release();
+    if (r2.ok) r2.token.release();
+   });
+   
   it("drains to zero after all work completes", async () => {
     const b = createLLMBulkhead({
       model: "claude-sonnet-4",
@@ -1406,8 +1454,8 @@ describe("stats()", () => {
     ]);
 
     const s = b.stats();
-    expect(s.inFlight).toBe(0);
-    expect(s.pending).toBe(0);
+    expect(s.bulkhead.inFlight).toBe(0);
+    expect(s.bulkhead.pending).toBe(0);
     expect(s.tokenBudget?.inFlightTokens).toBe(0);
     expect(s.deduplication?.active).toBe(0);
   });
@@ -1607,16 +1655,16 @@ describe("async-bulkhead-llm v2 stress", () => {
 
           // Observe invariants
           const s = b.stats();
-          if (s.inFlight > maxInFlightObserved)
-            maxInFlightObserved = s.inFlight;
-          if (s.pending > maxPendingObserved)
-            maxPendingObserved = s.pending;
+          if (s.bulkhead.inFlight > maxInFlightObserved)
+            maxInFlightObserved = s.bulkhead.inFlight;
+          if (s.bulkhead.pending > maxPendingObserved)
+            maxPendingObserved = s.bulkhead.pending;
           const iT = s.tokenBudget?.inFlightTokens ?? 0;
           if (iT > maxInFlightTokensObserved)
             maxInFlightTokensObserved = iT;
 
-          expect(s.inFlight).toBeLessThanOrEqual(maxConcurrent);
-          expect(s.pending).toBeLessThanOrEqual(maxQueue);
+          expect(s.bulkhead.inFlight).toBeLessThanOrEqual(maxConcurrent);
+          expect(s.bulkhead.pending).toBeLessThanOrEqual(maxQueue);
           if (s.tokenBudget) {
             expect(s.tokenBudget.inFlightTokens).toBeLessThanOrEqual(
               tokenBudget,
@@ -1632,8 +1680,8 @@ describe("async-bulkhead-llm v2 stress", () => {
       if (errors.length) throw errors[0];
 
       const final = b.stats();
-      expect(final.inFlight).toBe(0);
-      expect(final.pending).toBe(0);
+      expect(final.bulkhead.inFlight).toBe(0);
+      expect(final.bulkhead.pending).toBe(0);
       expect(final.tokenBudget?.inFlightTokens).toBe(0);
       expect(final.tokenBudget?.available).toBe(tokenBudget);
 
