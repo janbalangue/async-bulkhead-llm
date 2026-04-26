@@ -756,6 +756,156 @@ describe("token budget refund", () => {
   });
 });
 
+// ── Token budget cumulative counters (v3.1) ──────────────────
+
+describe("token budget cumulative counters", () => {
+  it("totalReserved increments on each successful admission", async () => {
+    const b = createLLMBulkhead({
+      model: "claude-sonnet-4",
+      maxConcurrent: 5,
+      tokenBudget: {
+        budget: 10_000,
+        estimator: () => ({ input: 100, maxOutput: 400 }), // 500 each
+      },
+    });
+
+    expect(b.stats().tokenBudget?.totalReserved).toBe(0);
+
+    const r1 = await b.acquire(makeRequest());
+    expect(b.stats().tokenBudget?.totalReserved).toBe(500);
+
+    const r2 = await b.acquire(makeRequest());
+    expect(b.stats().tokenBudget?.totalReserved).toBe(1_000);
+
+    if (r1.ok) r1.token.release();
+    if (r2.ok) r2.token.release();
+
+    // totalReserved is monotonic — release does not decrement it.
+    expect(b.stats().tokenBudget?.totalReserved).toBe(1_000);
+  });
+
+  it("totalReserved does not increment on rejected admissions", async () => {
+    const b = createLLMBulkhead({
+      model: "claude-sonnet-4",
+      maxConcurrent: 5,
+      tokenBudget: {
+        budget: 600,
+        estimator: () => ({ input: 100, maxOutput: 400 }), // 500 each
+      },
+    });
+
+    const r1 = await b.acquire(makeRequest());
+    expect(r1.ok).toBe(true);
+    expect(b.stats().tokenBudget?.totalReserved).toBe(500);
+
+    // Second admission would exceed budget (500 + 500 > 600) — rejected.
+    const r2 = await b.acquire(makeRequest());
+    expect(r2.ok).toBe(false);
+    expect(b.stats().tokenBudget?.totalReserved).toBe(500);
+  });
+
+  it("totalConsumed increments by usage.input + usage.output when usage is reported", async () => {
+    const b = createLLMBulkhead({
+      model: "claude-sonnet-4",
+      maxConcurrent: 5,
+      tokenBudget: {
+        budget: 10_000,
+        estimator: () => ({ input: 100, maxOutput: 400 }), // 500 reserved
+      },
+    });
+
+    const r = await b.acquire(makeRequest());
+    expect(r.ok).toBe(true);
+    if (r.ok) r.token.release({ input: 80, output: 20 });
+
+    expect(b.stats().tokenBudget?.totalConsumed).toBe(100);
+  });
+
+  it("totalConsumed stays at 0 when release() is called without usage", async () => {
+    const b = createLLMBulkhead({
+      model: "claude-sonnet-4",
+      maxConcurrent: 5,
+      tokenBudget: {
+        budget: 10_000,
+        estimator: () => ({ input: 100, maxOutput: 400 }),
+      },
+    });
+
+    const r = await b.acquire(makeRequest());
+    if (r.ok) r.token.release(); // no usage
+
+    expect(b.stats().tokenBudget?.totalConsumed).toBe(0);
+  });
+
+  it("totalConsumed reports actual usage even when it exceeds reserved (no clamping)", async () => {
+    const b = createLLMBulkhead({
+      model: "claude-sonnet-4",
+      maxConcurrent: 5,
+      tokenBudget: {
+        budget: 10_000,
+        estimator: () => ({ input: 100, maxOutput: 400 }), // 500 reserved
+      },
+    });
+
+    const r = await b.acquire(makeRequest());
+    if (r.ok) r.token.release({ input: 300, output: 400 }); // actual 700 > reserved 500
+
+    expect(b.stats().tokenBudget?.totalConsumed).toBe(700);
+    // Refund stays at 0 since actual > reserved.
+    expect(b.stats().tokenBudget?.totalRefunded).toBe(0);
+  });
+
+  it("totalReserved == totalConsumed + totalRefunded when getUsage is wired and no over-consumption", async () => {
+    const b = createLLMBulkhead({
+      model: "claude-sonnet-4",
+      maxConcurrent: 5,
+      tokenBudget: {
+        budget: 10_000,
+        estimator: () => ({ input: 100, maxOutput: 400 }), // 500 reserved per call
+      },
+    });
+
+    // Three releases, each with usage strictly less than reserved.
+    for (let i = 0; i < 3; i++) {
+      const r = await b.acquire(makeRequest());
+      if (r.ok) r.token.release({ input: 80, output: 20 }); // actual 100, refund 400
+    }
+
+    const tb = b.stats().tokenBudget!;
+    expect(tb.totalReserved).toBe(1_500);
+    expect(tb.totalConsumed).toBe(300);
+    expect(tb.totalRefunded).toBe(1_200);
+    expect(tb.totalReserved).toBe(tb.totalConsumed + tb.totalRefunded);
+  });
+
+  it("run() with getUsage drives both totalConsumed and totalRefunded", async () => {
+    const b = createLLMBulkhead({
+      model: "claude-sonnet-4",
+      maxConcurrent: 5,
+      tokenBudget: {
+        budget: 10_000,
+        estimator: () => ({ input: 100, maxOutput: 400 }),
+      },
+    });
+
+    await b.run(
+      makeRequest(),
+      async () => ({ usage: { input: 50, output: 50 } as TokenUsage }),
+      { getUsage: (r) => r.usage },
+    );
+
+    const tb = b.stats().tokenBudget!;
+    expect(tb.totalReserved).toBe(500);
+    expect(tb.totalConsumed).toBe(100);
+    expect(tb.totalRefunded).toBe(400);
+  });
+
+  it("counters are absent when tokenBudget is not configured", () => {
+    const b = createLLMBulkhead({ model: "claude-sonnet-4", maxConcurrent: 5 });
+    expect(b.stats().tokenBudget).toBeUndefined();
+  });
+});
+
 // ── Concurrency ──────────────────────────────────────────────
 
 describe("concurrency limits", () => {

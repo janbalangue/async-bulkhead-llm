@@ -7,7 +7,29 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [3.0.0] —
+## [3.1.0] — 2026-04-26
+ 
+### Added
+ 
+* **`stats().tokenBudget.totalReserved`** — cumulative tokens reserved at admission across all successful admissions. Monotonically increasing. Useful as the numerator companion to `inFlightTokens`/`available` for rate and saturation analysis over time.
+* **`stats().tokenBudget.totalConsumed`** — cumulative actual tokens consumed (`usage.input + usage.output`), summed across releases that reported `TokenUsage` via `token.release(usage)` or `run({ getUsage })`. Releases without usage contribute 0 — `totalConsumed` is meaningful only when `getUsage` is wired up consistently. Not clamped: over-consumption (actual > reserved) is reported as-is.
+When `getUsage` is wired consistently and no over-consumption occurs, the invariant `totalReserved == totalConsumed + totalRefunded` holds after all in-flight requests settle.
+ 
+### Changed
+ 
+* No changes to admission, release, refund, deduplication, event, or shutdown semantics.
+* **Documentation:** expanded the `release` event JSDoc to document the per-request consumption math (`usage ? usage.input + usage.output : null`) and the `null` vs `0` distinction for unreported usage. Pure docstring change — no API or behavior change.
+
+### Notes
+ 
+* Strict superset of the existing `totalRefunded` field — no breaking changes.
+* Both new fields are present whenever `tokenBudget` is configured (alongside `totalRefunded`); both are absent when `tokenBudget` is omitted.
+* These counters are designed for the library's existing scope: saturation tracking, throughput analysis, and refund-efficiency tuning (e.g., `totalRefunded / totalReserved` to surface overly generous `max_tokens` settings).
+* For accurate cost accounting, the `release` event remains the right primitive — it preserves the input/output split from `TokenUsage`, which `totalConsumed` collapses into a single sum. Token estimation in this library is approximate and intentionally suited to load-shedding, not finance-grade reconciliation.
+
+---
+
+## [3.0.0] — 2026-04-15
 
 ### Breaking Changes
 

@@ -467,6 +467,8 @@ s.llm.rejectedByReason?.budget_limit                        // true after close(
 s.tokenBudget?.budget
 s.tokenBudget?.inFlightTokens
 s.tokenBudget?.available
+s.tokenBudget?.totalReserved        // v3.1: cumulative tokens reserved at admission
+s.tokenBudget?.totalConsumed        // v3.1: cumulative actual tokens consumed (usage required)
 s.tokenBudget?.totalRefunded         // v2: cumulative refunded tokens
 
 s.deduplication?.active
@@ -486,6 +488,8 @@ type LLMStats = {
     budget: number;
     inFlightTokens: number;
     available: number;
+    totalReserved: number;
+    totalConsumed: number;
     totalRefunded: number;
   };
   deduplication?: {

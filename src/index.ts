@@ -121,11 +121,25 @@ export type LLMStats = {
   /** Underlying async-bulkhead-ts stats. */
   bulkhead: Stats;
   /** LLM-layer request stats. */
-  llm: LLMRequestStats;  /** Present only when `tokenBudget` is configured. */
+  llm: LLMRequestStats;
+  /** Present only when `tokenBudget` is configured. */
   tokenBudget?: {
     budget: number;
     inFlightTokens: number;
     available: number;
+    /**
+     * Cumulative tokens reserved at admission across all successful
+     * admissions. Monotonically increasing.
+     */
+    totalReserved: number;
+    /**
+     * Cumulative actual tokens consumed (`usage.input + usage.output`),
+     * summed across releases that reported `TokenUsage`. Releases without
+     * usage contribute 0 — `totalConsumed` is meaningful only when
+     * `getUsage` is wired up consistently. Not clamped: over-consumption
+     * (actual > reserved) is reported as-is.
+     */
+    totalConsumed: number;
     /** Cumulative tokens returned to the budget via the refund mechanism. */
     totalRefunded: number;
   };
@@ -147,7 +161,22 @@ export type LLMEventMap = {
   admit: { request: LLMRequest; reservedTokens: number };
   /** Fired when a request is rejected at any stage. */
   reject: { request: LLMRequest; reason: LLMRejectReason };
-  /** Fired when a slot is released. */
+  /**
+   * Fired when a slot is released.
+   *
+   * `reservedTokens` is the pre-admission reservation (input estimate +
+   * `max_tokens` reservation). `refundedTokens` is what was returned to
+   * the budget — non-zero only when `usage` was reported and
+   * `usage.input + usage.output < reservedTokens`.
+   *
+   * Per-request actual consumption: `usage ? usage.input + usage.output : null`.
+   * The library does not pre-derive this onto the event payload — `null`
+   * (no usage reported) and `0` (genuinely zero usage) are different
+   * states that observers should distinguish.
+   *
+   * For cumulative consumption across all releases, prefer
+   * `stats().tokenBudget.totalConsumed` over aggregating these events.
+   */
   release: {
     request: LLMRequest;
     reservedTokens: number;
@@ -528,6 +557,8 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     });
 
   let inFlightTokens = 0;
+  let totalReserved = 0;
+  let totalConsumed = 0;
   let totalRefunded = 0;
   let llmAdmitted = 0;
   let llmReleased = 0;
@@ -596,6 +627,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     const needed = estimate.input + estimate.maxOutput;
     if (inFlightTokens + needed > budget.budget) return null;
     inFlightTokens += needed;
+    totalReserved += needed;
     return needed;
   }
 
@@ -603,6 +635,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     let refunded = 0;
     if (usage && reserved > 0) {
       const actual = usage.input + usage.output;
+      totalConsumed += actual;
       if (actual < reserved) {
         refunded = reserved - actual;
         totalRefunded += refunded;
@@ -825,6 +858,8 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         budget: budget.budget,
         inFlightTokens,
         available: Math.max(0, budget.budget - inFlightTokens),
+        totalReserved,
+        totalConsumed,
         totalRefunded,
       };
     }
