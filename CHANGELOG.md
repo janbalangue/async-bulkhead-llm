@@ -7,6 +7,20 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.1.1] — 2026-05-06
+
+### Fixed
+
+* **`createModelAwareTokenEstimator({ defaultModel })` typing.** The estimator factory now accepts an options object as the first argument when it includes `defaultModel`, matching external call-site expectations and avoiding the previous TypeScript error where `defaultModel` was interpreted as a numeric ratio override.
+
+### Notes
+
+* Backward-compatible patch release. Existing `createModelAwareTokenEstimator(overrides, opts)` calls continue to work.
+* Single-argument ratio overrides remain supported.
+* No runtime changes to token estimation, admission, release, refund, deduplication, event, or shutdown semantics.
+
+---
+
 ## [3.1.0] — 2026-04-26
  
 ### Added

@@ -431,6 +431,20 @@ export type ModelAwareEstimatorOptions = {
   onUnknownModel?: ((model: string) => void) | undefined;
 };
 
+function isModelAwareEstimatorOptions(
+  value: unknown,
+): value is ModelAwareEstimatorOptions {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  return (
+    "defaultModel" in value ||
+    "outputCap" in value ||
+    "onUnknownModel" in value
+  );
+}
+
 /**
  * Estimates token usage using per-model character ratios.
  *
@@ -441,9 +455,26 @@ export type ModelAwareEstimatorOptions = {
  * v2: handles multimodal content (text blocks counted, others ignored).
  */
 export function createModelAwareTokenEstimator(
+  opts?: ModelAwareEstimatorOptions,
+): TokenEstimator;
+export function createModelAwareTokenEstimator(
   overrides?: Record<string, number>,
-  opts: ModelAwareEstimatorOptions = {},
-): TokenEstimator {
+  opts?: ModelAwareEstimatorOptions,
+ ): TokenEstimator;
+ export function createModelAwareTokenEstimator(
+  overridesOrOpts?: Record<string, number> | ModelAwareEstimatorOptions,
+  maybeOpts?: ModelAwareEstimatorOptions,
+ ): TokenEstimator {
+  const hasSingleOptionsArg =
+    maybeOpts === undefined &&
+    isModelAwareEstimatorOptions(overridesOrOpts);
+
+  const overrides = hasSingleOptionsArg
+    ? undefined
+    : (overridesOrOpts as Record<string, number> | undefined);
+  const opts = hasSingleOptionsArg
+    ? overridesOrOpts
+    : (maybeOpts ?? {});
   const outputCap = opts.outputCap ?? DEFAULT_OUTPUT_CAP;
 
   function lookupRatio(model: string): number {

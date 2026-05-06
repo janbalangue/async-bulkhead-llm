@@ -13,7 +13,6 @@ import {
 } from "../src/index";
 import type { AcquireOptions } from "async-bulkhead-ts";
 
-
 type TestAbortController = {
   signal: NonNullable<AcquireOptions["signal"]>;
   abort(reason?: unknown): void;
@@ -30,8 +29,15 @@ function makeAbortController(): TestAbortController {
 
 // ── Helpers ──────────────────────────────────────────────────
 
+type SetTimeout = (handler: () => void, timeout?: number) => unknown;
+
 function sleep(ms: number) {
-  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+  const setTimer = (
+    globalThis as typeof globalThis & { setTimeout: SetTimeout }
+  ).setTimeout;
+  return new Promise<void>((resolve) => {
+    setTimer(resolve, ms);
+  });
 }
 
 function randInt(maxExclusive: number) {
@@ -102,6 +108,7 @@ async function swallowBulkheadRejection(p: Promise<void>): Promise<void> {
     throw e;
   }
 }
+
 
 // ── extractTextLength ────────────────────────────────────────
 
@@ -192,6 +199,22 @@ describe("naiveTokenEstimator", () => {
 // ── createModelAwareTokenEstimator ───────────────────────────
 
 describe("createModelAwareTokenEstimator", () => {
+  it("accepts options as the first argument", () => {
+    const est = createModelAwareTokenEstimator({
+      defaultModel: "claude-sonnet-4-20260101",
+    });
+    const result = est(makeRequest("x".repeat(390), 512));
+    expect(result.input).toBe(100); // 390 / 3.9 = 100
+  });
+
+  it("keeps single-argument ratio overrides backward-compatible", () => {
+    const est = createModelAwareTokenEstimator({
+      "custom-model": 2.0,
+    });
+    const result = est(makeRequest("x".repeat(200), 512, "custom-model"));
+    expect(result.input).toBe(100); // 200 / 2.0 = 100
+  });
+
   it("uses a known built-in ratio for a recognised model prefix", () => {
     const est = createModelAwareTokenEstimator(
       {},
