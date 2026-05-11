@@ -243,7 +243,7 @@ export type DeduplicationOptions = {
    * Requests with the same key that arrive while a matching call is
    * already in-flight share that call.
    *
-   * Default: `JSON.stringify({ m: request.messages, t: request.max_tokens })`.
+   * Default: `JSON.stringify({ m: request.messages, t: request.max_tokens, o: request.model })`.
    *
    * Return an empty string to opt a specific request out of deduplication.
    */
@@ -329,6 +329,45 @@ export type LLMAcquireResult =
 const DEFAULT_OUTPUT_CAP = 2_048;
 const NAIVE_CHAR_RATIO = 4.0;
 
+function isNonNegativeInteger(value: number): boolean {
+  return Number.isFinite(value) && Number.isInteger(value) && value >= 0;
+}
+
+function assertNonNegativeInteger(value: number, name: string): void {
+  if (!isNonNegativeInteger(value)) {
+    throw new Error(`${name} must be an integer >= 0`);
+  }
+}
+
+function assertPositiveInteger(value: number, name: string): void {
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+}
+
+function assertOptionalNonNegativeInteger(
+  value: number | undefined,
+  name: string,
+): void {
+  if (value !== undefined) assertNonNegativeInteger(value, name);
+}
+
+function validateTokenEstimate(estimate: TokenEstimate): number {
+  assertNonNegativeInteger(estimate.input, "token estimator input");
+  assertNonNegativeInteger(estimate.maxOutput, "token estimator maxOutput");
+  const needed = estimate.input + estimate.maxOutput;
+  assertNonNegativeInteger(needed, "token reservation");
+  return needed;
+}
+
+function validateTokenUsage(usage: TokenUsage): TokenUsage {
+  assertNonNegativeInteger(usage.input, "token usage input");
+  assertNonNegativeInteger(usage.output, "token usage output");
+  const actual = usage.input + usage.output;
+  assertNonNegativeInteger(actual, "token usage total");
+  return usage;
+}
+
 /**
  * Extract total character count from message content.
  * Handles both plain strings and multimodal content block arrays.
@@ -352,6 +391,8 @@ export function extractTextLength(
 }
 
 function resolveMaxOutput(request: LLMRequest, fallback: number): number {
+  assertNonNegativeInteger(fallback, "outputCap");
+  assertOptionalNonNegativeInteger(request.max_tokens, "request.max_tokens");
   return request.max_tokens ?? fallback;
 }
 
@@ -476,6 +517,7 @@ export function createModelAwareTokenEstimator(
     ? overridesOrOpts
     : (maybeOpts ?? {});
   const outputCap = opts.outputCap ?? DEFAULT_OUTPUT_CAP;
+  assertNonNegativeInteger(outputCap, "outputCap");
 
   function lookupRatio(model: string): number {
     // Exact overrides checked first (case-sensitive, then lowercased).
@@ -560,17 +602,24 @@ function defaultDedupKey(request: LLMRequest): string {
 
 export function createLLMBulkhead(opts: LLMBulkheadOptions) {
   // ---- Validate ----
-  if (!opts.model || typeof opts.model !== "string") {
+  if (typeof opts.model !== "string" || opts.model.trim() === "") {
     throw new Error("model must be a non-empty string");
   }
-  if (!Number.isInteger(opts.maxConcurrent) || opts.maxConcurrent <= 0) {
-    throw new Error("maxConcurrent must be a positive integer");
-  }
+  assertPositiveInteger(opts.maxConcurrent, "maxConcurrent");
 
   // ---- Resolve profile defaults ----
   const preset = resolvePreset(opts.profile);
   const maxQueue = opts.maxQueue ?? preset.maxQueue ?? 0;
   const timeoutMs = opts.timeoutMs ?? preset.timeoutMs;
+  assertNonNegativeInteger(maxQueue, "maxQueue");
+  assertOptionalNonNegativeInteger(timeoutMs, "timeoutMs");
+  if (opts.tokenBudget) {
+    assertPositiveInteger(opts.tokenBudget.budget, "tokenBudget.budget");
+    assertOptionalNonNegativeInteger(
+      opts.tokenBudget.outputCap,
+      "tokenBudget.outputCap",
+    );
+  }
 
   // ---- Internal bulkhead from async-bulkhead-ts ----
   const bulkhead = createBulkhead({
@@ -647,19 +696,21 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     return { promise, resolve, reject };
   }
 
-  /**
-   * Attempt token budget admission synchronously.
-   * Returns the reserved token count (0 when budget is disabled),
-   * or null if the budget ceiling is exceeded.
-   */
-  function tryReserveTokens(request: LLMRequest): number | null {
+  function estimateReservation(request: LLMRequest): number {
     if (!budget) return 0;
-    const estimate = estimator(request);
-    const needed = estimate.input + estimate.maxOutput;
-    if (inFlightTokens + needed > budget.budget) return null;
-    inFlightTokens += needed;
-    totalReserved += needed;
-    return needed;
+    return validateTokenEstimate(estimator(request));
+  }
+
+  /**
+   * Attempt token budget admission synchronously for a precomputed
+   * reservation. Returns false if the budget ceiling is exceeded.
+   */
+  function tryReserveTokens(reserved: number): boolean {
+    if (!budget) return true;
+    if (inFlightTokens + reserved > budget.budget) return false;
+    inFlightTokens += reserved;
+    totalReserved += reserved;
+    return true;
   }
 
   function releaseTokens(reserved: number, usage?: TokenUsage): number {
@@ -676,6 +727,84 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     return refunded;
   }
 
+  function normalizeAcquireOptions(ao: AcquireOptions): AcquireOptions {
+    const normalized: AcquireOptions = {};
+    if (ao.signal !== undefined) normalized.signal = ao.signal;
+    const effectiveTimeoutMs = ao.timeoutMs ?? timeoutMs;
+    if (effectiveTimeoutMs !== undefined) {
+      assertNonNegativeInteger(effectiveTimeoutMs, "timeoutMs");
+      normalized.timeoutMs = effectiveTimeoutMs;
+    }
+    return normalized;
+  }
+
+  function noteDedupWaitRejection(
+    request: LLMRequest,
+    reason: Extract<LLMRejectReason, "aborted" | "timeout">,
+  ): LLMBulkheadRejectedError {
+    noteLLMReject(reason);
+    emit("reject", { request, reason });
+    return new LLMBulkheadRejectedError(reason);
+  }
+
+  function waitForSharedDedup<T>(
+    shared: Promise<T>,
+    request: LLMRequest,
+    ao: AcquireOptions,
+  ): Promise<T> {
+    const normalized = normalizeAcquireOptions(ao);
+    const signal = normalized.signal;
+    const effectiveTimeoutMs = normalized.timeoutMs;
+
+    if (signal?.aborted) {
+      return Promise.reject(noteDedupWaitRejection(request, "aborted"));
+    }
+    if (signal === undefined && effectiveTimeoutMs === undefined) {
+      return shared;
+    }
+
+    return new Promise<T>((resolve, reject) => {
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+
+      const cleanup = () => {
+        if (timeoutId !== undefined) clearTimeout(timeoutId);
+        if (signal !== undefined) {
+          signal.removeEventListener("abort", onAbort);
+        }
+      };
+
+      const settle = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        fn();
+      };
+
+      const onAbort = () => {
+        settle(() => {
+          reject(noteDedupWaitRejection(request, "aborted"));
+        });
+      };
+
+      if (signal !== undefined) {
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+      if (effectiveTimeoutMs !== undefined) {
+        timeoutId = setTimeout(() => {
+          settle(() => {
+            reject(noteDedupWaitRejection(request, "timeout"));
+          });
+        }, effectiveTimeoutMs);
+      }
+
+      void shared.then(
+        (value) => settle(() => resolve(value)),
+        (err) => settle(() => reject(err)),
+      );
+    });
+  }
+
   /**
    * Wraps a base Token so that release() also returns the token
    * reservation and optionally applies the refund.
@@ -690,18 +819,31 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       release(usage?: TokenUsage) {
         if (released) return;
         released = true;
+
+        let validUsage: TokenUsage | undefined;
+        let usageError: unknown;
+        if (usage !== undefined) {
+          try {
+            validUsage = validateTokenUsage(usage);
+          } catch (err) {
+            usageError = err;
+          }
+        }
+
         try {
           base.release();
         } finally {
-          const refunded = releaseTokens(reserved, usage);
+          const refunded = releaseTokens(reserved, validUsage);
           noteLLMRelease();
           emit("release", {
             request,
             reservedTokens: reserved,
             refundedTokens: refunded,
-            ...(usage !== undefined && { usage }),
+            ...(validUsage !== undefined && { usage: validUsage }),
           });
         }
+
+        if (usageError !== undefined) throw usageError;
       },
     };
   }
@@ -712,21 +854,17 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     request: LLMRequest,
     ao: AcquireOptions,
   ): Promise<LLMAcquireResult> {
+    assertOptionalNonNegativeInteger(request.max_tokens, "request.max_tokens");
+    const reserved = estimateReservation(request);
+
     // Token budget: pre-check before entering the queue.
-    if (budget) {
-      const estimate = estimator(request);
-      const needed = estimate.input + estimate.maxOutput;
-      if (inFlightTokens + needed > budget.budget) {
-        noteLLMReject("budget_limit");
-        emit("reject", { request, reason: "budget_limit" });
-        return { ok: false, reason: "budget_limit" };
-      }
+    if (budget && inFlightTokens + reserved > budget.budget) {
+      noteLLMReject("budget_limit");
+      emit("reject", { request, reason: "budget_limit" });
+      return { ok: false, reason: "budget_limit" };
     }
 
-    const mergedOptions: AcquireOptions = {};
-    if (ao.signal !== undefined) mergedOptions.signal = ao.signal;
-    if (ao.timeoutMs !== undefined) mergedOptions.timeoutMs = ao.timeoutMs;
-    else if (timeoutMs !== undefined) mergedOptions.timeoutMs = timeoutMs;
+    const mergedOptions = normalizeAcquireOptions(ao);
 
     const r = await bulkhead.acquire(mergedOptions);
 
@@ -736,9 +874,8 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       return { ok: false, reason: r.reason };
     }
 
-    // Post-admission: reserve tokens now.
-    const reserved = tryReserveTokens(request);
-    if (reserved === null) {
+    // Post-admission: reserve the precomputed amount now.
+    if (!tryReserveTokens(reserved)) {
       r.token.release();
       noteLLMReject("budget_limit");
       emit("reject", { request, reason: "budget_limit" });
@@ -808,7 +945,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       if (existing) {
         dedupHits++;
         emit("dedup", { request });
-        return existing as Promise<T>;
+        return waitForSharedDedup(existing as Promise<T>, request, acquireOpts);
       }
       deferred = createDeferred<T>();
       resultPromise = deferred.promise;
@@ -844,7 +981,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         let usage: TokenUsage | undefined;
         if (getUsage) {
           try {
-            usage = getUsage(result);
+            const extracted = getUsage(result);
+            usage =
+              extracted === undefined ? undefined : validateTokenUsage(extracted);
           } catch {
             // bad getUsage must not break release
           }

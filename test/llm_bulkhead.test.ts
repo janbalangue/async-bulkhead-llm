@@ -393,6 +393,54 @@ describe("createLLMBulkhead validation", () => {
       createLLMBulkhead({ model: "gpt-4o", maxConcurrent: 1.5 }),
     ).toThrow("maxConcurrent");
   });
+
+  it("throws if queue and timeout options are invalid", () => {
+    expect(() =>
+      createLLMBulkhead({
+        model: "gpt-4o",
+        maxConcurrent: 1,
+        maxQueue: -1,
+      }),
+    ).toThrow("maxQueue");
+    expect(() =>
+      createLLMBulkhead({
+        model: "gpt-4o",
+        maxConcurrent: 1,
+        maxQueue: 1.5,
+      }),
+    ).toThrow("maxQueue");
+    expect(() =>
+      createLLMBulkhead({
+        model: "gpt-4o",
+        maxConcurrent: 1,
+        timeoutMs: -1,
+      }),
+    ).toThrow("timeoutMs");
+  });
+
+  it("throws if token budget options are invalid", () => {
+    expect(() =>
+      createLLMBulkhead({
+        model: "gpt-4o",
+        maxConcurrent: 1,
+        tokenBudget: { budget: 0 },
+      }),
+    ).toThrow("tokenBudget.budget");
+    expect(() =>
+      createLLMBulkhead({
+        model: "gpt-4o",
+        maxConcurrent: 1,
+        tokenBudget: { budget: -1 },
+      }),
+    ).toThrow("tokenBudget.budget");
+    expect(() =>
+      createLLMBulkhead({
+        model: "gpt-4o",
+        maxConcurrent: 1,
+        tokenBudget: { budget: 100, outputCap: -1 },
+      }),
+    ).toThrow("tokenBudget.outputCap");
+  });
 });
 
 // ── Profile / preset resolution ──────────────────────────────
@@ -616,6 +664,54 @@ describe("token budget", () => {
     expect(r.ok).toBe(true);
     if (r.ok) r.token.release();
   });
+
+  it("calls the estimator once per successful acquisition", async () => {
+    const customEstimator = vi
+      .fn()
+      .mockReturnValue({ input: 10, maxOutput: 10 });
+
+    const b = createLLMBulkhead({
+      model: "claude-sonnet-4",
+      maxConcurrent: 1,
+      tokenBudget: { budget: 1_000, estimator: customEstimator },
+    });
+
+    const r = await b.acquire(makeRequest());
+    expect(r.ok).toBe(true);
+    expect(customEstimator).toHaveBeenCalledOnce();
+    if (r.ok) r.token.release();
+  });
+
+  it("rejects invalid request max_tokens before admission", async () => {
+    const b = createLLMBulkhead({
+      model: "claude-sonnet-4",
+      maxConcurrent: 1,
+      tokenBudget: { budget: 1_000 },
+    });
+
+    await expect(b.acquire(makeRequest("hello", -1))).rejects.toThrow(
+      "request.max_tokens",
+    );
+    expect(b.stats().bulkhead.inFlight).toBe(0);
+    expect(b.stats().tokenBudget?.inFlightTokens).toBe(0);
+  });
+
+  it("rejects invalid estimator output without leaking state", async () => {
+    const b = createLLMBulkhead({
+      model: "claude-sonnet-4",
+      maxConcurrent: 1,
+      tokenBudget: {
+        budget: 1_000,
+        estimator: () => ({ input: -1, maxOutput: Number.NaN }),
+      },
+    });
+
+    await expect(b.acquire(makeRequest())).rejects.toThrow(
+      "token estimator input",
+    );
+    expect(b.stats().bulkhead.inFlight).toBe(0);
+    expect(b.stats().tokenBudget?.inFlightTokens).toBe(0);
+  });
 });
 
 // ── Token budget refund (v2) ─────────────────────────────────
@@ -758,6 +854,49 @@ describe("token budget refund", () => {
 
     expect(b.stats().tokenBudget?.inFlightTokens).toBe(0);
     expect(b.stats().tokenBudget?.totalRefunded).toBe(0);
+  });
+
+  it("invalid getUsage output does not break release", async () => {
+    const b = createLLMBulkhead({
+      model: "claude-sonnet-4",
+      maxConcurrent: 5,
+      tokenBudget: {
+        budget: 1_000,
+        estimator: () => ({ input: 50, maxOutput: 50 }),
+      },
+    });
+
+    await b.run(
+      makeRequest(),
+      async () => "result",
+      { getUsage: () => ({ input: -1, output: Number.NaN }) },
+    );
+
+    expect(b.stats().tokenBudget?.inFlightTokens).toBe(0);
+    expect(b.stats().tokenBudget?.totalConsumed).toBe(0);
+    expect(b.stats().tokenBudget?.totalRefunded).toBe(0);
+  });
+
+  it("manual release validates usage but still releases capacity", async () => {
+    const b = createLLMBulkhead({
+      model: "claude-sonnet-4",
+      maxConcurrent: 1,
+      tokenBudget: {
+        budget: 1_000,
+        estimator: () => ({ input: 50, maxOutput: 50 }),
+      },
+    });
+
+    const r = await b.acquire(makeRequest());
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(() =>
+        r.token.release({ input: -1, output: 10 }),
+      ).toThrow("token usage input");
+    }
+
+    expect(b.stats().bulkhead.inFlight).toBe(0);
+    expect(b.stats().tokenBudget?.inFlightTokens).toBe(0);
   });
 
   it("cumulative refund tracks across multiple requests", async () => {
@@ -1328,6 +1467,58 @@ describe("deduplication", () => {
 
     await Promise.all([p1, p2]);
     expect(callCount).toBe(2);
+  });
+
+  it("deduped callers can abort their own wait without cancelling shared work", async () => {
+    let callCount = 0;
+    const b = createLLMBulkhead({
+      model: "claude-sonnet-4",
+      maxConcurrent: 1,
+      deduplication: true,
+    });
+
+    const req = makeRequest("same");
+    const p1 = b.run(req, async () => {
+      callCount++;
+      await sleep(30);
+      return "shared";
+    });
+    await sleep(0);
+
+    const ac = makeAbortController();
+    const p2 = b.run(req, async () => "unused", { signal: ac.signal });
+    ac.abort();
+
+    await expect(p2).rejects.toMatchObject({ reason: "aborted" });
+    await expect(p1).resolves.toBe("shared");
+    expect(callCount).toBe(1);
+    expect(b.stats().deduplication?.hits).toBe(1);
+    expect(b.stats().llm.rejectedByReason.aborted).toBe(1);
+  });
+
+  it("deduped callers can timeout their own wait without cancelling shared work", async () => {
+    let callCount = 0;
+    const b = createLLMBulkhead({
+      model: "claude-sonnet-4",
+      maxConcurrent: 1,
+      deduplication: true,
+    });
+
+    const req = makeRequest("same");
+    const p1 = b.run(req, async () => {
+      callCount++;
+      await sleep(30);
+      return "shared";
+    });
+    await sleep(0);
+
+    const p2 = b.run(req, async () => "unused", { timeoutMs: 1 });
+
+    await expect(p2).rejects.toMatchObject({ reason: "timeout" });
+    await expect(p1).resolves.toBe("shared");
+    expect(callCount).toBe(1);
+    expect(b.stats().deduplication?.hits).toBe(1);
+    expect(b.stats().llm.rejectedByReason.timeout).toBe(1);
   });
 });
 

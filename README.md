@@ -380,6 +380,12 @@ deduplication: {
 
 Return `""` from `keyFn` to opt a specific request out.
 
+When a request joins an existing in-flight call through deduplication, the
+underlying LLM call is shared and is not cancelled by later callers. Each
+deduped caller still gets its own `AbortSignal` and `timeoutMs` wait: aborting
+or timing out that caller rejects only that caller's `run()` promise while the
+shared work continues for the original caller and any other waiters.
+
 ---
 
 ## Cancellation
@@ -544,12 +550,12 @@ type LLMBulkheadOptions = {
   model:          string;
   maxConcurrent:  number;
   maxQueue?:      number;
-  timeoutMs?:     number;
+  timeoutMs?:     number; // integer >= 0
   profile?:       'interactive' | 'batch' | LLMBulkheadPreset;
   tokenBudget?: {
-    budget:      number;
+    budget:      number; // positive integer
     estimator?:  TokenEstimator;
-    outputCap?:  number;
+    outputCap?:  number; // integer >= 0
   };
   deduplication?: boolean | DeduplicationOptions;
 };
@@ -567,7 +573,7 @@ run<T>(
   fn:       (signal?: AbortSignal) => Promise<T>,
   options?: {
     signal?:    AbortSignal;
-    timeoutMs?: number;
+    timeoutMs?: number; // integer >= 0
     getUsage?:  (result: T) => TokenUsage | undefined;
   },
 ): Promise<T>
@@ -578,7 +584,7 @@ run<T>(
 ```ts
 acquire(
   request:  LLMRequest,
-  options?: { signal?: AbortSignal; timeoutMs?: number },
+  options?: { signal?: AbortSignal; timeoutMs?: number /* integer >= 0 */ },
 ): Promise<LLMAcquireResult>
 
 type LLMAcquireResult =

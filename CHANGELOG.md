@@ -7,6 +7,30 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.1.2] — 2026-05-11
+
+### Fixed
+
+* **Hardened token accounting input validation.** `tokenBudget.budget`, `tokenBudget.outputCap`, `request.max_tokens`, estimator output, and reported `TokenUsage` are now validated as finite non-negative integer token counts, with `tokenBudget.budget` required to be positive. Invalid usage passed to `release()` still releases capacity before surfacing the validation error.
+* **Avoided duplicate estimator calls during admission.** Token reservation is now estimated once per acquisition attempt, then rechecked against the current budget after the underlying bulkhead slot is acquired.
+* **Deduped caller cancellation.** Callers that join an existing in-flight deduplicated request now honor their own `AbortSignal` and `timeoutMs` while leaving the shared provider call running for other waiters.
+* **CJS source maps after rename.** The CommonJS rename script now rewrites `sourceMappingURL` trailers and source map `file` fields from `.js` to `.cjs`.
+* **Coverage setup.** Added the missing V8 coverage provider and a `test:coverage` script so `vitest run --coverage` works from a clean install.
+* **Release checks.** Added stricter release scripts for lint, deterministic test runs, coverage, package smoke checks, and `npm pack --dry-run`.
+* **Reduced build noise.** The CommonJS rename script no longer writes routine diagnostics during build or pack.
+* **Security policy.** Updated supported versions to the current `3.x` line and removed the placeholder security email.
+* **Deduplication docs.** Fixed the public JSDoc for the default deduplication key to include `model`, matching the implementation and README.
+
+### Tests
+
+* Added coverage for invalid token options, invalid request `max_tokens`, invalid estimator output, invalid usage reporting, one-estimation-per-acquire behavior, deduped abort/timeout behavior, and packaged ESM/CJS smoke checks.
+
+### Notes
+
+* Patch release: this is a hardening and packaging maintenance release. It rejects invalid numeric inputs that previously produced undefined or unsafe accounting states, but does not intentionally change supported valid API usage.
+
+---
+
 ## [3.1.1] — 2026-05-06
 
 ### Fixed
@@ -77,7 +101,7 @@ When `getUsage` is wired consistently and no over-consumption occurs, the invari
 * The `run()` callback signal type now derives from `AcquireOptions["signal"]`
   instead of referring to the global `AbortSignal` type directly.
 * Test utilities now avoid direct dependency on ambient `AbortController` globals.
-* Bumped `async-bulkhead-ts` to `^0.4.1`. :contentReference[oaicite:1]{index=1}
+* Bumped `async-bulkhead-ts` to `^0.4.1`.
 
 ### Migration Guide
 

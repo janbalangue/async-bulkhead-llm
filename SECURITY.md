@@ -4,10 +4,10 @@
 
 Only the latest release receives security fixes.
 
-| Version | Supported        |
-|---------|------------------|
-| 2.0.x   | ✅               |
-| 1.0.x   | ⚠️ security-only |
+| Version | Supported |
+|---------|-----------|
+| 3.x     | ✅        |
+| < 3.0   | ❌        |
 
 ---
 
@@ -15,8 +15,9 @@ Only the latest release receives security fixes.
 
 Please **do not** open a public GitHub issue for security vulnerabilities.
 
-Report privately via GitHub's [Security Advisory](../../security/advisories/new) feature,
-or email **security@your-org.example** with:
+Report privately via GitHub's [Security Advisory](../../security/advisories/new) feature.
+
+Include:
 
 - A description of the vulnerability
 - Steps to reproduce or a minimal proof of concept

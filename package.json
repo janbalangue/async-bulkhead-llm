@@ -1,6 +1,6 @@
 {
   "name": "async-bulkhead-llm",
-  "version": "3.1.1",
+  "version": "3.1.2",
   "description": "Fail-fast admission control for LLM workloads built on async-bulkhead-ts.",
   "license": "Apache-2.0",
   "author": "",
@@ -49,7 +49,11 @@
     "lint": "eslint . --max-warnings=0",
     "lint:fix": "eslint . --fix",
     "test": "vitest",
-    "prepublishOnly": "npm run build && npm test"
+    "prepublishOnly": "npm run lint && npm run build && npm run test:run && npm run test:coverage && npm run smoke && npm run pack:check",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "smoke": "node --input-type=module -e \"await import('./dist/esm/index.js')\" && node -e \"require('./dist/cjs/index.cjs')\" && node --input-type=module -e \"import { readFileSync } from 'node:fs'; const js = readFileSync('./dist/cjs/index.cjs', 'utf8'); const map = JSON.parse(readFileSync('./dist/cjs/index.cjs.map', 'utf8')); if (!js.includes('sourceMappingURL=index.cjs.map')) throw new Error('bad CJS sourceMappingURL'); if (map.file !== 'index.cjs') throw new Error('bad CJS sourcemap file');\"",
+    "pack:check": "npm pack --dry-run"
   },
   "dependencies": {
     "async-bulkhead-ts": "^0.4.1"
@@ -57,6 +61,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/node": "^25.3.0",
+    "@vitest/coverage-v8": "^4.1.6",
     "eslint": "^10.0.2",
     "eslint-config-prettier": "^10.1.8",
     "typescript": "^5.9.3",
