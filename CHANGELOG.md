@@ -1,5 +1,12 @@
 # Changelog
 
+All notable changes to this project will be documented in this file.
+
+The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
+and adheres to [Semantic Versioning](https://semver.org/).
+
+---
+
 ## [3.2.0] - 2026-07-14
 
 Gateway-readiness release. All changes are additive (semver-minor).
@@ -28,7 +35,7 @@ Gateway-readiness release. All changes are additive (semver-minor).
 * **`wouldAdmit(request, { priority })`** — advisory, non-reserving dry-run
   for routing decisions. Documented as racy.
 * **Stats** — `tokenBudget.totalOverrun` and `tokenBudget.highPriorityReserve`.
-* New exported types: `UsageReport`, `LLMRunContext`, `LLMPriority`,
+* New exported types: `UsageReport`, ``LLMRunContext`, `LLMPriority`,
   `LLMRejectDetail`, `LLMAcquireOptions`.
 
 ### Changed
@@ -46,14 +53,6 @@ Gateway-readiness release. All changes are additive (semver-minor).
 * Single-process by design: distributed budget coordination across replicas
   is explicitly out of scope (see README "Scope note").
 * Backward compatible: the full 3.1.x test suite passes unmodified.
-
----
-
-
-All notable changes to this project will be documented in this file.
-
-The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
-and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
