@@ -122,6 +122,71 @@ const result = await bulkhead.run(request, async () => {
 
 ---
 
+## What's New in v3.2 — Gateway readiness
+
+v3.2 adds the admission-control primitives an AI gateway needs, all additive:
+
+### Streaming budget enforcement (`reportUsage`)
+
+Report *cumulative* usage as stream events arrive. Input over-estimates are
+refunded to the budget immediately; output overruns expand the hold (blocking
+new admissions until the runaway stream releases). The returned snapshot lets
+a gateway decide to abort a stream:
+
+```ts
+await bulkhead.run(request, async (signal, ctx) => {
+  for await (const event of providerStream(request, signal)) {
+    const snap = ctx!.reportUsage({
+      input: event.usage.input_tokens,
+      output: event.usage.output_tokens, // cumulative
+    });
+    if (snap.outputRemaining === 0) {
+      // stream has consumed its entire output reservation — abort policy here
+    }
+  }
+  return final;
+});
+```
+
+If `release()` is called without usage, the last reported usage drives the
+final refund. Reports are clamped monotonically non-decreasing per field.
+
+### Priority admission (`highPriorityReserve`)
+
+Reserve budget headroom that only `priority: "high"` requests may use, so
+interactive traffic keeps admitting when batch traffic saturates the pool:
+
+```ts
+const bulkhead = createLLMBulkhead({
+  model: "claude-sonnet-4",
+  maxConcurrent: 50,
+  tokenBudget: { budget: 200_000, highPriorityReserve: 40_000 },
+});
+
+await bulkhead.run(request, callLLM, { priority: "high" });
+```
+
+### Rejection detail
+
+Failed acquisitions, `reject` events, and `LLMBulkheadRejectedError` now carry
+a capacity snapshot (`detail`) — slots, queue, and priority-adjusted budget
+numbers — so gateways can emit informative 429/503 responses. No fabricated
+`Retry-After` is provided: a fail-fast bulkhead has no honest ETA.
+
+### `wouldAdmit(request, { priority })`
+
+Advisory dry-run for routing decisions ("try another model pool"). It reserves
+nothing and is inherently racy — never treat `true` as a guarantee.
+
+### Scope note
+
+This library remains single-process by design. Distributed budget
+coordination across gateway replicas requires shared state and an async
+admission path; it is out of scope here. For multi-replica deployments,
+partition the budget per replica or coordinate above this layer.
+
+---
+
 ## What's New in v3
 
 ### Stats are now namespaced

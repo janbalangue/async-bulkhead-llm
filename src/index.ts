@@ -93,12 +93,60 @@ export type TokenUsage = {
 
 export type LLMRejectReason = BaseRejectReason | "budget_limit";
 
+/**
+ * Admission priority.
+ *
+ * `"high"` requests may use the full token budget. `"normal"` requests
+ * (the default) are rejected once available budget drops to
+ * `tokenBudget.highPriorityReserve`, keeping headroom for high-priority
+ * traffic. Priority has no effect when `tokenBudget` is not configured
+ * or `highPriorityReserve` is 0/unset.
+ */
+export type LLMPriority = "high" | "normal";
+
+/**
+ * Capacity snapshot attached to rejections so callers (e.g. gateways)
+ * can build informative 429/503 responses.
+ *
+ * Note: no retry-after estimate is provided — a fail-fast bulkhead has
+ * no honest ETA for capacity. Expose these numbers instead.
+ */
+export type LLMRejectDetail = {
+  inFlight: number;
+  maxConcurrent: number;
+  pending: number;
+  maxQueue: number;
+  tokenBudget?: {
+    /** Configured budget ceiling. */
+    budget: number;
+    /** Tokens currently held by in-flight reservations. */
+    inFlightTokens: number;
+    /** Budget this request was admitted against (priority-adjusted). */
+    effectiveBudget: number;
+    /** Tokens available at this priority (clamped at 0). */
+    available: number;
+    /** Tokens this request needed. */
+    requested: number;
+  };
+};
+
+/** Options accepted by `acquire()` / `run()` (base options + priority). */
+export type LLMAcquireOptions = AcquireOptions & {
+  priority?: LLMPriority;
+};
+
 export class LLMBulkheadRejectedError extends Error {
   readonly code = "LLM_BULKHEAD_REJECTED" as const;
+  readonly detail: LLMRejectDetail | undefined;
 
-  constructor(readonly reason: LLMRejectReason) {
+  constructor(reason: LLMRejectReason, detail?: LLMRejectDetail);
+  constructor(
+    readonly reason: LLMRejectReason,
+    detail?: LLMRejectDetail,
+  ) {
     super(`LLM bulkhead rejected: ${reason}`);
     this.name = "LLMBulkheadRejectedError";
+    this.detail = detail;
   }
 }
 
@@ -140,8 +188,20 @@ export type LLMStats = {
      * (actual > reserved) is reported as-is.
      */
     totalConsumed: number;
-    /** Cumulative tokens returned to the budget via the refund mechanism. */
+    /**
+     * Cumulative tokens returned to the budget via the refund mechanism —
+     * both early refunds from `reportUsage()` and refunds at release.
+     */
     totalRefunded: number;
+    /**
+     * Cumulative tokens held *beyond* original reservations because
+     * `reportUsage()` reported consumption exceeding the reserved hold.
+     * Overrun expands `inFlightTokens` (possibly above `budget`), which
+     * correctly blocks new admissions until the overrunning work releases.
+     */
+    totalOverrun: number;
+    /** Budget headroom reserved for `priority: "high"` requests. */
+    highPriorityReserve: number;
   };
   /** Present only when deduplication is enabled. */
   deduplication?: {
@@ -160,7 +220,12 @@ export type LLMEventMap = {
   /** Fired after a request is admitted (slot + budget acquired). */
   admit: { request: LLMRequest; reservedTokens: number };
   /** Fired when a request is rejected at any stage. */
-  reject: { request: LLMRequest; reason: LLMRejectReason };
+  reject: {
+    request: LLMRequest;
+    reason: LLMRejectReason;
+    /** Capacity snapshot; absent for dedup-wait rejections. */
+    detail?: LLMRejectDetail;
+  };
   /**
    * Fired when a slot is released.
    *
@@ -231,6 +296,19 @@ export type TokenBudgetOptions = {
    * Default: 2048.
    */
   outputCap?: number;
+
+  /**
+   * Tokens of budget headroom reserved for `priority: "high"` requests.
+   *
+   * Normal-priority admission is checked against
+   * `budget - highPriorityReserve`; high-priority admission is checked
+   * against the full `budget`. This lets interactive traffic keep
+   * admitting while batch traffic has saturated the shared pool.
+   *
+   * Must satisfy `0 <= highPriorityReserve <= budget`. Default: 0
+   * (priority has no effect).
+   */
+  highPriorityReserve?: number;
 };
 
 // ────────────────────────────────────────────
@@ -307,20 +385,59 @@ export type LLMBulkheadOptions = {
 // ────────────────────────────────────────────
 
 /**
+ * Snapshot returned by `LLMToken.reportUsage()`.
+ *
+ * `outputCap` / `outputRemaining` are `null` when `tokenBudget` is not
+ * configured (there is no reservation to measure against).
+ */
+export type UsageReport = {
+  /** Original pre-admission reservation (0 when budget disabled). */
+  reserved: number;
+  /** Tokens currently held against the budget for this request. */
+  held: number;
+  /** Cumulative reported consumption (`input + output`). */
+  consumed: number;
+  /** Output tokens reserved for this request (`max_tokens`/`outputCap`). */
+  outputCap: number | null;
+  /** Output reservation remaining before the stream overruns it. */
+  outputRemaining: number | null;
+  /** True once cumulative consumption exceeds the original reservation. */
+  overReservation: boolean;
+};
+
+/** Context passed to `run()` callbacks for mid-flight usage reporting. */
+export type LLMRunContext = {
+  reportUsage(usage: TokenUsage): UsageReport;
+};
+
+/**
  * Admission token returned by `acquire()`.
  *
  * Call `release()` exactly once when the request completes.
  * Pass `TokenUsage` to enable the refund mechanism — the bulkhead
  * returns the difference between the pre-admission reservation and
  * actual consumption to the budget immediately.
+ *
+ * For streaming workloads, call `reportUsage()` with *cumulative* usage
+ * as stream events arrive:
+ *
+ * - If the reported input is lower than the pre-admission estimate, the
+ *   surplus is refunded to the budget immediately (the full output
+ *   reservation is retained).
+ * - If reported consumption exceeds the hold, the hold expands (overrun),
+ *   which blocks new admissions until this request releases.
+ * - Reports are clamped to be monotonically non-decreasing per field.
+ * - If `release()` is later called without usage, the last reported
+ *   usage is used for the final refund.
  */
 export type LLMToken = {
   release(usage?: TokenUsage): void;
+  reportUsage(usage: TokenUsage): UsageReport;
 };
 
 export type LLMAcquireResult =
   | { ok: true; token: LLMToken }
-  | { ok: false; reason: LLMRejectReason };
+  | { ok: false; reason: LLMRejectReason; detail?: LLMRejectDetail };
 
 // ────────────────────────────────────────────
 // Estimator internals
@@ -619,6 +736,18 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       opts.tokenBudget.outputCap,
       "tokenBudget.outputCap",
     );
+    assertOptionalNonNegativeInteger(
+      opts.tokenBudget.highPriorityReserve,
+      "tokenBudget.highPriorityReserve",
+    );
+    if (
+      opts.tokenBudget.highPriorityReserve !== undefined &&
+      opts.tokenBudget.highPriorityReserve > opts.tokenBudget.budget
+    ) {
+      throw new Error(
+        "tokenBudget.highPriorityReserve must be <= tokenBudget.budget",
+      );
+    }
   }
 
   // ---- Internal bulkhead from async-bulkhead-ts ----
@@ -636,10 +765,13 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       outputCap: budget?.outputCap,
     });
 
+  const highPriorityReserve = budget?.highPriorityReserve ?? 0;
+
   let inFlightTokens = 0;
   let totalReserved = 0;
   let totalConsumed = 0;
   let totalRefunded = 0;
+  let totalOverrun = 0;
   let llmAdmitted = 0;
   let llmReleased = 0;
   let llmRejected = 0;
@@ -696,35 +828,86 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     return { promise, resolve, reject };
   }
 
-  function estimateReservation(request: LLMRequest): number {
-    if (!budget) return 0;
-    return validateTokenEstimate(estimator(request));
+  /** Estimate parts kept per-token so streaming reports can re-derive holds. */
+  type ReservationParts = {
+    input: number;
+    maxOut: number;
+    reserved: number;
+  };
+
+  function estimateParts(request: LLMRequest): ReservationParts | null {
+    if (!budget) return null;
+    const estimate = estimator(request);
+    const reserved = validateTokenEstimate(estimate);
+    return { input: estimate.input, maxOut: estimate.maxOutput, reserved };
+  }
+
+  function resolvePriority(priority: LLMPriority | undefined): LLMPriority {
+    if (priority === undefined) return "normal";
+    if (priority !== "high" && priority !== "normal") {
+      throw new Error(`priority must be "high" or "normal"`);
+    }
+    return priority;
+  }
+
+  /** Budget ceiling applicable to a request at the given priority. */
+  function effectiveBudget(priority: LLMPriority): number {
+    if (!budget) return Infinity;
+    return priority === "high"
+      ? budget.budget
+      : budget.budget - highPriorityReserve;
   }
 
   /**
    * Attempt token budget admission synchronously for a precomputed
-   * reservation. Returns false if the budget ceiling is exceeded.
+   * reservation. Returns false if the priority-adjusted ceiling is
+   * exceeded.
    */
-  function tryReserveTokens(reserved: number): boolean {
+  function tryReserveTokens(reserved: number, priority: LLMPriority): boolean {
     if (!budget) return true;
-    if (inFlightTokens + reserved > budget.budget) return false;
+    if (inFlightTokens + reserved > effectiveBudget(priority)) return false;
     inFlightTokens += reserved;
     totalReserved += reserved;
     return true;
   }
 
-  function releaseTokens(reserved: number, usage?: TokenUsage): number {
+  function releaseTokens(held: number, usage?: TokenUsage): number {
     let refunded = 0;
-    if (usage && reserved > 0) {
+    if (usage && held > 0) {
       const actual = usage.input + usage.output;
       totalConsumed += actual;
-      if (actual < reserved) {
-        refunded = reserved - actual;
+      if (actual < held) {
+        refunded = held - actual;
         totalRefunded += refunded;
       }
     }
-    inFlightTokens = Math.max(0, inFlightTokens - reserved);
+    inFlightTokens = Math.max(0, inFlightTokens - held);
     return refunded;
+  }
+
+  /** Capacity snapshot for rejection results, events, and errors. */
+  function buildRejectDetail(
+    requested: number,
+    priority: LLMPriority,
+  ): LLMRejectDetail {
+    const base = bulkhead.stats();
+    const detail: LLMRejectDetail = {
+      inFlight: base.inFlight,
+      pending: base.pending,
+      maxConcurrent: base.maxConcurrent,
+      maxQueue: base.maxQueue,
+    };
+    if (budget) {
+      const eff = effectiveBudget(priority);
+      detail.tokenBudget = {
+        budget: budget.budget,
+        inFlightTokens,
+        effectiveBudget: eff,
+        available: Math.max(0, eff - inFlightTokens),
+        requested,
+      };
+    }
+    return detail;
   }
 
   function normalizeAcquireOptions(ao: AcquireOptions): AcquireOptions {
@@ -807,15 +990,72 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
 
   /**
    * Wraps a base Token so that release() also returns the token
-   * reservation and optionally applies the refund.
+   * reservation and optionally applies the refund, and so that
+   * streaming callers can report cumulative usage mid-flight.
    */
   function wrapToken(
     base: Token,
-    reserved: number,
+    parts: ReservationParts | null,
     request: LLMRequest,
   ): LLMToken {
     let released = false;
+    /** Tokens currently held against the budget for this request. */
+    let held = parts?.reserved ?? 0;
+    /** Last reported cumulative usage (monotonically clamped). */
+    let reported: TokenUsage | undefined;
+
+    const snapshot = (): UsageReport => {
+      const consumed = reported
+        ? reported.input + reported.output
+        : 0;
+      const outputCap = parts ? parts.maxOut : null;
+      return {
+        reserved: parts?.reserved ?? 0,
+        held,
+        consumed,
+        outputCap,
+        outputRemaining:
+          outputCap === null
+            ? null
+            : Math.max(0, outputCap - (reported?.output ?? 0)),
+        overReservation: parts ? consumed > parts.reserved : false,
+      };
+    };
+
+    const reportUsage = (usage: TokenUsage): UsageReport => {
+      const valid = validateTokenUsage(usage);
+      // Clamp to monotonic non-decreasing per field — cumulative
+      // stream usage never shrinks; a lower report is stale.
+      reported = reported
+        ? {
+            input: Math.max(reported.input, valid.input),
+            output: Math.max(reported.output, valid.output),
+          }
+        : valid;
+
+      // Accounting only applies pre-release with a budget configured.
+      if (!released && parts && budget) {
+        // Hold = known input + the larger of (output ceiling, actual output).
+        // Keeps the full output reservation while refunding input
+        // over-estimates immediately; expands on output overrun.
+        const newHold =
+          reported.input + Math.max(parts.maxOut, reported.output);
+        const delta = newHold - held;
+        if (delta > 0) {
+          inFlightTokens += delta;
+          totalOverrun += delta;
+        } else if (delta < 0) {
+          const refund = -delta;
+          inFlightTokens = Math.max(0, inFlightTokens - refund);
+          totalRefunded += refund;
+        }
+        held = newHold;
+      }
+      return snapshot();
+    };
+
     return {
+      reportUsage,
       release(usage?: TokenUsage) {
         if (released) return;
         released = true;
@@ -829,15 +1069,20 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
             usageError = err;
           }
         }
+        // Fall back to the last mid-flight report when no (valid)
+        // explicit usage is provided at release.
+        if (validUsage === undefined && reported !== undefined) {
+          validUsage = reported;
+        }
 
         try {
           base.release();
         } finally {
-          const refunded = releaseTokens(reserved, validUsage);
+          const refunded = releaseTokens(held, validUsage);
           noteLLMRelease();
           emit("release", {
             request,
-            reservedTokens: reserved,
+            reservedTokens: parts?.reserved ?? 0,
             refundedTokens: refunded,
             ...(validUsage !== undefined && { usage: validUsage }),
           });
@@ -852,16 +1097,23 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
 
   async function _acquire(
     request: LLMRequest,
-    ao: AcquireOptions,
+    ao: LLMAcquireOptions,
   ): Promise<LLMAcquireResult> {
     assertOptionalNonNegativeInteger(request.max_tokens, "request.max_tokens");
-    const reserved = estimateReservation(request);
+    const priority = resolvePriority(ao.priority);
+    const parts = estimateParts(request);
+    const reserved = parts?.reserved ?? 0;
+
+    const rejectWith = (reason: LLMRejectReason): LLMAcquireResult => {
+      const detail = buildRejectDetail(reserved, priority);
+      noteLLMReject(reason);
+      emit("reject", { request, reason, detail });
+      return { ok: false, reason, detail };
+    };
 
     // Token budget: pre-check before entering the queue.
-    if (budget && inFlightTokens + reserved > budget.budget) {
-      noteLLMReject("budget_limit");
-      emit("reject", { request, reason: "budget_limit" });
-      return { ok: false, reason: "budget_limit" };
+    if (budget && inFlightTokens + reserved > effectiveBudget(priority)) {
+      return rejectWith("budget_limit");
     }
 
     const mergedOptions = normalizeAcquireOptions(ao);
@@ -869,22 +1121,18 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     const r = await bulkhead.acquire(mergedOptions);
 
     if (!r.ok) {
-      noteLLMReject(r.reason);
-      emit("reject", { request, reason: r.reason });
-      return { ok: false, reason: r.reason };
+      return rejectWith(r.reason);
     }
 
     // Post-admission: reserve the precomputed amount now.
-    if (!tryReserveTokens(reserved)) {
+    if (!tryReserveTokens(reserved, priority)) {
       r.token.release();
-      noteLLMReject("budget_limit");
-      emit("reject", { request, reason: "budget_limit" });
-      return { ok: false, reason: "budget_limit" };
+      return rejectWith("budget_limit");
     }
 
     noteLLMAdmit();
     emit("admit", { request, reservedTokens: reserved });
-    return { ok: true, token: wrapToken(r.token, reserved, request) };
+    return { ok: true, token: wrapToken(r.token, parts, request) };
   }
 
   // ---- Public API ----
@@ -897,9 +1145,38 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
    */
   async function acquire(
     request: LLMRequest,
-    ao: AcquireOptions = {},
+    ao: LLMAcquireOptions = {},
   ): Promise<LLMAcquireResult> {
     return _acquire(request, ao);
+  }
+
+  /**
+   * Advisory dry-run: would a request of this shape be admitted right
+   * now at the given priority?
+   *
+   * This is a snapshot for routing decisions (e.g. pick a different
+   * model pool). It does NOT reserve anything — the answer can change
+   * before a subsequent `acquire()`/`run()` lands. Never treat `true`
+   * as a guarantee.
+   */
+  function wouldAdmit(
+    request: LLMRequest,
+    opts: { priority?: LLMPriority } = {},
+  ): { admit: boolean; reason?: LLMRejectReason } {
+    const priority = resolvePriority(opts.priority);
+    const base = bulkhead.stats();
+    if (base.closed) return { admit: false, reason: "shutdown" };
+    const parts = estimateParts(request);
+    const reserved = parts?.reserved ?? 0;
+    if (budget && inFlightTokens + reserved > effectiveBudget(priority)) {
+      return { admit: false, reason: "budget_limit" };
+    }
+    if (base.inFlight < base.maxConcurrent) return { admit: true };
+    if (base.pending < base.maxQueue) return { admit: true };
+    return {
+      admit: false,
+      reason: base.maxQueue > 0 ? "queue_limit" : "concurrency_limit",
+    };
   }
 
   /**
@@ -914,8 +1191,8 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
    */
   async function run<T>(
     request: LLMRequest,
-    fn: (signal?: BulkheadSignal) => Promise<T>,
-    ao: AcquireOptions & {
+    fn: (signal?: BulkheadSignal, ctx?: LLMRunContext) => Promise<T>,
+    ao: LLMAcquireOptions & {
       getUsage?: (result: T) => TokenUsage | undefined;
     } = {},
   ): Promise<T> {
@@ -965,13 +1242,17 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     try {
       const r = await _acquire(request, acquireOpts);
       if (!r.ok) {
-        throw new LLMBulkheadRejectedError(r.reason);
+        throw new LLMBulkheadRejectedError(r.reason, r.detail);
       }
+
+      const ctx: LLMRunContext = {
+        reportUsage: (usage) => r.token.reportUsage(usage),
+      };
 
       const work = (async () => {
         let result: T;
         try {
-          result = await fn(ao.signal);
+          result = await fn(ao.signal, ctx);
         } catch (err) {
           r.token.release(); // no usage on error
           throw err;
@@ -1031,6 +1312,8 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         totalReserved,
         totalConsumed,
         totalRefunded,
+        totalOverrun,
+        highPriorityReserve,
       };
     }
 
@@ -1079,7 +1362,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     };
   }
 
-  return { acquire, run, stats, close, drain, on };
+  return { acquire, run, wouldAdmit, stats, close, drain, on };
 }
 
 export type LLMBulkhead = ReturnType<typeof createLLMBulkhead>;

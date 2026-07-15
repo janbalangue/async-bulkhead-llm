@@ -1,5 +1,55 @@
 # Changelog
 
+## [3.2.0] - UNRELEASED
+
+Gateway-readiness release. All changes are additive (semver-minor).
+
+### Added
+
+* **`LLMToken.reportUsage(usage)` / run-context `ctx.reportUsage(usage)`** —
+  mid-flight cumulative usage reporting for streaming workloads.
+  * Input over-estimates are refunded to the budget immediately (the full
+    output reservation is retained until release).
+  * Consumption beyond the hold expands it (overrun), which can push
+    `inFlightTokens` above `budget` and correctly blocks new admissions
+    until the overrunning request releases.
+  * Reports are clamped monotonically non-decreasing per field.
+  * `release()` without explicit usage falls back to the last reported
+    usage for the final refund.
+  * Returns a `UsageReport` snapshot (`reserved`, `held`, `consumed`,
+    `outputCap`, `outputRemaining`, `overReservation`).
+* **Priority admission** — `tokenBudget.highPriorityReserve` plus per-call
+  `priority: "high" | "normal"` on `acquire()`/`run()`. Normal-priority
+  admission is checked against `budget - highPriorityReserve`; high-priority
+  against the full budget.
+* **Rejection detail** — failed `acquire()` results, `reject` events, and
+  `LLMBulkheadRejectedError` now carry an optional `detail: LLMRejectDetail`
+  capacity snapshot (slots, queue, priority-adjusted budget numbers).
+* **`wouldAdmit(request, { priority })`** — advisory, non-reserving dry-run
+  for routing decisions. Documented as racy.
+* **Stats** — `tokenBudget.totalOverrun` and `tokenBudget.highPriorityReserve`.
+* New exported types: `UsageReport`, `LLMRunContext`, `LLMPriority`,
+  `LLMRejectDetail`, `LLMAcquireOptions`.
+
+### Changed
+
+* `run()` callbacks now receive an optional second argument
+  (`LLMRunContext`). Existing single-argument callbacks are unaffected.
+* Release-event semantics when `reportUsage()` was used: `refundedTokens`
+  on the `release` event reflects the refund *at release* (against the
+  current hold); early refunds from `reportUsage()` are already included
+  in `stats().tokenBudget.totalRefunded` as they occur. When
+  `reportUsage()` is never called, behavior is byte-identical to 3.1.x.
+
+### Notes
+
+* Single-process by design: distributed budget coordination across replicas
+  is explicitly out of scope (see README "Scope note").
+* Backward compatible: the full 3.1.x test suite passes unmodified.
+
+---
+
+
 All notable changes to this project will be documented in this file.
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
