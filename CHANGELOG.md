@@ -1,6 +1,6 @@
 # Changelog
 
-## [3.2.0] - UNRELEASED
+## [3.2.0] - 2026-07-14
 
 Gateway-readiness release. All changes are additive (semver-minor).
 
@@ -10,7 +10,7 @@ Gateway-readiness release. All changes are additive (semver-minor).
   mid-flight cumulative usage reporting for streaming workloads.
   * Input over-estimates are refunded to the budget immediately (the full
     output reservation is retained until release).
-  * Consumption beyond the hold expands it (overrun), which can push
+  * Consumption beyond the hold `expands it (overrun), which can push
     `inFlightTokens` above `budget` and correctly blocks new admissions
     until the overrunning request releases.
   * Reports are clamped monotonically non-decreasing per field.
