@@ -423,13 +423,6 @@ describe("createLLMBulkhead validation", () => {
       createLLMBulkhead({
         model: "gpt-4o",
         maxConcurrent: 1,
-        tokenBudget: { budget: 0 },
-      }),
-    ).toThrow("tokenBudget.budget");
-    expect(() =>
-      createLLMBulkhead({
-        model: "gpt-4o",
-        maxConcurrent: 1,
         tokenBudget: { budget: -1 },
       }),
     ).toThrow("tokenBudget.budget");
@@ -441,7 +434,43 @@ describe("createLLMBulkhead validation", () => {
       }),
     ).toThrow("tokenBudget.outputCap");
   });
+
+  it("accepts tokenBudget.budget: 0 at construction — reject all budget-gated admissions", async () => {
+    const b = createLLMBulkhead({
+      model: "gpt-4o",
+      maxConcurrent: 5,
+      tokenBudget: {
+        budget: 0,
+        estimator: () => ({ input: 10, maxOutput: 10 }),
+      },
+    });
+
+    expect(b.stats().tokenBudget?.budget).toBe(0);
+
+    const r = await b.acquire(makeRequest());
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("budget_limit");
+
+    // No token reservation should have leaked.
+    expect(b.stats().tokenBudget?.inFlightTokens).toBe(0);
+  });
+
+  it("budget: 0 still admits a request that reserves exactly 0 tokens", async () => {
+    const b = createLLMBulkhead({
+      model: "gpt-4o",
+      maxConcurrent: 5,
+      tokenBudget: {
+        budget: 0,
+        estimator: () => ({ input: 0, maxOutput: 0 }),
+      },
+    });
+
+    const r = await b.acquire(makeRequest());
+    expect(r.ok).toBe(true);
+    if (r.ok) r.token.release();
+  });
 });
+
 
 // ── Profile / preset resolution ──────────────────────────────
 

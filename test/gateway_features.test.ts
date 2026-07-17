@@ -358,3 +358,150 @@ describe("wouldAdmit — advisory routing check", () => {
     expect(b.wouldAdmit(req())).toEqual({ admit: false, reason: "shutdown" });
   });
 });
+
+describe("setBudget — runtime budget mutation", () => {
+  it("throws when tokenBudget was never configured", () => {
+    const b = createLLMBulkhead({ model: "claude-sonnet-4", maxConcurrent: 5 });
+    expect(() => b.setBudget(1000)).toThrow(/tokenBudget/);
+  });
+
+  it("validates: rejects negative, non-integer, NaN, and Infinity", () => {
+    const b = makeBulkhead(1200);
+    expect(() => b.setBudget(-1)).toThrow();
+    expect(() => b.setBudget(1.5)).toThrow();
+    expect(() => b.setBudget(Number.NaN)).toThrow();
+    expect(() => b.setBudget(Number.POSITIVE_INFINITY)).toThrow();
+    // Budget must be left untouched by rejected calls.
+    expect(b.stats().tokenBudget!.budget).toBe(1200);
+  });
+
+  it("accepts zero as a valid budget (fully closed)", () => {
+    const b = makeBulkhead(1200);
+    b.setBudget(0);
+    expect(b.stats().tokenBudget!.budget).toBe(0);
+    expect(b.wouldAdmit(req())).toEqual({
+      admit: false,
+      reason: "budget_limit",
+    });
+  });
+
+  it("raising the budget takes effect immediately on the next admission", async () => {
+    const b = makeBulkhead(1100);
+
+    const r1 = await b.acquire(req("a"));
+    expect(r1.ok).toBe(true);
+    if (!r1.ok) return;
+
+    // Budget exhausted: next request rejected.
+    const r2 = await b.acquire(req("b"));
+    expect(r2.ok).toBe(false);
+
+    // Raise the ceiling — no release, no waiting.
+    b.setBudget(2200);
+    expect(b.stats().tokenBudget!.budget).toBe(2200);
+
+    // Immediately admits without any in-flight work being touched.
+    const r3 = await b.acquire(req("c"));
+    expect(r3.ok).toBe(true);
+    if (!r3.ok) return;
+
+    expect(b.stats().tokenBudget!.inFlightTokens).toBe(2200);
+
+    r1.token.release();
+    r3.token.release();
+  });
+
+  it("lowering below inFlightTokens is legal — shrink by attrition (pinned semantics)", async () => {
+    const b = makeBulkhead(1200);
+
+    // Fill inFlightTokens to 1100.
+    const r1 = await b.acquire(req("a"));
+    expect(r1.ok).toBe(true);
+    if (!r1.ok) return;
+    expect(b.stats().tokenBudget!.inFlightTokens).toBe(1100);
+
+    // Lower the ceiling below current in-flight usage. Must not throw,
+    // must not revoke/release the in-flight reservation.
+    expect(() => b.setBudget(500)).not.toThrow();
+    expect(b.stats().tokenBudget!.budget).toBe(500);
+    expect(b.stats().tokenBudget!.inFlightTokens).toBe(1100); // unchanged
+    expect(b.stats().bulkhead.inFlight).toBe(1); // in-flight work not revoked
+
+    // New admissions reject until the pool drains below the new ceiling.
+    const r2 = await b.acquire(req("b"));
+    expect(r2.ok).toBe(false);
+    if (r2.ok) return;
+    expect(r2.reason).toBe("budget_limit");
+
+    // wouldAdmit reflects the same shrunk ceiling.
+    expect(b.wouldAdmit(req("c"))).toEqual({
+      admit: false,
+      reason: "budget_limit",
+    });
+
+    // Draining brings inFlightTokens to 0, below the new (still low) ceiling.
+    // Since the new ceiling (500) is itself below a single request's cost
+    // (1100), admission still correctly rejects — the ceiling was lowered,
+    // not the estimator.
+    r1.token.release();
+    expect(b.stats().tokenBudget!.inFlightTokens).toBe(0);
+    const r3 = await b.acquire(req("d"));
+    expect(r3.ok).toBe(false);
+
+    // Raising the ceiling again to fit a request demonstrates the pool
+    // has genuinely drained and is ready to admit under the new ceiling.
+    b.setBudget(1100);
+    const r4 = await b.acquire(req("e"));
+    expect(r4.ok).toBe(true);
+    if (r4.ok) r4.token.release();
+  });
+
+
+  it("propagates through rejection detail (effectiveBudget/available)", async () => {
+    const b = makeBulkhead(1100);
+    const r1 = await b.acquire(req("a"));
+    expect(r1.ok).toBe(true);
+    if (!r1.ok) return;
+
+    const rejected = await b.acquire(req("b"));
+    expect(rejected.ok).toBe(false);
+    if (rejected.ok) return;
+    expect(rejected.detail!.tokenBudget).toMatchObject({
+      budget: 1100,
+      effectiveBudget: 1100,
+      inFlightTokens: 1100,
+      available: 0,
+    });
+
+    b.setBudget(3300);
+
+    const rejected2 = await b.acquire(req("b"));
+    // Now admits: no longer rejected, so detail path differs.
+    expect(rejected2.ok).toBe(true);
+    if (rejected2.ok) {
+      expect(b.stats().tokenBudget!.inFlightTokens).toBe(2200);
+      rejected2.token.release();
+    }
+    r1.token.release();
+  });
+
+  it("interacts correctly with highPriorityReserve after mutation", async () => {
+    const b = makeBulkhead(2400, { highPriorityReserve: 400 });
+    // Normal ceiling: 2400 - 400 = 2000. Room for exactly 1 request (1100)
+    // plus partial headroom, but not two (2200 > 2000).
+    const r1 = await b.acquire(req("a"));
+    expect(r1.ok).toBe(true);
+    if (!r1.ok) return;
+
+    const r2 = await b.acquire(req("b"));
+    expect(r2.ok).toBe(false); // normal ceiling exceeded (2200 > 2000)
+
+    // Raise budget: normal ceiling becomes 4800 - 400 = 4400.
+    b.setBudget(4800);
+    const r3 = await b.acquire(req("c"));
+    expect(r3.ok).toBe(true);
+    if (r3.ok) r3.token.release();
+    r1.token.release();
+  });
+});
+

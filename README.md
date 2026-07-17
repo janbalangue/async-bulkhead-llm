@@ -416,9 +416,32 @@ const estimate = createModelAwareTokenEstimator(
 const charCount = extractTextLength(message.content);
 ```
 
+### Runtime Budget Adjustment
+
+`setBudget(tokens)` mutates the token budget ceiling at runtime — useful for gateways that adjust cost limits based on external signals (billing tier changes, incident response, time-of-day throttling) without recreating the bulkhead.
+
+```ts
+const bulkhead = createLLMBulkhead({
+  model:         'claude-sonnet-4',
+  maxConcurrent: 10,
+  tokenBudget: { budget: 200_000 },
+});
+
+bulkhead.setBudget(300_000); // raise the ceiling
+bulkhead.setBudget(50_000);  // shrink the ceiling
+```
+
+Semantics, pinned deliberately:
+
+* **Raising takes effect immediately.** The very next `acquire()`/`run()`/`wouldAdmit()` call sees the new headroom — there is no caching to invalidate.
+* **Lowering below `inFlightTokens` is legal — shrink by attrition.** No in-flight request is revoked or cancelled. New admissions reject with `"budget_limit"` until enough in-flight work releases to bring `stats().tokenBudget.inFlightTokens` back under the new ceiling. This is consistent with the library's existing overrun tolerance — `inFlightTokens` can already exceed `budget` via `reportUsage()` overrun, so an over-budget in-flight state is an established, intentional condition rather than an edge case.
+* **Throws if `tokenBudget` was never configured at construction.** There is no ceiling to adjust, so an explicit error is raised instead of silently no-op'ing.
+* **Validates `tokens` as a non-negative integer** (`0` is valid — it fully closes admission until either budget is raised or in-flight work drains and no further reservation exists).
+
 ---
 
 ## Deduplication
+
 
 ```ts
 const bulkhead = createLLMBulkhead({
@@ -618,8 +641,9 @@ type LLMBulkheadOptions = {
   timeoutMs?:     number; // integer >= 0
   profile?:       'interactive' | 'batch' | LLMBulkheadPreset;
   tokenBudget?: {
-    budget:      number; // positive integer
+    budget:      number; // non-negative integer; 0 rejects all budget-gated admissions
     estimator?:  TokenEstimator;
+
     outputCap?:  number; // integer >= 0
   };
   deduplication?: boolean | DeduplicationOptions;
@@ -661,7 +685,18 @@ type LLMToken = { release(usage?: TokenUsage): void };
 
 ### `bulkhead.stats()`
 
+### `bulkhead.setBudget(tokens)`
+
+```ts
+setBudget(tokens: number): void
+```
+
+Mutates the token budget ceiling at runtime. Throws if `tokenBudget` was not
+configured at construction. Throws if `tokens` is not a non-negative integer.
+See [Runtime Budget Adjustment](#runtime-budget-adjustment) for full semantics.
+
 ### `bulkhead.close()`
+
 
 ### `bulkhead.drain()`
 

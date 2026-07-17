@@ -7,7 +7,57 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+---
+
+## [3.3.0] - 2026-07-17
+
+### Changed
+
+* **`tokenBudget.budget: 0` is now accepted at construction.** Previously,
+  `createLLMBulkhead({ tokenBudget: { budget: 0 } })` threw because `budget`
+  was validated as a positive integer. A budget of `0` is a legitimate state
+  — e.g. a lease ledger reporting pool exhaustion for the current cycle — and
+  the bulkhead now represents it as "reject all budget-gated admissions"
+  rather than an invalid configuration. `budget` is now validated as a
+  non-negative integer, matching the existing validation already used by
+  `setBudget()`. Admission behavior is unaffected for any `budget > 0`; a
+  `budget: 0` bulkhead rejects every admission that needs `> 0` tokens with
+  `"budget_limit"`, and admits requests whose estimator produces a `0`-token
+  reservation, consistent with `effectiveBudget()`/`tryReserveTokens()`
+  semantics already in place for runtime-lowered budgets.
+
+### Added
+
+* **`bulkhead.setBudget(tokens)`** — mutate the token budget ceiling at
+  runtime. All admission math (`acquire`/`run`, `wouldAdmit`, rejection
+
+  `detail`, `stats()`) reads the ceiling dynamically, so a call to
+  `setBudget()` propagates immediately with no other behavioral changes.
+  * **Raising takes effect immediately** — the very next admission check
+    sees the new headroom.
+  * **Lowering below `inFlightTokens` is legal — shrink by attrition.**
+    No in-flight work is revoked or cancelled. New admissions reject with
+    `"budget_limit"` until enough in-flight work releases to bring
+    `inFlightTokens` back under the new ceiling. This is consistent with
+    the library's existing overrun tolerance (`inFlightTokens` can already
+    exceed `budget` via `reportUsage()` overrun) and is pinned with a
+    dedicated test.
+  * **Throws if `tokenBudget` was never configured** at construction — an
+    explicit error beats a silent no-op.
+  * **Validates `tokens`** as a non-negative integer (`0` is valid and
+    fully closes admission).
+
+### Notes
+
+* Purely additive: existing `tokenBudget.budget` behavior is unchanged for
+  bulkheads that never call `setBudget()`.
+
+---
+
 ## [3.2.0] - 2026-07-14
+
 
 Gateway-readiness release. All changes are additive (semver-minor).
 
@@ -57,7 +107,7 @@ Gateway-readiness release. All changes are additive (semver-minor).
 ---
 
 ## [3.1.2] — 2026-05-11
-
+`
 ### Fixed
 
 * **Hardened token accounting input validation.** `tokenBudget.budget`, `tokenBudget.outputCap`, `request.max_tokens`, estimator output, and reported `TokenUsage` are now validated as finite non-negative integer token counts, with `tokenBudget.budget` required to be positive. Invalid usage passed to `release()` still releases capacity before surfacing the validation error.

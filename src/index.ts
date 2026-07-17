@@ -282,8 +282,16 @@ export type TokenBudgetOptions = {
    * Maximum tokens allowed in-flight simultaneously across all active requests.
    * Admission is always fail-fast when this ceiling is reached,
    * independent of concurrency headroom and independent of `profile`.
+   *
+   * Must be a non-negative integer. `0` is valid and intentional — it
+   * represents a pool with no budget to grant this cycle (e.g. a lease
+   * ledger reporting exhaustion) and results in every budget-gated
+   * admission being rejected with `"budget_limit"` until the ceiling is
+   * raised (via `setBudget()`) or `tokenBudget` admits a zero-token
+   * request.
    */
   budget: number;
+
 
   /**
    * Estimator used to calculate token reservation pre-admission.
@@ -731,7 +739,8 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
   assertNonNegativeInteger(maxQueue, "maxQueue");
   assertOptionalNonNegativeInteger(timeoutMs, "timeoutMs");
   if (opts.tokenBudget) {
-    assertPositiveInteger(opts.tokenBudget.budget, "tokenBudget.budget");
+    assertNonNegativeInteger(opts.tokenBudget.budget, "tokenBudget.budget");
+
     assertOptionalNonNegativeInteger(
       opts.tokenBudget.outputCap,
       "tokenBudget.outputCap",
@@ -767,7 +776,18 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
 
   const highPriorityReserve = budget?.highPriorityReserve ?? 0;
 
+  /**
+   * Mutable budget ceiling, initialized from `tokenBudget.budget`.
+   * `undefined` when `tokenBudget` was never configured — `setBudget()`
+   * throws in that case rather than silently no-op'ing.
+   * Mutated only by `setBudget()`. All admission math reads this value
+   * (via `effectiveBudget()`), not the frozen `opts.tokenBudget.budget`,
+   * so budget changes take effect on the very next admission check.
+   */
+  let currentBudget: number | undefined = budget?.budget;
+
   let inFlightTokens = 0;
+
   let totalReserved = 0;
   let totalConsumed = 0;
   let totalRefunded = 0;
@@ -854,9 +874,10 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
   function effectiveBudget(priority: LLMPriority): number {
     if (!budget) return Infinity;
     return priority === "high"
-      ? budget.budget
-      : budget.budget - highPriorityReserve;
+      ? currentBudget!
+      : currentBudget! - highPriorityReserve;
   }
+
 
   /**
    * Attempt token budget admission synchronously for a precomputed
@@ -900,7 +921,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     if (budget) {
       const eff = effectiveBudget(priority);
       detail.tokenBudget = {
-        budget: budget.budget,
+        budget: currentBudget!,
         inFlightTokens,
         effectiveBudget: eff,
         available: Math.max(0, eff - inFlightTokens),
@@ -909,6 +930,37 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     }
     return detail;
   }
+
+  /**
+   * Update the token budget ceiling at runtime.
+   *
+   * Semantics (deliberate, not incidental):
+   *
+   * - **Raising takes effect immediately.** The very next admission check
+   *   reads the new ceiling via `effectiveBudget()` — no caching to
+   *   invalidate, no in-flight work touched.
+   * - **Lowering below `inFlightTokens` is legal — shrink by attrition.**
+   *   No in-flight work is revoked or cancelled. New admissions reject
+   *   with `"budget_limit"` until enough in-flight work releases to bring
+   *   `inFlightTokens` back under the new ceiling. This mirrors the
+   *   library's existing overrun tolerance (`inFlightTokens` can already
+   *   exceed `budget` via `reportUsage()` overrun) — over-budget in-flight
+   *   state is an established, intentional condition, not an invariant
+   *   violation.
+   * - **Throws if `tokenBudget` was never configured.** An explicit error
+   *   beats a silent no-op — there is no budget ceiling to adjust.
+   * - **Validation:** `tokens` must be a non-negative integer.
+   */
+  function setBudget(tokens: number): void {
+    if (!budget) {
+      throw new Error(
+        "setBudget requires tokenBudget to be configured at construction",
+      );
+    }
+    assertNonNegativeInteger(tokens, "tokens");
+    currentBudget = tokens;
+  }
+
 
   function normalizeAcquireOptions(ao: AcquireOptions): AcquireOptions {
     const normalized: AcquireOptions = {};
@@ -1306,9 +1358,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
 
     if (budget) {
       result.tokenBudget = {
-        budget: budget.budget,
+        budget: currentBudget!,
         inFlightTokens,
-        available: Math.max(0, budget.budget - inFlightTokens),
+        available: Math.max(0, currentBudget! - inFlightTokens),
         totalReserved,
         totalConsumed,
         totalRefunded,
@@ -1316,6 +1368,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         highPriorityReserve,
       };
     }
+
 
     if (dedup.enabled) {
       result.deduplication = {
@@ -1362,7 +1415,8 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     };
   }
 
-  return { acquire, run, wouldAdmit, stats, close, drain, on };
+  return { acquire, run, wouldAdmit, stats, setBudget, close, drain, on };
 }
+
 
 export type LLMBulkhead = ReturnType<typeof createLLMBulkhead>;
