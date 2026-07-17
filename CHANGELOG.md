@@ -7,9 +7,39 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [3.3.1] - 2026-07-17
+
+### Changed
+
+
+* **`effectiveBudget("normal")` now clamps to `0` instead of going negative.**
+  Construction validates `0 <= highPriorityReserve <= budget` (a startup check
+  that catches config typos), but `setBudget()` does not re-run that
+  validation — a runtime budget update (e.g. driven by a lease-renewal
+  ledger) is trusted as-is, since rejecting the ledger's grant would be
+  incorrect. This means `currentBudget` can legitimately drop below
+  `highPriorityReserve` after `setBudget()`. Previously, the normal-priority
+  ceiling (`currentBudget - highPriorityReserve`) could go negative in that
+  state, which was surfaced as a negative `effectiveBudget`/`available` in
+  `stats()` and rejection `detail`. It is now `Math.max(0, currentBudget -
+  highPriorityReserve)`.
+  * **Behavioral consequence (unchanged, now made explicit):** when the
+    budget grant drops below the reserve, normal-priority requests are
+    fully rejected with `"budget_limit"` while `priority: "high"` requests
+    are still checked against the full (shrunk) `currentBudget` and can
+    keep admitting whatever capacity remains. This is the intended degraded
+    behavior — `highPriorityReserve` exists specifically to protect
+    interactive traffic when capacity is scarce, and capacity is never
+    scarcer than when the grant itself falls below the reserve.
+  * Admission decisions were already correct in this scenario (a negative
+    ceiling already rejected every normal-priority request); this change
+    only corrects the *reported* numbers (`stats().tokenBudget`, rejection
+    `detail.tokenBudget`) from negative to `0`.
+  * Construction-time validation (`highPriorityReserve <= budget`) is
+    unchanged.
 
 ---
+
 
 ## [3.3.0] - 2026-07-17
 

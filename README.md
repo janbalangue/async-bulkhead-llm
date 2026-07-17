@@ -437,6 +437,8 @@ Semantics, pinned deliberately:
 * **Lowering below `inFlightTokens` is legal — shrink by attrition.** No in-flight request is revoked or cancelled. New admissions reject with `"budget_limit"` until enough in-flight work releases to bring `stats().tokenBudget.inFlightTokens` back under the new ceiling. This is consistent with the library's existing overrun tolerance — `inFlightTokens` can already exceed `budget` via `reportUsage()` overrun, so an over-budget in-flight state is an established, intentional condition rather than an edge case.
 * **Throws if `tokenBudget` was never configured at construction.** There is no ceiling to adjust, so an explicit error is raised instead of silently no-op'ing.
 * **Validates `tokens` as a non-negative integer** (`0` is valid — it fully closes admission until either budget is raised or in-flight work drains and no further reservation exists).
+* **Not re-validated against `highPriorityReserve`.** Construction requires `highPriorityReserve <= budget` (catches config typos), but `setBudget()` trusts the caller — a renewal-driven ledger grant is reality, and the bulkhead has no standing to refuse it even if it drops below the configured reserve. If that happens, the normal-priority ceiling (`budget - highPriorityReserve`) is clamped to `0`: normal-priority traffic is fully rejected with `"budget_limit"` while `priority: "high"` requests are still checked against the full (shrunk) budget and can keep admitting. This is the intended degraded behavior — protecting interactive traffic when capacity is scarcest is exactly what `highPriorityReserve` is for.
+
 
 ---
 

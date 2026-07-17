@@ -870,13 +870,37 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     return priority;
   }
 
-  /** Budget ceiling applicable to a request at the given priority. */
+  /**
+   * Budget ceiling applicable to a request at the given priority.
+   *
+   * Construction validates `0 <= highPriorityReserve <= budget` (see the
+   * `tokenBudget` validation block above) — that check catches config
+   * typos once, at startup. It intentionally does *not* run again here.
+   *
+   * `setBudget()` can lower `currentBudget` below `highPriorityReserve` at
+   * runtime (e.g. a lease-renewal ledger reporting a shrunk grant), and
+   * that is allowed, not re-validated. Rejecting a renewal-driven update
+   * would be wrong: the ledger's grant is reality — the bulkhead has no
+   * standing to refuse it. So `currentBudget` can legitimately end up
+   * smaller than `highPriorityReserve`.
+   *
+   * Consequence, deliberately embraced: `currentBudget! - highPriorityReserve`
+   * would go negative in that state, so it is clamped to `0` here. That
+   * means normal-priority admission is fully rejected (nothing fits under
+   * a `0` ceiling) while high-priority admission is still checked against
+   * the full (shrunk) `currentBudget` and can keep admitting whatever
+   * capacity remains. That is exactly the right degraded behavior — the
+   * entire purpose of `highPriorityReserve` is protecting interactive
+   * traffic when capacity is scarce, and capacity has never been scarcer
+   * than when the grant itself drops below the reserve.
+   */
   function effectiveBudget(priority: LLMPriority): number {
     if (!budget) return Infinity;
     return priority === "high"
       ? currentBudget!
-      : currentBudget! - highPriorityReserve;
+      : Math.max(0, currentBudget! - highPriorityReserve);
   }
+
 
 
   /**

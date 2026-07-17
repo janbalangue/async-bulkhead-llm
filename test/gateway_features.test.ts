@@ -503,5 +503,50 @@ describe("setBudget — runtime budget mutation", () => {
     if (r3.ok) r3.token.release();
     r1.token.release();
   });
+
+  it("clamps effectiveBudget(\"normal\") to 0 (not negative) when setBudget drops the grant below highPriorityReserve", async () => {
+    // reserve (400) > budget after mutation (200) — construction validation
+    // does not re-run at runtime; the renewal-driven grant is trusted as-is.
+    const b = makeBulkhead(2400, { highPriorityReserve: 400 });
+    b.setBudget(200);
+
+    // Normal priority: effectiveBudget = max(0, 200 - 400) = 0 -> full rejection,
+    // even for a request whose reservation would otherwise fit inside 200.
+    expect(b.wouldAdmit(req())).toEqual({
+      admit: false,
+      reason: "budget_limit",
+    });
+    const rejected = await b.acquire(req("a"));
+    expect(rejected.ok).toBe(false);
+    if (rejected.ok) return;
+    expect(rejected.reason).toBe("budget_limit");
+    // Reported numbers must be clamped at 0, never negative.
+    expect(rejected.detail!.tokenBudget).toMatchObject({
+      budget: 200,
+      effectiveBudget: 0,
+      available: 0,
+    });
+
+    // High priority is still checked against the full (shrunk) budget (200),
+    // not the reserve — a small-enough request can still be admitted.
+    const tinyEstimator = (): TokenEstimate => ({ input: 50, maxOutput: 50 });
+    const bTiny = createLLMBulkhead({
+      model: "claude-sonnet-4",
+      maxConcurrent: 10,
+      tokenBudget: {
+        budget: 2400,
+        estimator: tinyEstimator,
+        highPriorityReserve: 400,
+      },
+    });
+    bTiny.setBudget(200);
+    expect(bTiny.wouldAdmit(req(), { priority: "high" })).toEqual({
+      admit: true,
+    });
+    const admitted = await bTiny.acquire(req("b"), { priority: "high" });
+    expect(admitted.ok).toBe(true);
+    if (admitted.ok) admitted.token.release();
+  });
 });
+
 
