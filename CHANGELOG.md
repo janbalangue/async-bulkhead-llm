@@ -7,9 +7,16 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [3.4.0] - 2026-07-18
+## [3.4.1] - 2026-07-18
+
+> **Note:** This release is identical in content to what was intended to be
+> published as `3.4.0`. That version was published to npm and then
+> unpublished, and npm's registry policy prevents re-publishing a version
+> number once it has been unpublished. This release republishes the same
+> changes as `3.4.1`.
 
 ### Changed
+
 
 * **Default deduplication key now covers the entire request.** The old key
   serialized only `{messages, max_tokens, model}`, silently conflating
