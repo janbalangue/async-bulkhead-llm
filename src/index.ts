@@ -6,6 +6,8 @@ import {
   type RejectReason as BaseRejectReason,
 } from "async-bulkhead-ts";
 
+import { createHash } from "node:crypto";
+
 type BulkheadSignal = NonNullable<AcquireOptions["signal"]>;
 
 // ────────────────────────────────────────────
@@ -329,7 +331,25 @@ export type DeduplicationOptions = {
    * Requests with the same key that arrive while a matching call is
    * already in-flight share that call.
    *
-   * Default: `JSON.stringify({ m: request.messages, t: request.max_tokens, o: request.model })`.
+   * Default (v3.4): a key-order-stable serialization of the **entire
+   * request object**. Any own enumerable property difference —
+   * `temperature`, `tools`, `system`, etc., not just `messages` /
+   * `max_tokens` / `model` — prevents conflation. The tradeoff: volatile
+   * per-request fields (request IDs, timestamps) also defeat
+   * deduplication. If your requests carry such fields, supply a `keyFn`
+   * that omits them. Non-serializable values (functions, symbols) are
+   * dropped by JSON serialization and do not distinguish requests.
+   *
+   * Keys are SHA-256 hashed before being stored, so the in-flight map
+   * never retains prompt text and per-entry key memory is bounded.
+   *
+   * Deduplication applies to `run()` only — `acquire()` never
+   * deduplicates.
+   *
+   * **Multi-tenant callers:** the default key has no tenant dimension.
+   * Two tenants sending byte-identical requests would share one
+   * response. Pass `dedupScope` (per-call, on `run()` options) or bake
+   * the tenant into a custom `keyFn` to prevent cross-tenant sharing.
    *
    * Return an empty string to opt a specific request out of deduplication.
    */
@@ -703,22 +723,53 @@ function resolveDedup(
 }
 
 /**
+ * JSON.stringify with recursively sorted object keys, so structurally
+ * identical requests serialize identically regardless of property
+ * insertion order.
+ */
+function stableStringify(value: unknown): string {
+  return JSON.stringify(value, (_key, v: unknown) => {
+    if (v !== null && typeof v === "object" && !Array.isArray(v)) {
+      const obj = v as Record<string, unknown>;
+      const sorted: Record<string, unknown> = {};
+      for (const k of Object.keys(obj).sort()) sorted[k] = obj[k];
+      return sorted;
+    }
+    return v;
+  });
+}
+
+/**
  * Default deduplication key.
  *
- * v2: includes `max_tokens` and `model` so that requests with
- * identical messages but different output limits or models are
- * not conflated.
+ * v3.4: serializes the **entire request** (stable key order) instead of
+ * only `{messages, max_tokens, model}`. The old key silently conflated
+ * requests that differed in any other field — e.g. identical messages
+ * with `temperature: 0` vs `temperature: 1` shared one call and one
+ * response. Missing a dedup opportunity is cheap; serving a response
+ * generated under different parameters is a correctness bug, so the
+ * default now errs entirely toward non-conflation.
  */
 function defaultDedupKey(request: LLMRequest): string {
   try {
-    return JSON.stringify({
-      m: request.messages,
-      t: request.max_tokens,
-      o: request.model,
-    });
+    return stableStringify(request);
   } catch {
     return "";
   }
+}
+
+/**
+ * Derive the map key actually stored for an in-flight entry:
+ * `sha256(scope \0 rawKey)`. Hashing bounds per-entry key memory and
+ * keeps prompt text out of the dedup map; the `\0` separator prevents
+ * scope/key boundary ambiguity ("ab"+"c" vs "a"+"bc").
+ */
+function hashDedupKey(scope: string, rawKey: string): string {
+  const h = createHash("sha256");
+  h.update(scope);
+  h.update("\u0000");
+  h.update(rawKey);
+  return h.digest("hex");
 }
 
 // ────────────────────────────────────────────
@@ -1006,14 +1057,28 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     return new LLMBulkheadRejectedError(reason);
   }
 
+  /**
+   * Wait on another caller's in-flight shared call.
+   *
+   * v3.4: only an *explicitly passed* per-call `timeoutMs` caps this
+   * wait. The bulkhead-level `timeoutMs` default is deliberately NOT
+   * applied here — it is documented as a *queue-wait* timeout, and a
+   * follower is not queued; it is waiting on a call that is already
+   * running. Applying the default (e.g. the `batch` profile's 30s) made
+   * every follower of a slow LLM call fail with `"timeout"` while the
+   * leader succeeded, defeating deduplication exactly when calls are
+   * long. `signal` continues to apply as before.
+   */
   function waitForSharedDedup<T>(
     shared: Promise<T>,
     request: LLMRequest,
     ao: AcquireOptions,
   ): Promise<T> {
-    const normalized = normalizeAcquireOptions(ao);
-    const signal = normalized.signal;
-    const effectiveTimeoutMs = normalized.timeoutMs;
+    const signal = ao.signal;
+    const effectiveTimeoutMs = ao.timeoutMs;
+    if (effectiveTimeoutMs !== undefined) {
+      assertNonNegativeInteger(effectiveTimeoutMs, "timeoutMs");
+    }
 
     if (signal?.aborted) {
       return Promise.reject(noteDedupWaitRejection(request, "aborted"));
@@ -1154,7 +1219,13 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         try {
           base.release();
         } finally {
-          const refunded = releaseTokens(held, validUsage);
+          // Zero `held` before returning tokens: nothing is held against
+          // the budget after release, and post-release `reportUsage()`
+          // snapshots must reflect that (previously they reported the
+          // stale pre-release hold).
+          const heldAtRelease = held;
+          held = 0;
+          const refunded = releaseTokens(heldAtRelease, validUsage);
           noteLLMRelease();
           emit("release", {
             request,
@@ -1264,23 +1335,43 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
    * of `fn` to extract actual token usage. The refund mechanism then
    * returns the difference between the reservation and actual consumption
    * to the budget.
+   *
+   * Deduplication (when enabled) applies to `run()` only; `acquire()`
+   * never deduplicates. A caller that joins an existing in-flight call
+   * is capped only by its own `signal` and an *explicitly passed*
+   * per-call `timeoutMs` — the bulkhead-level `timeoutMs` (a queue-wait
+   * timeout) does not apply to that wait.
    */
   async function run<T>(
     request: LLMRequest,
     fn: (signal?: BulkheadSignal, ctx?: LLMRunContext) => Promise<T>,
     ao: LLMAcquireOptions & {
       getUsage?: (result: T) => TokenUsage | undefined;
+      /**
+       * Deduplication scope. Requests deduplicate only within the same
+       * scope — calls with different scopes never share an in-flight
+       * call, even with identical keys. Use this to carry the tenant /
+       * API-key identity in multi-tenant gateways so responses are never
+       * shared across tenants. Ignored when deduplication is disabled.
+       * Default: `""` (single global scope).
+       */
+      dedupScope?: string;
     } = {},
   ): Promise<T> {
-    const { getUsage, ...acquireOpts } = ao;
+    const { getUsage, dedupScope, ...acquireOpts } = ao;
 
     // ---- Deduplication ----
     let dedupKey = "";
     if (dedup.enabled) {
+      let rawKey: string;
       try {
-        dedupKey = dedup.keyFn(request);
+        rawKey = dedup.keyFn(request);
       } catch {
-        dedupKey = "";
+        rawKey = "";
+      }
+      // "" opts out; only real keys are scoped + hashed.
+      if (rawKey !== "") {
+        dedupKey = hashDedupKey(dedupScope ?? "", rawKey);
       }
     }
 

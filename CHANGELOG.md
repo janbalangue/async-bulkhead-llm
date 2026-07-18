@@ -7,6 +7,64 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.4.0] - 2026-07-18
+
+### Changed
+
+* **Default deduplication key now covers the entire request.** The old key
+  serialized only `{messages, max_tokens, model}`, silently conflating
+  requests that differed in any other field — identical messages with
+  `temperature: 0` vs `temperature: 1` shared one call, and the second
+  caller received a response generated under the first caller's parameters.
+  The default key is now a key-order-stable serialization of the whole
+  request object, so any own enumerable property difference prevents
+  conflation. Tradeoff: volatile per-request fields (request IDs,
+  timestamps) now also defeat deduplication — supply a custom `keyFn` that
+  omits them if your requests carry such fields. Missing a dedup
+  opportunity is cheap; serving a wrong-parameters response is a
+  correctness bug, so the default errs entirely toward non-conflation.
+  Dedup **hit rates may drop** for callers whose requests carry extra
+  fields; admission behavior is otherwise unchanged.
+
+* **Dedup keys are SHA-256 hashed before storage.** The in-flight map
+  previously held full serialized prompt text as its keys — unbounded
+  per-entry key memory, and prompt content resident for the lifetime of
+  the entry. Keys are now hashed (scope + `\0` + raw key), bounding key
+  size and keeping prompt text out of the map. `keyFn` semantics are
+  unchanged: it still returns a plain string, and `""` still opts out.
+
+* **Bulkhead-level `timeoutMs` no longer applies to dedup followers.**
+  `timeoutMs` is documented as a *queue-wait* timeout, but it was also
+  being applied to a follower's wait on an already-running shared call.
+  Under the `batch` profile (30s default), any LLM call slower than the
+  timeout caused every follower to reject with `"timeout"` while the
+  leader succeeded — defeating deduplication exactly when calls are long.
+  Followers are now capped only by their own `signal` and an *explicitly
+  passed* per-call `timeoutMs`. Callers who relied on the bulkhead
+  default bounding follower waits should pass `timeoutMs` per call.
+
+* **`reportUsage()` after `release()` now reports `held: 0`.** The token's
+  internal hold counter was not zeroed at release, so post-release
+  snapshots reported the stale pre-release hold while
+  `stats().tokenBudget.inFlightTokens` correctly showed the tokens
+  returned. Budget accounting was always correct; only the snapshot lied.
+  `reserved` continues to report the historical pre-admission reservation.
+
+### Added
+
+* **`dedupScope` option on `run()`.** Requests deduplicate only within the
+  same scope; different scopes never share an in-flight call even with
+  identical keys. Intended for multi-tenant gateways: the default key has
+  no tenant dimension, so without a scope (or a tenant-aware `keyFn`),
+  two tenants sending byte-identical requests would share one response.
+  Default: `""` (single global scope — prior behavior).
+
+* Documented explicitly: deduplication applies to `run()` only;
+  `acquire()` never deduplicates. (Existing behavior, previously
+  undocumented.)
+
+---
+
 ## [3.3.1] - 2026-07-17
 
 ### Changed
