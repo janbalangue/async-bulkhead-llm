@@ -7,6 +7,50 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.6.0] - 2026-07-19
+
+### Added
+
+* **Exact reservation preview via `bulkhead.estimate(request)`.** The new
+  method runs the same estimator and validation path used by
+  `acquire()`, `run()`, and `wouldAdmit()`, returning
+  `{ input, maxOutput, reserved }` without acquiring capacity. It returns
+  `null` when token-budget admission is disabled. This gives gateways and
+  external capacity coordinators one authoritative reservation calculation
+  instead of forcing them to duplicate estimator logic.
+
+* **Stable admission IDs.** Every successful admission now receives a
+  process-unique UUID exposed on the successful `acquire()` result,
+  `LLMToken`, `LLMRunContext`, and the `admit` / `release` lifecycle events.
+  Admission events also expose the resolved priority, and release events now
+  include the pre-release held-token count plus the final usage-event
+  sequence. These fields let gateways correlate HTTP requests, traces,
+  distributed leases, usage updates, and release records without maintaining
+  fragile side maps.
+
+* **Ordered `usage` lifecycle events.** Effective cumulative
+  `reportUsage()` updates now emit an event containing the admission ID,
+  priority, monotonically increasing per-admission sequence, previous/current
+  hold, hold delta, cumulative usage, output-cap state, and over-reservation
+  status. Duplicate or stale reports that do not increase either cumulative
+  usage field are suppressed. Sequence numbers allow external coordinators to
+  reject duplicate or out-of-order updates safely. The returned `UsageReport`
+  now also includes `admissionId` and the current `sequence`, so a gateway can
+  await an external absolute-hold update before forwarding more streamed data.
+
+### Changed
+
+* `LLMEventMap["admit"]` and `LLMEventMap["release"]` include additional
+  correlation and accounting fields. Existing listener behavior is unchanged;
+  the additions are backward-compatible for consumers that read only the
+  previous fields.
+
+* `request.max_tokens` validation is centralized in the shared reservation
+  path, so `estimate()`, `wouldAdmit()`, `acquire()`, and `run()` now validate
+  it consistently even when a custom estimator ignores that field.
+
+---
+
 ## [3.5.0] - 2026-07-19
 
 ### Fixed

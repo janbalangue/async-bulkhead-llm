@@ -19,7 +19,10 @@ Designed for services that need to enforce **cost ceilings, concurrency limits, 
 - ✅ **In-flight deduplication** — identical requests share one LLM call; hashed keys, whole-request equality
 - ✅ **Custom dedup key + per-tenant scope** — bring your own equivalence function; `dedupScope` isolates tenants
 - ✅ **Streaming-safe deduplication** — single-consumer results are never silently shared; `shareResult` fan-out hook + per-call `dedup: false` opt-out
-- ✅ **Event hooks** — `on('admit' | 'reject' | 'release' | 'dedup', fn)`
+- ✅ **Exact reservation preview** — `estimate()` exposes the reservation admission will use
+- ✅ **Stable admission IDs** — correlate gateway requests, traces, usage, and release
+- ✅ **Ordered usage events** — sequence-numbered hold changes for external coordinators
+- ✅ **Event hooks** — `on('admit' | 'reject' | 'usage' | 'release' | 'dedup', fn)`
 - ✅ **Graceful shutdown** — `close()` + `drain()`
 - ✅ Optional **AbortSignal** and **timeout** cancellation
 - ✅ `bulkhead.run(request, fn)` — acquire + release handled automatically
@@ -118,6 +121,83 @@ const request = {
 
 const result = await bulkhead.run(request, async () => {
   return callYourLLMProvider(request);
+});
+```
+
+---
+
+## What's New in v3.6 — Gateway coordination seams
+
+### Exact reservation preview
+
+`estimate()` runs the same estimator and validation path as admission without
+reserving capacity. This is useful when a gateway must acquire an external
+lease before entering the local bulkhead:
+
+```ts
+const reservation = bulkhead.estimate(request);
+const lease = reservation
+  ? await redisLease.reserve(requestId, reservation.reserved)
+  : undefined;
+
+const result = await bulkhead.acquire(request);
+if (!result.ok) {
+  await lease?.release();
+  return reject(result.reason);
+}
+```
+
+The preview is advisory until admission occurs: do not mutate the request
+between calls, and keep custom estimators deterministic. `null` means token
+budgeting is disabled and the local bulkhead will reserve no tokens.
+
+### Stable admission identity
+
+Every successful admission receives a UUID available on the acquire result,
+token, run context, and lifecycle events:
+
+```ts
+const result = await bulkhead.acquire(request);
+if (result.ok) {
+  console.log(result.admissionId);
+  console.log(result.token.admissionId);
+  result.token.release();
+}
+
+await bulkhead.run(request, async (_signal, ctx) => {
+  trace.setAttribute('llm.admission_id', ctx!.admissionId);
+  return callYourLLMProvider(request);
+});
+```
+
+### Ordered usage-change events
+
+Effective cumulative `reportUsage()` updates emit a sequence-numbered event.
+Stale or duplicate reports are clamped as before and do not emit:
+
+```ts
+bulkhead.on('usage', (event) => {
+  // External stores can ignore an update whose sequence is not newer.
+  distributedLedger.adjust({
+    admissionId: event.admissionId,
+    sequence: event.sequence,
+    heldTokens: event.heldTokens,
+  });
+});
+```
+
+The event includes previous/current hold, delta, cumulative usage, priority,
+output-cap state, and over-reservation status. Listeners remain synchronous;
+enqueue network or storage work rather than blocking inside the callback.
+For admission-critical distributed enforcement, use the returned report and
+await the external update in the gateway's stream loop:
+
+```ts
+const report = ctx!.reportUsage(cumulativeUsage);
+await distributedLedger.setHold({
+  admissionId: report.admissionId,
+  sequence: report.sequence,
+  heldTokens: report.held,
 });
 ```
 
@@ -290,7 +370,8 @@ const bulkhead = createLLMBulkhead({
 });
 ```
 
-The default key now includes `messages`, `max_tokens`, and `model`. Return an empty string to opt a specific request out.
+The default key covers the entire request object with stable key ordering.
+Return an empty string to opt a specific request out.
 
 ### Event Hooks
 
@@ -304,7 +385,7 @@ const off = bulkhead.on('release', ({ reservedTokens, refundedTokens, usage }) =
 off(); // unsubscribe
 ```
 
-Events: `'admit'`, `'reject'`, `'release'`, `'dedup'`.
+Events: `'admit'`, `'reject'`, `'usage'`, `'release'`, `'dedup'`.
 
 ### Graceful Shutdown
 
@@ -579,6 +660,8 @@ if (!r.ok) {
   return respond503(r.reason);
 }
 
+console.log(`Admission: ${r.admissionId}`);
+
 try {
   const response = await callLLM(request);
   return response;
@@ -669,8 +752,8 @@ type LLMStats = {
 
 ```ts
 // Subscribe
-const off = bulkhead.on('admit', ({ request, reservedTokens }) => {
-  console.log(`Admitted: ${reservedTokens} tokens reserved`);
+const off = bulkhead.on('admit', ({ admissionId, reservedTokens }) => {
+  console.log(`${admissionId}: ${reservedTokens} tokens reserved`);
 });
 
 // Unsubscribe
@@ -679,12 +762,15 @@ off();
 
 | Event     | Payload |
 |-----------|---------|
-| `admit`   | `{ request, reservedTokens }` |
-| `reject`  | `{ request, reason }` |
-| `release` | `{ request, reservedTokens, refundedTokens, usage? }` |
+| `admit`   | `{ request, admissionId, priority, reservedTokens }` |
+| `reject`  | `{ request, reason, detail? }` |
+| `usage`   | `{ request, admissionId, priority, sequence, reservedTokens, previousHeldTokens, heldTokens, deltaTokens, usage, outputCap, outputRemaining, overReservation }` |
+| `release` | `{ request, admissionId, priority, reservedTokens, heldTokens, refundedTokens, usageSequence, usage? }` |
 | `dedup`   | `{ request }` |
 
 Listeners are synchronous and fire-and-forget. Exceptions are silently caught.
+Do not perform blocking network I/O in a listener; enqueue telemetry or lease
+updates for asynchronous delivery.
 
 ---
 
@@ -711,10 +797,10 @@ type LLMBulkheadOptions = {
   timeoutMs?:     number; // integer >= 0
   profile?:       'interactive' | 'batch' | LLMBulkheadPreset;
   tokenBudget?: {
-    budget:      number; // non-negative integer; 0 rejects all budget-gated admissions
-    estimator?:  TokenEstimator;
-
-    outputCap?:  number; // integer >= 0
+    budget:               number; // non-negative integer; 0 rejects all budget-gated admissions
+    estimator?:           TokenEstimator;
+    outputCap?:           number; // integer >= 0
+    highPriorityReserve?: number; // integer >= 0 and <= initial budget
   };
   deduplication?: boolean | DeduplicationOptions;
 };
@@ -730,10 +816,11 @@ type DeduplicationOptions = {
 ```ts
 run<T>(
   request:  LLMRequest,
-  fn:       (signal?: AbortSignal) => Promise<T>,
+  fn:       (signal?: AbortSignal, ctx?: LLMRunContext) => Promise<T>,
   options?: {
     signal?:     AbortSignal;
     timeoutMs?:  number; // integer >= 0
+    priority?:   'normal' | 'high';
     getUsage?:   (result: T) => TokenUsage | undefined;
     dedupScope?: string;  // dedup isolation scope (e.g. tenant / API key)
     dedup?:      boolean; // false = opt this call out of dedup (v3.5)
@@ -741,19 +828,52 @@ run<T>(
 ): Promise<T>
 ```
 
+`ctx.admissionId` is the stable admission identifier. `ctx.reservation` is
+the exact reservation used at admission (or `null` when token budgeting is
+disabled), and `ctx.reportUsage()` reports cumulative streaming usage.
+
+### `bulkhead.estimate(request)`
+
+```ts
+estimate(request: LLMRequest): LLMReservationEstimate | null
+
+type LLMReservationEstimate = {
+  readonly input: number;
+  readonly maxOutput: number;
+  readonly reserved: number;
+};
+```
+
+Runs the same estimator and validation path as admission but does not reserve
+capacity. Returns `null` when `tokenBudget` is not configured.
+
 ### `bulkhead.acquire(request, options?)`
 
 ```ts
 acquire(
   request:  LLMRequest,
-  options?: { signal?: AbortSignal; timeoutMs?: number /* integer >= 0 */ },
+  options?: {
+    signal?: AbortSignal;
+    timeoutMs?: number; // integer >= 0
+    priority?: 'normal' | 'high';
+  },
 ): Promise<LLMAcquireResult>
 
 type LLMAcquireResult =
-  | { ok: true;  token: LLMToken }
+  | {
+      ok: true;
+      admissionId: string;
+      reservation: LLMReservationEstimate | null;
+      token: LLMToken;
+    }
   | { ok: false; reason: LLMRejectReason };
 
-type LLMToken = { release(usage?: TokenUsage): void };
+type LLMToken = {
+  readonly admissionId: string;
+  readonly reservation: LLMReservationEstimate | null;
+  reportUsage(usage: TokenUsage): UsageReport;
+  release(usage?: TokenUsage): void;
+};
 ```
 
 ### `bulkhead.stats()`
@@ -792,8 +912,19 @@ type TextContentBlock  = { type: 'text'; text: string };
 type OpaqueContentBlock = { type: string; [key: string]: unknown };
 
 type TokenEstimate  = { input: number; maxOutput: number };
+type LLMReservationEstimate = TokenEstimate & { reserved: number };
 type TokenEstimator = (request: LLMRequest) => TokenEstimate;
 type TokenUsage     = { input: number; output: number };
+type UsageReport = {
+  admissionId: string;
+  sequence: number;
+  reserved: number;
+  held: number;
+  consumed: number;
+  outputCap: number | null;
+  outputRemaining: number | null;
+  overReservation: boolean;
+};
 
 type LLMRejectReason =
   | 'concurrency_limit'
@@ -801,12 +932,19 @@ type LLMRejectReason =
   | 'budget_limit'
   | 'timeout'
   | 'aborted'
-  | 'shutdown';
+  | 'shutdown'
+  | 'unshareable_result';
 ```
 
 ---
 
 ## Migration
+
+### v3.5 → v3.6
+
+No call-site changes are required. `admit` and `release` event payloads gained
+additional fields, and `usage` is a new event type. Code that exhaustively
+enumerates `LLMEventType` should add the new `usage` case.
 
 ### v2 → v3
 
