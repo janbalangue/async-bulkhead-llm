@@ -93,7 +93,20 @@ export type TokenUsage = {
 // Reject reason
 // ────────────────────────────────────────────
 
-export type LLMRejectReason = BaseRejectReason | "budget_limit";
+/**
+ * Rejection reasons.
+ *
+ * `"unshareable_result"` (v3.5) is raised only for deduplication
+ * *followers*: the shared call resolved to a single-consumer value
+ * (stream, `Response` with a body, async iterable) that cannot be
+ * safely handed to more than one caller, and no
+ * `deduplication.shareResult` hook was configured. The leader always
+ * receives the original result unaffected.
+ */
+export type LLMRejectReason =
+  | BaseRejectReason
+  | "budget_limit"
+  | "unshareable_result";
 
 /**
  * Admission priority.
@@ -354,6 +367,47 @@ export type DeduplicationOptions = {
    * Return an empty string to opt a specific request out of deduplication.
    */
   keyFn?: (request: LLMRequest) => string;
+
+  /**
+   * Fan-out hook for delivering a shared in-flight result to
+   * deduplication *followers* (v3.5).
+   *
+   * Called once per follower with the leader's resolved result; the
+   * return value is what that follower receives. The leader always
+   * receives the original result — `shareResult` is never called for
+   * the leader.
+   *
+   * Why this exists: without it, followers receive the *same object*
+   * the leader does. For plain JSON results that is fine (and remains
+   * the default), but single-consumer values — `ReadableStream`,
+   * Node `Readable`, async iterables, `Response` bodies — can only be
+   * consumed once. Whichever caller reads first wins; the rest get a
+   * locked or drained stream. The library cannot tee arbitrary stream
+   * types on your behalf, so it provides this seam instead:
+   *
+   * ```ts
+   * // fetch Response: hand each follower an independent clone.
+   * // (clone() must be called before any consumer reads the body —
+   * //  guaranteed here, since fan-out happens at resolution time.)
+   * deduplication: { shareResult: (r) => (r as Response).clone() }
+   * ```
+   *
+   * When `shareResult` is provided it is called for **every** follower
+   * delivery, including safe (non-stream) results — it is a general
+   * fan-out policy, usable e.g. for defensive deep-cloning.
+   *
+   * If `shareResult` throws, that follower's `run()` rejects with the
+   * thrown error as-is; the leader and other followers are unaffected.
+   *
+   * When `shareResult` is **not** provided and the shared result is
+   * detected as single-consumer, followers are rejected with
+   * `LLMBulkheadRejectedError("unshareable_result")` rather than being
+   * silently handed a stream they cannot read. Detection is shallow:
+   * it inspects the result value itself, not nested properties — a
+   * stream buried inside `{ stream: ... }` is not detected and will be
+   * shared by reference as before.
+   */
+  shareResult?: (result: unknown) => unknown;
 };
 
 // ────────────────────────────────────────────
@@ -714,12 +768,60 @@ function resolvePreset(
   return profile;
 }
 
-function resolveDedup(
-  opt: LLMBulkheadOptions["deduplication"],
-): { enabled: boolean; keyFn: (request: LLMRequest) => string } {
-  if (!opt) return { enabled: false, keyFn: defaultDedupKey };
-  if (opt === true) return { enabled: true, keyFn: defaultDedupKey };
-  return { enabled: true, keyFn: opt.keyFn ?? defaultDedupKey };
+function resolveDedup(opt: LLMBulkheadOptions["deduplication"]): {
+  enabled: boolean;
+  keyFn: (request: LLMRequest) => string;
+  shareResult: ((result: unknown) => unknown) | undefined;
+} {
+  if (!opt) {
+    return { enabled: false, keyFn: defaultDedupKey, shareResult: undefined };
+  }
+  if (opt === true) {
+    return { enabled: true, keyFn: defaultDedupKey, shareResult: undefined };
+  }
+  return {
+    enabled: true,
+    keyFn: opt.keyFn ?? defaultDedupKey,
+    shareResult: opt.shareResult,
+  };
+}
+
+/**
+ * Shallow detection of single-consumer values that must not be handed
+ * to more than one deduplication caller by reference:
+ *
+ * - Web `ReadableStream` (also matched structurally via `getReader`)
+ * - Node streams (`pipe`)
+ * - Async iterables (async generators, SDK stream wrappers) — plain
+ *   arrays/strings/objects are sync-iterable at most, so they never match
+ * - `Response` with a non-null body (`fetch` responses; the body is a
+ *   `ReadableStream` and `.json()`/`.text()` can be called once)
+ *
+ * Deliberately shallow: only the value itself is inspected, never
+ * nested properties. False negatives (a stream inside a wrapper
+ * object) fall back to today's share-by-reference behavior; false
+ * positives are limited to caller types that genuinely advertise
+ * stream/iterator protocols.
+ */
+function isUnsafeToShare(value: unknown): boolean {
+  if (value === null || typeof value !== "object") return false;
+  const v = value as Record<PropertyKey, unknown>;
+  if (
+    typeof globalThis.ReadableStream === "function" &&
+    value instanceof globalThis.ReadableStream
+  ) {
+    return true;
+  }
+  if (typeof v["getReader"] === "function") return true;
+  if (typeof v["pipe"] === "function") return true;
+  if (Symbol.asyncIterator in v) return true;
+  if (
+    typeof globalThis.Response === "function" &&
+    value instanceof globalThis.Response
+  ) {
+    return value.body !== null;
+  }
+  return false;
 }
 
 /**
@@ -1050,11 +1152,38 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
 
   function noteDedupWaitRejection(
     request: LLMRequest,
-    reason: Extract<LLMRejectReason, "aborted" | "timeout">,
+    reason: Extract<
+      LLMRejectReason,
+      "aborted" | "timeout" | "unshareable_result"
+    >,
   ): LLMBulkheadRejectedError {
     noteLLMReject(reason);
     emit("reject", { request, reason });
     return new LLMBulkheadRejectedError(reason);
+  }
+
+  /**
+   * Deliver a shared in-flight result to a deduplication follower.
+   *
+   * - With a `shareResult` hook: the hook decides what the follower
+   *   receives (called for every follower, safe results included).
+   *   Hook exceptions propagate to the follower as-is.
+   * - Without a hook: single-consumer values (streams, `Response`
+   *   bodies, async iterables) are refused with
+   *   `"unshareable_result"` instead of being handed out by
+   *   reference — a locked stream downstream is a silent correctness
+   *   bug; a typed rejection at the bulkhead is actionable.
+   *
+   * The leader never passes through this function.
+   */
+  function deliverShared<T>(value: T, request: LLMRequest): T {
+    if (dedup.shareResult) {
+      return dedup.shareResult(value) as T;
+    }
+    if (isUnsafeToShare(value)) {
+      throw noteDedupWaitRejection(request, "unshareable_result");
+    }
+    return value;
   }
 
   /**
@@ -1084,7 +1213,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       return Promise.reject(noteDedupWaitRejection(request, "aborted"));
     }
     if (signal === undefined && effectiveTimeoutMs === undefined) {
-      return shared;
+      return shared.then((value) => deliverShared(value, request));
     }
 
     return new Promise<T>((resolve, reject) => {
@@ -1123,7 +1252,14 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       }
 
       void shared.then(
-        (value) => settle(() => resolve(value)),
+        (value) =>
+          settle(() => {
+            try {
+              resolve(deliverShared(value, request));
+            } catch (err) {
+              reject(err);
+            }
+          }),
         (err) => settle(() => reject(err)),
       );
     });
@@ -1356,13 +1492,30 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
        * Default: `""` (single global scope).
        */
       dedupScope?: string;
+      /**
+       * Per-call deduplication opt-out (v3.5). Pass `false` to make
+       * this call always execute independently — it neither joins an
+       * existing in-flight call nor registers itself as joinable.
+       *
+       * Intended for streaming routes on a bulkhead where dedup is
+       * otherwise useful: shared stream results are single-consumer
+       * (see `deduplication.shareResult`), so streaming calls can skip
+       * dedup here instead of encoding the exemption in a bulkhead-wide
+       * `keyFn`.
+       *
+       * `true` is accepted but cannot enable deduplication when it is
+       * disabled at the bulkhead level (the key function and shared
+       * state live there); it is treated the same as omitting the
+       * option. Ignored by `acquire()`, which never deduplicates.
+       */
+      dedup?: boolean;
     } = {},
   ): Promise<T> {
-    const { getUsage, dedupScope, ...acquireOpts } = ao;
+    const { getUsage, dedupScope, dedup: perCallDedup, ...acquireOpts } = ao;
 
     // ---- Deduplication ----
     let dedupKey = "";
-    if (dedup.enabled) {
+    if (dedup.enabled && perCallDedup !== false) {
       let rawKey: string;
       try {
         rawKey = dedup.keyFn(request);

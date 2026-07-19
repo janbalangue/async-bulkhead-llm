@@ -7,6 +7,49 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.5.0] - 2026-07-19
+
+### Fixed
+
+* **Deduplication no longer silently hands followers a single-consumer
+  result.** Dedup shares the leader's resolved value with every follower
+  by reference. For plain JSON results that is correct, but for streaming
+  results — `ReadableStream`, Node `Readable`, async iterables, `Response`
+  bodies — the shared object can only be consumed once: whichever caller
+  read first won, and the rest received a locked or drained stream, with
+  no error at the bulkhead. Followers whose shared result is detected as
+  single-consumer now reject with
+  `LLMBulkheadRejectedError("unshareable_result")` (new reject reason,
+  counted in `stats().llm.rejectedByReason` and emitted via the `reject`
+  event, without capacity detail — like other dedup-wait rejections).
+  The **leader is never affected** and always receives the original
+  result. Detection is deliberately shallow: only the result value itself
+  is inspected, so a stream nested inside a wrapper object is still
+  shared by reference as before.
+
+### Added
+
+* **`deduplication.shareResult` fan-out hook.** Called once per follower
+  with the leader's resolved result; its return value is what that
+  follower receives. This is the seam for making streaming dedup
+  *work* rather than merely fail loudly — e.g.
+  `shareResult: (r) => (r as Response).clone()` for `fetch` responses, or
+  a tee/replay of your provider stream. When provided, the hook runs for
+  every follower delivery (safe results included) and the
+  single-consumer detection is bypassed — the hook owns fan-out policy.
+  A throwing hook rejects that follower with the thrown error as-is;
+  leader and other followers are unaffected.
+
+* **Per-call `dedup: false` on `run()` options.** Opts a single call out
+  of deduplication entirely — it neither joins an existing in-flight
+  call nor registers as joinable. Intended for streaming routes on a
+  bulkhead where dedup is otherwise useful, replacing the previous
+  workaround of encoding exemptions in a bulkhead-wide `keyFn`.
+  `dedup: true` cannot enable deduplication when it is disabled at the
+  bulkhead level and is treated as omitted.
+
+---
+
 ## [3.4.1] - 2026-07-18
 
 > **Note:** This release is identical in content to what was intended to be

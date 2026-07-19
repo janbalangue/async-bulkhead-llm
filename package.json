@@ -1,6 +1,6 @@
 {
   "name": "async-bulkhead-llm",
-  "version": "3.4.1",
+  "version": "3.5.0",
   "description": "Fail-fast admission control for LLM workloads built on async-bulkhead-ts.",
   "license": "Apache-2.0",
   "author": "",

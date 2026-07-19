@@ -18,6 +18,7 @@ Designed for services that need to enforce **cost ceilings, concurrency limits, 
 - ✅ **Opinionated profiles** — `'interactive'` and `'batch'` presets with escape hatch
 - ✅ **In-flight deduplication** — identical requests share one LLM call; hashed keys, whole-request equality
 - ✅ **Custom dedup key + per-tenant scope** — bring your own equivalence function; `dedupScope` isolates tenants
+- ✅ **Streaming-safe deduplication** — single-consumer results are never silently shared; `shareResult` fan-out hook + per-call `dedup: false` opt-out
 - ✅ **Event hooks** — `on('admit' | 'reject' | 'release' | 'dedup', fn)`
 - ✅ **Graceful shutdown** — `close()` + `drain()`
 - ✅ Optional **AbortSignal** and **timeout** cancellation
@@ -497,6 +498,52 @@ The bulkhead-level `timeoutMs` default does **not** apply to this wait —
 it is a queue-wait timeout, and a follower is waiting on a call that is
 already running, not queued.
 
+### Streaming results (v3.5)
+
+Dedup shares the leader's resolved value with every follower **by
+reference**. For plain JSON results that is correct. For streaming
+results it is not: a `ReadableStream`, Node `Readable`, async iterable,
+or `Response` body can only be consumed once — whichever caller reads
+first wins, and the rest get a locked or drained stream.
+
+The bulkhead now refuses to do that silently. When a follower's shared
+result is detected as single-consumer, that follower rejects with
+`LLMBulkheadRejectedError("unshareable_result")`. The **leader always
+receives its original result unaffected**. Detection is shallow — only
+the result value itself is inspected, so a stream nested inside a
+wrapper object is still shared by reference.
+
+You have two ways to make streaming and dedup coexist:
+
+**1. `shareResult` — make sharing work.** A fan-out hook called once per
+follower with the leader's result; its return value is what that
+follower receives. It runs for *every* follower delivery (safe results
+included) and bypasses the single-consumer detection — the hook owns
+fan-out policy. A throwing hook rejects that follower with the thrown
+error; leader and other followers are unaffected.
+
+```ts
+// fetch Response: each follower gets an independent clone.
+// clone() is called at resolution time, before any body is consumed.
+deduplication: {
+  shareResult: (r) => (r as Response).clone(),
+}
+```
+
+For raw streams, `tee()`/replay choreography is provider-specific, which
+is why this is a hook rather than built in.
+
+**2. `dedup: false` — skip dedup for streaming calls.** A per-call
+opt-out on `run()` options: the call neither joins an existing in-flight
+call nor registers as joinable. Use it on streaming routes of a bulkhead
+where dedup is otherwise useful, instead of encoding the exemption in a
+bulkhead-wide `keyFn`. (`dedup: true` cannot enable deduplication when
+it is disabled at the bulkhead level.)
+
+```ts
+bulkhead.run(request, streamFromProvider, { dedup: false });
+```
+
 ---
 
 ## Cancellation
@@ -673,7 +720,8 @@ type LLMBulkheadOptions = {
 };
 
 type DeduplicationOptions = {
-  keyFn?: (request: LLMRequest) => string;
+  keyFn?:       (request: LLMRequest) => string;
+  shareResult?: (result: unknown) => unknown; // per-follower fan-out (v3.5)
 };
 ```
 
@@ -684,9 +732,11 @@ run<T>(
   request:  LLMRequest,
   fn:       (signal?: AbortSignal) => Promise<T>,
   options?: {
-    signal?:    AbortSignal;
-    timeoutMs?: number; // integer >= 0
-    getUsage?:  (result: T) => TokenUsage | undefined;
+    signal?:     AbortSignal;
+    timeoutMs?:  number; // integer >= 0
+    getUsage?:   (result: T) => TokenUsage | undefined;
+    dedupScope?: string;  // dedup isolation scope (e.g. tenant / API key)
+    dedup?:      boolean; // false = opt this call out of dedup (v3.5)
   },
 ): Promise<T>
 ```
