@@ -7,7 +7,53 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [3.6.0] - 2026-07-19
+## [3.7.0] - 2026-07-20
+
+### Added
+
+* **`LLMRequest.system`** — optional system prompt (string or content-block
+  array), counted by both built-in estimators exactly like message content.
+  Previously, callers had to fold the system prompt into a synthetic message
+  for it to participate in estimation, which also distorted events, logs,
+  and deduplication keys.
+
+* **`LLMRequest.extraInputTokens`** — a first-class channel for input tokens
+  the character-based estimators cannot see (tool schemas kept outside
+  `messages`, provider-priced media, etc.). Built-in estimators add the
+  value verbatim; custom estimators may honor or ignore it. Must be a
+  non-negative integer. Because it is an ordinary request field, it
+  participates in the default deduplication key — requests differing only
+  here are never conflated. This replaces the pattern of smuggling
+  out-of-band token costs through wrapper estimators or hidden properties.
+
+* **`opaqueBlockTokens` on `createModelAwareTokenEstimator`** — a
+  configurable input-token surcharge for opaque (non-text) content blocks:
+  either a flat number per block, or `{ default?, byType? }` keyed by
+  `block.type`. Applies to blocks in `messages[].content` and `system`
+  arrays; validated at estimator creation. Without it, opaque blocks
+  contribute 0 input tokens (unchanged default) — an image-heavy request
+  estimates as nearly free, which is the wrong direction for admission
+  control. Malformed text blocks (`type: "text"` without a string `text`)
+  are treated as opaque, erring toward over-reservation.
+
+* **Per-call reservation override** — `reservation?: TokenEstimate` on
+  `acquire()` / `run()` options and on `wouldAdmit()` options. When
+  provided with `tokenBudget` configured, admission reserves
+  `input + maxOutput` from the override verbatim and skips the estimator
+  for that call. Intended for gateways that already compute a more accurate
+  estimate from the full provider request than any character-ratio
+  estimator could. Validated as non-negative integers; ignored when
+  `tokenBudget` is not configured; not reflected by `estimate()`, which
+  always previews the estimator path.
+
+### Notes
+
+* All changes are additive and backward compatible: requests without the
+  new fields, and estimators without the new option, behave exactly as in
+  3.6.0. Requests that do carry `system` / `extraInputTokens` produce
+  different default deduplication keys than hand-rolled 3.6.0 projections
+  of the same prompt — as intended, since those fields now distinguish
+  requests.
 
 ### Added
 

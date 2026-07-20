@@ -13,7 +13,9 @@ Designed for services that need to enforce **cost ceilings, concurrency limits, 
 - ✅ **Token refund** — reclaim unused budget capacity from actual usage post-completion
 - ✅ **Model-aware estimation** — per-model character ratios for known providers
 - ✅ **Per-request model** — mixed-model routing through a single bulkhead
-- ✅ **Multimodal content** — text blocks counted, non-text blocks ignored
+- ✅ **Multimodal content** — text blocks counted; opaque blocks ignored by default or charged a configurable per-block reservation (`opaqueBlockTokens`)
+- ✅ **Full-request estimation** — `system` prompts counted natively; `extraInputTokens` carries caller-computed costs (tool schemas, provider-priced media)
+- ✅ **Per-call reservation override** — gateways with their own estimate can bypass the estimator via `reservation` on `acquire()`/`run()`/`wouldAdmit()`
 - ✅ **Fail-fast by default** — shed load early, never silently queue
 - ✅ **Opinionated profiles** — `'interactive'` and `'batch'` presets with escape hatch
 - ✅ **In-flight deduplication** — identical requests share one LLM call; hashed keys, whole-request equality

@@ -26,9 +26,12 @@ export type TextContentBlock = {
 /**
  * A non-text content block (image, tool_result, document, etc.).
  *
- * Built-in estimators ignore non-text blocks — token estimates for
- * multimodal requests should be treated as a lower bound.
- * Provide a custom estimator for accurate multimodal estimation.
+ * By default, built-in estimators ignore non-text blocks — token
+ * estimates for multimodal requests should then be treated as a lower
+ * bound. To charge a fixed reservation per opaque block instead, use
+ * `createModelAwareTokenEstimator`'s `opaqueBlockTokens` option, or
+ * carry a caller-computed total in `LLMRequest.extraInputTokens`, or
+ * provide a custom estimator.
  */
 export type OpaqueContentBlock = {
   type: string;
@@ -64,6 +67,31 @@ export type LLMRequest = {
   model?: string;
   messages: LLMMessage[];
   max_tokens?: number;
+
+  /**
+   * Optional system prompt (v3.7). Counted by the built-in estimators
+   * exactly like message content: a plain string, or an array of content
+   * blocks (text blocks counted by characters, non-text blocks subject
+   * to the model-aware estimator's `opaqueBlockTokens` surcharge).
+   *
+   * Before v3.7, callers had to fold the system prompt into a synthetic
+   * message for it to participate in estimation — which also distorted
+   * events, logs, and deduplication keys. Carry it here instead.
+   */
+  system?: string | ContentBlock[];
+
+  /**
+   * Additional input tokens the character-based estimators cannot see
+   * (v3.7) — e.g. provider-side cost of tool schemas kept outside
+   * `messages`, or media priced by out-of-band rules. Built-in
+   * estimators add this verbatim to their input estimate; custom
+   * estimators may honor or ignore it.
+   *
+   * Must be a non-negative integer when present. Participates in the
+   * default deduplication key like any other request field, so requests
+   * differing only here are never conflated.
+   */
+  extraInputTokens?: number;
 };
 
 // ────────────────────────────────────────────
@@ -161,6 +189,23 @@ export type LLMRejectDetail = {
 /** Options accepted by `acquire()` / `run()` (base options + priority). */
 export type LLMAcquireOptions = AcquireOptions & {
   priority?: LLMPriority;
+
+  /**
+   * Per-call token reservation override (v3.7).
+   *
+   * When provided and `tokenBudget` is configured, admission reserves
+   * `input + maxOutput` from this value verbatim and the bulkhead's
+   * estimator is not consulted for this call. Intended for callers —
+   * typically gateways — that already compute a more accurate estimate
+   * from the full provider request (tool schemas, response formats,
+   * provider-priced media) than any character-ratio estimator could.
+   *
+   * Both fields must be non-negative integers. Ignored when
+   * `tokenBudget` is not configured (no reservation participates in
+   * admission in that mode). Not reflected by `estimate()`, which
+   * always previews the estimator path.
+   */
+  reservation?: TokenEstimate;
 };
 
 export class LLMBulkheadRejectedError extends Error {
@@ -645,15 +690,42 @@ export function extractTextLength(
   if (typeof content === "string") return content.length;
   let len = 0;
   for (const block of content) {
-    if (
-      block.type === "text" &&
-      "text" in block &&
-      typeof (block as TextContentBlock).text === "string"
-    ) {
-      len += (block as TextContentBlock).text.length;
-    }
+    if (isTextBlock(block)) len += block.text.length;
   }
   return len;
+}
+
+/** A block counts as text iff `type === "text"` with a string `text`. */
+function isTextBlock(block: ContentBlock): block is TextContentBlock {
+  return (
+    block.type === "text" &&
+    "text" in block &&
+    typeof (block as TextContentBlock).text === "string"
+  );
+}
+
+/**
+ * Total characters across `messages[].content` and `system`.
+ * The single character-count surface shared by both built-in estimators.
+ */
+function requestInputChars(request: LLMRequest): number {
+  let chars = request.messages.reduce(
+    (sum, m) => sum + extractTextLength(m.content),
+    0,
+  );
+  if (request.system !== undefined) {
+    chars += extractTextLength(request.system);
+  }
+  return chars;
+}
+
+/** Validated `request.extraInputTokens`, defaulting to 0. */
+function resolveExtraInputTokens(request: LLMRequest): number {
+  assertOptionalNonNegativeInteger(
+    request.extraInputTokens,
+    "request.extraInputTokens",
+  );
+  return request.extraInputTokens ?? 0;
 }
 
 function resolveMaxOutput(request: LLMRequest, fallback: number): number {
@@ -670,14 +742,18 @@ function resolveMaxOutput(request: LLMRequest, fallback: number): number {
  *
  * Accuracy: ±25% for English prose.
  * Suitable for load-shedding; not suitable for cost accounting.
+ *
+ * v3.7: counts `request.system` alongside message content and adds
+ * `request.extraInputTokens` verbatim. Non-text blocks still contribute
+ * zero characters (use the model-aware estimator's `opaqueBlockTokens`
+ * for per-block surcharges).
  */
 export function naiveTokenEstimator(request: LLMRequest): TokenEstimate {
-  const inputChars = request.messages.reduce(
-    (sum, m) => sum + extractTextLength(m.content),
-    0,
-  );
+  const inputChars = requestInputChars(request);
   return {
-    input: Math.ceil(inputChars / NAIVE_CHAR_RATIO),
+    input:
+      Math.ceil(inputChars / NAIVE_CHAR_RATIO) +
+      resolveExtraInputTokens(request),
     maxOutput: resolveMaxOutput(request, DEFAULT_OUTPUT_CAP),
   };
 }
@@ -717,6 +793,72 @@ const BUILT_IN_RATIOS: ReadonlyArray<readonly [string, number]> = [
   ["gemini-1.5", 3.8],
 ];
 
+/**
+ * Surcharge policy for opaque (non-text) content blocks (v3.7).
+ *
+ * - `number` — every opaque block reserves this many input tokens.
+ * - `{ default?, byType? }` — per-`block.type` surcharges with an
+ *   optional fallback for types not listed; unlisted types with no
+ *   `default` contribute 0.
+ *
+ * All values must be non-negative integers. A block is "opaque" unless
+ * it is a well-formed text block (`type: "text"` with a string `text`)
+ * — malformed text blocks are treated as opaque, which errs toward
+ * over-reservation. Applies to blocks in `messages[].content` and
+ * `system` arrays.
+ */
+export type OpaqueBlockTokens =
+  | number
+  | {
+      /** Fallback surcharge for opaque types without a `byType` entry. */
+      default?: number;
+      /** Per-block-type surcharges, keyed by `block.type`. */
+      byType?: Record<string, number>;
+    };
+
+function validateOpaqueBlockTokens(
+  opt: OpaqueBlockTokens | undefined,
+): void {
+  if (opt === undefined) return;
+  if (typeof opt === "number") {
+    assertNonNegativeInteger(opt, "opaqueBlockTokens");
+    return;
+  }
+  assertOptionalNonNegativeInteger(opt.default, "opaqueBlockTokens.default");
+  if (opt.byType) {
+    for (const [type, tokens] of Object.entries(opt.byType)) {
+      assertNonNegativeInteger(
+        tokens,
+        `opaqueBlockTokens.byType[${JSON.stringify(type)}]`,
+      );
+    }
+  }
+}
+
+function opaqueBlockCost(opt: OpaqueBlockTokens, type: string): number {
+  if (typeof opt === "number") return opt;
+  return opt.byType?.[type] ?? opt.default ?? 0;
+}
+
+/** Sum of surcharges for every opaque block in messages + system. */
+function countOpaqueBlockTokens(
+  request: LLMRequest,
+  opt: OpaqueBlockTokens | undefined,
+): number {
+  if (opt === undefined) return 0;
+  let total = 0;
+  const scan = (content: string | ContentBlock[]): void => {
+    if (typeof content === "string") return;
+    for (const block of content) {
+      if (isTextBlock(block)) continue;
+      total += opaqueBlockCost(opt, block.type);
+    }
+  };
+  for (const m of request.messages) scan(m.content);
+  if (request.system !== undefined) scan(request.system);
+  return total;
+}
+
 export type ModelAwareEstimatorOptions = {
   /**
    * Model string used for ratio lookup when the request does not
@@ -736,6 +878,18 @@ export type ModelAwareEstimatorOptions = {
    * The estimator falls back to the naive 4.0 ratio when this fires.
    */
   onUnknownModel?: ((model: string) => void) | undefined;
+
+  /**
+   * Input-token surcharge for opaque (non-text) content blocks (v3.7).
+   *
+   * Without this, opaque blocks contribute 0 input tokens — an
+   * image-heavy request estimates as nearly free, which is the wrong
+   * direction for admission control. A flat conservative number (e.g.
+   * 2048 per block) or a per-type map converts each opaque block into a
+   * fixed reservation. Validated at estimator creation. Omitted:
+   * surcharge disabled (previous behavior).
+   */
+  opaqueBlockTokens?: OpaqueBlockTokens | undefined;
 };
 
 function isModelAwareEstimatorOptions(
@@ -748,7 +902,8 @@ function isModelAwareEstimatorOptions(
   return (
     "defaultModel" in value ||
     "outputCap" in value ||
-    "onUnknownModel" in value
+    "onUnknownModel" in value ||
+    "opaqueBlockTokens" in value
   );
 }
 
@@ -760,6 +915,9 @@ function isModelAwareEstimatorOptions(
  *
  * v2: respects `request.model` when present, falling back to `defaultModel`.
  * v2: handles multimodal content (text blocks counted, others ignored).
+ * v3.7: counts `request.system`, adds `request.extraInputTokens`
+ * verbatim, and applies the `opaqueBlockTokens` surcharge (when
+ * configured) to every non-text block in messages and system.
  */
 export function createModelAwareTokenEstimator(
   opts?: ModelAwareEstimatorOptions,
@@ -784,6 +942,8 @@ export function createModelAwareTokenEstimator(
     : (maybeOpts ?? {});
   const outputCap = opts.outputCap ?? DEFAULT_OUTPUT_CAP;
   assertNonNegativeInteger(outputCap, "outputCap");
+  const opaqueBlockTokens = opts.opaqueBlockTokens;
+  validateOpaqueBlockTokens(opaqueBlockTokens);
 
   function lookupRatio(model: string): number {
     // Exact overrides checked first (case-sensitive, then lowercased).
@@ -812,12 +972,12 @@ export function createModelAwareTokenEstimator(
   return (request: LLMRequest): TokenEstimate => {
     const model = request.model ?? opts.defaultModel ?? "";
     const ratio = lookupRatio(model);
-    const inputChars = request.messages.reduce(
-      (sum, m) => sum + extractTextLength(m.content),
-      0,
-    );
+    const inputChars = requestInputChars(request);
     return {
-      input: Math.ceil(inputChars / ratio),
+      input:
+        Math.ceil(inputChars / ratio) +
+        countOpaqueBlockTokens(request, opaqueBlockTokens) +
+        resolveExtraInputTokens(request),
       maxOutput: resolveMaxOutput(request, outputCap),
     };
   };
@@ -1073,8 +1233,30 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
   type ReservationParts = LLMReservationEstimate;
 
   function estimateParts(request: LLMRequest): ReservationParts | null {
+    return resolveReservation(request, undefined);
+  }
+
+  /**
+   * Reservation used for admission: the caller's per-call `reservation`
+   * override verbatim when provided, otherwise the estimator's output.
+   * Both paths validate as non-negative integers. `null` when
+   * `tokenBudget` is disabled (no reservation participates then, and
+   * the override is deliberately ignored).
+   */
+  function resolveReservation(
+    request: LLMRequest,
+    override: TokenEstimate | undefined,
+  ): ReservationParts | null {
     assertOptionalNonNegativeInteger(request.max_tokens, "request.max_tokens");
     if (!budget) return null;
+    if (override !== undefined) {
+      const reserved = validateTokenEstimate(override);
+      return {
+        input: override.input,
+        maxOutput: override.maxOutput,
+        reserved,
+      };
+    }
     const estimate = estimator(request);
     const reserved = validateTokenEstimate(estimate);
     return {
@@ -1095,6 +1277,10 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
    * Custom estimators should be deterministic: if either the request or
    * estimator output changes between `estimate()` and admission, the later
    * admission will correctly use the newly calculated value.
+   *
+   * A per-call `reservation` override passed to `acquire()` / `run()` /
+   * `wouldAdmit()` bypasses the estimator and is NOT reflected here —
+   * `estimate()` always previews the estimator path.
    */
   function estimate(request: LLMRequest): LLMReservationEstimate | null {
     const parts = estimateParts(request);
@@ -1513,7 +1699,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     ao: LLMAcquireOptions,
   ): Promise<LLMAcquireResult> {
     const priority = resolvePriority(ao.priority);
-    const parts = estimateParts(request);
+    const parts = resolveReservation(request, ao.reservation);
     const reserved = parts?.reserved ?? 0;
 
     const rejectWith = (reason: LLMRejectReason): LLMAcquireResult => {
@@ -1577,15 +1763,19 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
    * model pool). It does NOT reserve anything — the answer can change
    * before a subsequent `acquire()`/`run()` lands. Never treat `true`
    * as a guarantee.
+   *
+   * Accepts the same per-call `reservation` override as `acquire()` /
+   * `run()` (v3.7); pass the identical value to both for a consistent
+   * preview.
    */
   function wouldAdmit(
     request: LLMRequest,
-    opts: { priority?: LLMPriority } = {},
+    opts: { priority?: LLMPriority; reservation?: TokenEstimate } = {},
   ): { admit: boolean; reason?: LLMRejectReason } {
     const priority = resolvePriority(opts.priority);
     const base = bulkhead.stats();
     if (base.closed) return { admit: false, reason: "shutdown" };
-    const parts = estimateParts(request);
+    const parts = resolveReservation(request, opts.reservation);
     const reserved = parts?.reserved ?? 0;
     if (budget && inFlightTokens + reserved > effectiveBudget(priority)) {
       return { admit: false, reason: "budget_limit" };
