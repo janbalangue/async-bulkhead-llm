@@ -7,6 +7,90 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.8.0] - 2026-07-21
+
+### Added
+
+* **Bounded drain: `drain({ timeoutMs })`.** The no-argument form keeps its
+  `Promise<void>` contract unchanged. With a deadline, the promise always
+  *resolves* (never rejects) with an `LLMDrainResult` —
+  `{ drained: true, inFlight: 0, pending: 0 }` when everything completed in
+  time, or `{ drained: false, inFlight, pending }` with the outstanding
+  counts at the moment the deadline elapsed. The deadline never cancels or
+  interrupts in-flight work and leaves accounting untouched: work that
+  finishes later still releases normally. Intended for shutdown paths that
+  must log what they are abandoning and proceed, rather than parking
+  forever behind one stuck upstream stream. `timeoutMs` must be a
+  non-negative integer; `0` is an immediate "is it drained right now?"
+  snapshot.
+
+* **`wouldAdmit(request, { detail: true })`.** Opt in to receive the same
+  `LLMRejectDetail` capacity snapshot that real rejections carry — on
+  every outcome, including `admit: true`, where it describes the capacity
+  the request would be admitted against (`requested` is the reservation
+  this request needs). Routing layers choosing between pools want the
+  numbers, not just the boolean. Omitted by default, so the result shape
+  and cost are unchanged for existing callers (results still deep-equal
+  `{ admit: true }` etc.).
+
+* **`estimate()` results round-trip as the `reservation` override.** The
+  per-call override now accepts `LLMReservationOverride`
+  (`TokenEstimate & { reserved?: number }`), so the frozen object returned
+  by `bulkhead.estimate()` can be passed back verbatim — no need to strip
+  `reserved` first. When `reserved` is present it is validated as a
+  consistency check: it must equal `input + maxOutput`, otherwise
+  admission throws. This catches hand-built overrides whose cached
+  `reserved` drifted from edited parts. Plain `{ input, maxOutput }`
+  overrides (the 3.7 shape) are unchanged.
+
+* **`createAdaptiveTokenEstimator()` — self-calibrating estimation.** A
+  wrapper around `createModelAwareTokenEstimator` that closes the feedback
+  loop between estimates and reality. Feed it actual usage from completed
+  calls via `observe(request, usage)` (typically wired to the bulkhead's
+  `release` event); it maintains a per-model EWMA of
+  `actual input / estimated input` and multiplies future *input*
+  estimates by that factor — clamped to
+  `[minCorrection, maxCorrection]` (default `[0.5, 2]`) and applied only
+  after `minSamples` observations (default 5). Output reservations are
+  never corrected: `max_tokens` / `outputCap` is a ceiling, not an
+  estimate. Observations always measure against the *uncorrected* base
+  estimate, so the loop does not compound through its own corrections.
+  Tracked models are bounded (`maxModels`, default 64, oldest-inserted
+  evicted); `corrections()` exposes the calibration state for stats
+  endpoints and `reset(model?)` clears it. Calibration is in-memory and
+  per-instance — share one instance per bulkhead.
+
+### Changed
+
+* **`wouldAdmit()` validates before the shutdown check.** The request (and
+  any `reservation` override) is now validated *before* the closed fast
+  path, matching `acquire()`'s ordering — an invalid request (e.g. a
+  negative `max_tokens`) now throws even when the bulkhead is closed,
+  instead of returning `{ admit: false, reason: "shutdown" }`. Valid
+  requests against a closed bulkhead behave exactly as before.
+
+### Internal
+
+* **Source split into focused modules.** The former single-file
+  `src/index.ts` (~2,400 lines) is now a barrel over `types.ts`,
+  `errors.ts`, `profiles.ts`, `validation.ts`, `estimators.ts`,
+  `adaptive.ts`, `dedup.ts`, and `bulkhead.ts`. No public API change:
+  the package entry point re-exports the identical surface (verified
+  against the pre-split build), and the `exports` map still exposes
+  only the entry point — deep imports of the internal modules remain
+  unsupported. `dist/` now contains one file per module for ESM, CJS
+  (`.cjs`, with local requires rewritten), and declarations.
+
+### Notes
+
+* All changes are additive and backward compatible for valid inputs:
+  `drain()` without arguments, `wouldAdmit()` without `detail`, and
+  `{ input, maxOutput }` reservation overrides behave exactly as in
+  3.7.0. The only observable difference is the validation-ordering change
+  above, which affects invalid requests on closed bulkheads only.
+
+---
+
 ## [3.7.0] - 2026-07-20
 
 ### Added

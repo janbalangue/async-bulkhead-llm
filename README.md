@@ -21,11 +21,13 @@ Designed for services that need to enforce **cost ceilings, concurrency limits, 
 - ✅ **In-flight deduplication** — identical requests share one LLM call; hashed keys, whole-request equality
 - ✅ **Custom dedup key + per-tenant scope** — bring your own equivalence function; `dedupScope` isolates tenants
 - ✅ **Streaming-safe deduplication** — single-consumer results are never silently shared; `shareResult` fan-out hook + per-call `dedup: false` opt-out
-- ✅ **Exact reservation preview** — `estimate()` exposes the reservation admission will use
+- ✅ **Exact reservation preview** — `estimate()` exposes the reservation admission will use, and its result can be passed back verbatim as the per-call `reservation`
+- ✅ **Adaptive estimation** — `createAdaptiveTokenEstimator()` self-calibrates per-model input estimates from observed usage
+- ✅ **Advisory capacity snapshots** — `wouldAdmit(request, { detail: true })` returns the same capacity numbers rejections carry
 - ✅ **Stable admission IDs** — correlate gateway requests, traces, usage, and release
 - ✅ **Ordered usage events** — sequence-numbered hold changes for external coordinators
 - ✅ **Event hooks** — `on('admit' | 'reject' | 'usage' | 'release' | 'dedup', fn)`
-- ✅ **Graceful shutdown** — `close()` + `drain()`
+- ✅ **Graceful shutdown** — `close()` + `drain()`, with an optional bounded wait: `drain({ timeoutMs })`
 - ✅ Optional **AbortSignal** and **timeout** cancellation
 - ✅ `bulkhead.run(request, fn)` — acquire + release handled automatically
 - ✅ Zero dependencies beyond `async-bulkhead-ts`
@@ -125,6 +127,103 @@ const result = await bulkhead.run(request, async () => {
   return callYourLLMProvider(request);
 });
 ```
+
+---
+
+## What's New in v3.8 — Feedback and shutdown ergonomics
+
+### Bounded drain
+
+`drain()` without arguments is unchanged (`Promise<void>`). With a deadline,
+it always *resolves* — never rejects — with what happened:
+
+```ts
+bulkhead.close();
+const result = await bulkhead.drain({ timeoutMs: 10_000 });
+if (!result.drained) {
+  log.warn("abandoning shutdown wait", {
+    inFlight: result.inFlight,
+    pending: result.pending,
+  });
+}
+```
+
+The deadline never cancels or interrupts in-flight work and leaves the
+bulkhead's accounting untouched — work that finishes later still releases
+normally. It exists so a shutdown path can log what it is abandoning and
+proceed, instead of parking forever behind one stuck upstream stream.
+`timeoutMs: 0` is an immediate "is it drained right now?" snapshot.
+
+### Capacity detail from `wouldAdmit()`
+
+Routing layers choosing between pools want the numbers, not just the boolean:
+
+```ts
+const { admit, reason, detail } = bulkhead.wouldAdmit(request, {
+  detail: true,
+});
+// detail is the same LLMRejectDetail snapshot real rejections carry,
+// present on admit: true as well (detail.tokenBudget.requested is the
+// reservation this request needs).
+```
+
+Omitted by default, so existing callers see the exact v3.7 result shape.
+
+### `estimate()` round-trips as the reservation override
+
+The frozen object returned by `estimate()` can now be passed straight back:
+
+```ts
+const preview = bulkhead.estimate(request);
+await bulkhead.run(request, fn, {
+  ...(preview !== null ? { reservation: preview } : {}),
+});
+```
+
+When the override carries a `reserved` field it is validated as a
+consistency check (`reserved === input + maxOutput`), catching hand-built
+overrides whose cached total drifted from edited parts. Plain
+`{ input, maxOutput }` overrides are unchanged.
+
+### Adaptive estimation
+
+Character-ratio estimation is ±15% at best and drifts with content mix and
+tokenizer changes. `createAdaptiveTokenEstimator()` closes the loop:
+
+```ts
+import {
+  createAdaptiveTokenEstimator,
+  createLLMBulkhead,
+} from "async-bulkhead-llm";
+
+const adaptive = createAdaptiveTokenEstimator({
+  defaultModel: "claude-sonnet-4-5",
+  opaqueBlockTokens: 2_048,
+  // smoothing: 0.2, minSamples: 5,
+  // minCorrection: 0.5, maxCorrection: 2, maxModels: 64,
+});
+
+const bulkhead = createLLMBulkhead({
+  model: "claude-sonnet-4-5",
+  maxConcurrent: 8,
+  tokenBudget: { budget: 200_000, estimator: adaptive.estimator },
+});
+
+// Close the loop from actual usage:
+bulkhead.on("release", (e) => {
+  if (e.usage) adaptive.observe(e.request, e.usage);
+});
+
+adaptive.corrections(); // per-model { samples, factor, applied } for /stats
+```
+
+It maintains a per-model EWMA of `actual input / estimated input` and
+multiplies future *input* estimates by that factor — clamped, and only
+after `minSamples` observations. Output reservations are never corrected
+(`max_tokens` is a ceiling, not an estimate). Observations always measure
+against the *uncorrected* base estimate, so the loop cannot compound
+through its own corrections. Calibration is in-memory, per-instance, and
+bounded to `maxModels` tracked models.
 
 ---
 
@@ -480,6 +579,7 @@ const bulkhead = createLLMBulkhead({
 import {
   naiveTokenEstimator,
   createModelAwareTokenEstimator,
+  createAdaptiveTokenEstimator,
   extractTextLength,
 } from 'async-bulkhead-llm';
 
@@ -498,6 +598,13 @@ const estimate = createModelAwareTokenEstimator(
 
 // Utility for multimodal content
 const charCount = extractTextLength(message.content);
+
+// Self-calibrating wrapper (v3.8) — see "What's New in v3.8"
+const adaptive = createAdaptiveTokenEstimator({ defaultModel: 'gpt-4o' });
+adaptive.estimator;                    // pass as tokenBudget.estimator
+adaptive.observe(request, usage);      // feed actual usage (release event)
+adaptive.corrections();                // per-model calibration snapshot
+adaptive.reset();                      // clear calibration
 ```
 
 ### Runtime Budget Adjustment
@@ -893,7 +1000,22 @@ See [Runtime Budget Adjustment](#runtime-budget-adjustment) for full semantics.
 ### `bulkhead.close()`
 
 
-### `bulkhead.drain()`
+### `bulkhead.drain(opts?)`
+
+```ts
+drain(): Promise<void>;
+drain(opts: { timeoutMs: number }): Promise<LLMDrainResult>;
+
+type LLMDrainResult = {
+  drained: boolean;   // true: everything completed within the deadline
+  inFlight: number;   // outstanding at the deadline (0 when drained)
+  pending: number;    // queued waiters at the deadline (0 when drained)
+};
+```
+
+Resolves when all in-flight work and pending waiters have completed. With
+`timeoutMs`, always resolves (never rejects) by the deadline with an
+`LLMDrainResult`; the deadline does not cancel in-flight work.
 
 ### `bulkhead.on(event, listener)`
 
@@ -976,6 +1098,26 @@ s.llm.rejectedByReason?.budget_limit;
 ### v1 → v2
 
 See [CHANGELOG](./CHANGELOG.md) for the v2 migration guide.
+
+---
+
+## Source Layout
+
+The implementation is split into focused modules under `src/`; the package
+entry point (`src/index.ts`) is a barrel that re-exports the public API.
+Deep-importing the internal modules is not supported — the package
+`exports` map exposes only the entry point.
+
+| Module | Contents |
+|---|---|
+| `types.ts` | Public request, result, options, stats, and event types (declarations only) |
+| `errors.ts` | `LLMBulkheadRejectedError` |
+| `profiles.ts` | `PROFILES` presets + `LLMBulkheadPreset` |
+| `estimators.ts` | `naiveTokenEstimator`, `createModelAwareTokenEstimator`, `opaqueBlockTokens` handling, `extractTextLength`, built-in ratio table |
+| `adaptive.ts` | `createAdaptiveTokenEstimator` (v3.8 self-calibration) |
+| `dedup.ts` | Deduplication internals: default whole-request key, scope-aware hashing, single-consumer result detection |
+| `validation.ts` | Internal numeric/estimate/usage guards (not re-exported) |
+| `bulkhead.ts` | `createLLMBulkhead`: admission, token budget + refund accounting, streaming usage reports, events, stats, shutdown |
 
 ---
 
