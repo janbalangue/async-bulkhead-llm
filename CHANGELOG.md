@@ -7,6 +7,35 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.9.0] - 2026-07-22
+
+### Added
+
+* **First-class observe mode for `run()`.** Pass `{ mode: "observe" }` to
+  execute work without holding concurrency or token capacity when admission
+  would reject for `budget_limit`, `concurrency_limit`, `queue_limit`, or
+  `timeout`. The default remains `{ mode: "enforce" }`. `shadowReasons` can
+  narrow the bypassable capacity reasons; shutdown, caller cancellation, and
+  unsafe deduplication fan-out remain hard failures and cannot be shadowed.
+
+* **Admitted-versus-bypassed run context.** `LLMRunContext.admission` is
+  `"admitted"` or `"bypassed"`. Bypassed executions receive a stable
+  `shadow-...` identifier, the exact evaluated reservation, and optional
+  `bypassReason` / `bypassDetail`. `reportUsage()` remains available and
+  returns normal `UsageReport` snapshots without altering capacity accounting.
+
+* **Observe telemetry.** `stats().observe` reports bypass counts, race
+  bypasses, reasons, and final usage totals. New `bypass`, `bypassUsage`, and
+  `bypassRelease` events expose the same lifecycle without misrepresenting
+  bypassed work as admitted or released capacity.
+
+### Changed
+
+* Observe mode performs an exact advisory check before authoritative admission.
+  Obvious capacity rejections bypass immediately; a later queue timeout or
+  post-slot budget race is also bypassed and counted as `raceBypassed`. The
+  same resolved reservation is reused across both checks.
+
 ## [3.8.0] - 2026-07-21
 
 ### Added

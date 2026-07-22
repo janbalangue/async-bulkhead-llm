@@ -13,6 +13,7 @@ import type {
   Listener,
   LLMAcquireOptions,
   LLMAcquireResult,
+  LLMAdmissionMode,
   LLMBulkheadOptions,
   LLMDrainResult,
   LLMEventMap,
@@ -24,6 +25,8 @@ import type {
   LLMReservationEstimate,
   LLMReservationOverride,
   LLMRunContext,
+  LLMRunOptions,
+  LLMShadowableRejectReason,
   LLMStats,
   LLMToken,
   LLMWouldAdmitResult,
@@ -43,6 +46,17 @@ import {
 import { hashDedupKey, isUnsafeToShare, resolveDedup } from "./dedup.js";
 
 type BulkheadSignal = NonNullable<AcquireOptions["signal"]>;
+
+const DEFAULT_SHADOW_REASONS: readonly LLMShadowableRejectReason[] = [
+  "budget_limit",
+  "concurrency_limit",
+  "queue_limit",
+  "timeout",
+];
+
+const SHADOWABLE_REASONS = new Set<LLMShadowableRejectReason>(
+  DEFAULT_SHADOW_REASONS,
+);
 
 // ────────────────────────────────────────────
 // Option resolution
@@ -131,10 +145,19 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
   let llmReleased = 0;
   let llmRejected = 0;
   const llmRejectedByReason: Partial<Record<LLMRejectReason, number>> = {};
+  let observeBypassed = 0;
+  let observeRaceBypassed = 0;
+  const observeBypassedByReason: Partial<
+    Record<LLMShadowableRejectReason, number>
+  > = {};
+  let observeUsageReported = 0;
+  let observeTotalInputTokens = 0;
+  let observeTotalOutputTokens = 0;
 
   // ---- Deduplication state ----
   const dedup = resolveDedup(opts.deduplication);
   const dedupMap = new Map<string, Promise<unknown>>();
+  const dedupWaitErrors = new WeakSet<LLMBulkheadRejectedError>();
   let dedupHits = 0;
 
   // ---- Event emitter state ----
@@ -143,6 +166,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     reject: new Set(),
     release: new Set(),
     usage: new Set(),
+    bypass: new Set(),
+    bypassUsage: new Set(),
+    bypassRelease: new Set(),
     dedup: new Set(),
   };
 
@@ -261,6 +287,48 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     return priority;
   }
 
+  function resolveAdmissionMode(
+    mode: LLMAdmissionMode | undefined,
+  ): LLMAdmissionMode {
+    if (mode === undefined) return "enforce";
+    if (mode !== "enforce" && mode !== "observe") {
+      throw new Error(`mode must be "enforce" or "observe"`);
+    }
+    return mode;
+  }
+
+  function resolveShadowReasons(
+    reasons: readonly LLMShadowableRejectReason[] | undefined,
+  ): ReadonlySet<LLMShadowableRejectReason> {
+    if (reasons === undefined) return SHADOWABLE_REASONS;
+    const resolved = new Set<LLMShadowableRejectReason>();
+    for (const reason of reasons) {
+      if (!SHADOWABLE_REASONS.has(reason)) {
+        throw new Error(
+          `shadowReasons may contain only budget_limit, concurrency_limit, ` +
+            `queue_limit, or timeout`,
+        );
+      }
+      resolved.add(reason);
+    }
+    return resolved;
+  }
+
+  type ResolvedAdmission = {
+    priority: LLMPriority;
+    parts: ReservationParts | null;
+    reserved: number;
+  };
+
+  function resolveAdmission(
+    request: LLMRequest,
+    ao: Pick<LLMAcquireOptions, "priority" | "reservation">,
+  ): ResolvedAdmission {
+    const priority = resolvePriority(ao.priority);
+    const parts = resolveReservation(request, ao.reservation);
+    return { priority, parts, reserved: parts?.reserved ?? 0 };
+  }
+
   /**
    * Budget ceiling applicable to a request at the given priority.
    *
@@ -346,6 +414,38 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     return detail;
   }
 
+  function wouldAdmitResolved(
+    admission: ResolvedAdmission,
+    includeDetail: boolean,
+  ): LLMWouldAdmitResult {
+    const { priority, reserved } = admission;
+    const withDetail = (
+      result: LLMWouldAdmitResult,
+    ): LLMWouldAdmitResult => {
+      if (includeDetail) {
+        result.detail = buildRejectDetail(reserved, priority);
+      }
+      return result;
+    };
+    const base = bulkhead.stats();
+    if (base.closed) {
+      return withDetail({ admit: false, reason: "shutdown" });
+    }
+    if (budget && inFlightTokens + reserved > effectiveBudget(priority)) {
+      return withDetail({ admit: false, reason: "budget_limit" });
+    }
+    if (base.inFlight < base.maxConcurrent) {
+      return withDetail({ admit: true });
+    }
+    if (base.pending < base.maxQueue) {
+      return withDetail({ admit: true });
+    }
+    return withDetail({
+      admit: false,
+      reason: base.maxQueue > 0 ? "queue_limit" : "concurrency_limit",
+    });
+  }
+
   /**
    * Update the token budget ceiling at runtime.
    *
@@ -397,7 +497,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
   ): LLMBulkheadRejectedError {
     noteLLMReject(reason);
     emit("reject", { request, reason });
-    return new LLMBulkheadRejectedError(reason);
+    const error = new LLMBulkheadRejectedError(reason);
+    dedupWaitErrors.add(error);
+    return error;
   }
 
   /**
@@ -663,10 +765,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
   async function _acquire(
     request: LLMRequest,
     ao: LLMAcquireOptions,
+    resolved: ResolvedAdmission = resolveAdmission(request, ao),
   ): Promise<LLMAcquireResult> {
-    const priority = resolvePriority(ao.priority);
-    const parts = resolveReservation(request, ao.reservation);
-    const reserved = parts?.reserved ?? 0;
+    const { priority, parts, reserved } = resolved;
 
     const rejectWith = (reason: LLMRejectReason): LLMAcquireResult => {
       const detail = buildRejectDetail(reserved, priority);
@@ -754,34 +855,165 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       detail?: boolean;
     } = {},
   ): LLMWouldAdmitResult {
-    const priority = resolvePriority(opts.priority);
-    const parts = resolveReservation(request, opts.reservation);
-    const reserved = parts?.reserved ?? 0;
-    const withDetail = (
-      result: LLMWouldAdmitResult,
-    ): LLMWouldAdmitResult => {
-      if (opts.detail === true) {
-        result.detail = buildRejectDetail(reserved, priority);
-      }
-      return result;
-    };
-    const base = bulkhead.stats();
-    if (base.closed) {
-      return withDetail({ admit: false, reason: "shutdown" });
+    return wouldAdmitResolved(resolveAdmission(request, opts), opts.detail === true);
+  }
+
+  function shouldBypass(
+    reason: LLMRejectReason,
+    configured: ReadonlySet<LLMShadowableRejectReason>,
+  ): reason is LLMShadowableRejectReason {
+    return (
+      SHADOWABLE_REASONS.has(reason as LLMShadowableRejectReason) &&
+      configured.has(reason as LLMShadowableRejectReason)
+    );
+  }
+
+  async function runBypassed<T>(
+    request: LLMRequest,
+    fn: (signal?: BulkheadSignal, ctx?: LLMRunContext) => Promise<T>,
+    opts: Pick<LLMRunOptions<T>, "signal" | "getUsage">,
+    admission: ResolvedAdmission,
+    reason: LLMShadowableRejectReason,
+    detail: LLMRejectDetail | undefined,
+    raced: boolean,
+  ): Promise<T> {
+    const hardReason: Extract<LLMRejectReason, "aborted" | "shutdown"> | undefined =
+      opts.signal?.aborted
+        ? "aborted"
+        : bulkhead.stats().closed
+          ? "shutdown"
+          : undefined;
+    if (hardReason !== undefined) {
+      const hardDetail = buildRejectDetail(
+        admission.reserved,
+        admission.priority,
+      );
+      noteLLMReject(hardReason);
+      emit("reject", { request, reason: hardReason, detail: hardDetail });
+      throw new LLMBulkheadRejectedError(hardReason, hardDetail);
     }
-    if (budget && inFlightTokens + reserved > effectiveBudget(priority)) {
-      return withDetail({ admit: false, reason: "budget_limit" });
-    }
-    if (base.inFlight < base.maxConcurrent) {
-      return withDetail({ admit: true });
-    }
-    if (base.pending < base.maxQueue) {
-      return withDetail({ admit: true });
-    }
-    return withDetail({
-      admit: false,
-      reason: base.maxQueue > 0 ? "queue_limit" : "concurrency_limit",
+
+    const admissionId = `shadow-${randomUUID()}`;
+    const reservation =
+      admission.parts === null
+        ? null
+        : Object.freeze({ ...admission.parts });
+    let reported: TokenUsage | undefined;
+    let usageSequence = 0;
+    let settled = false;
+
+    observeBypassed++;
+    if (raced) observeRaceBypassed++;
+    observeBypassedByReason[reason] =
+      (observeBypassedByReason[reason] ?? 0) + 1;
+
+    emit("bypass", {
+      request,
+      admissionId,
+      priority: admission.priority,
+      reason,
+      ...(detail !== undefined && { detail }),
+      reservation,
+      raced,
     });
+
+    const snapshot = (): UsageReport => {
+      const consumed = reported ? reported.input + reported.output : 0;
+      const outputCap = admission.parts?.maxOutput ?? null;
+      return {
+        admissionId,
+        sequence: usageSequence,
+        reserved: admission.reserved,
+        held: 0,
+        consumed,
+        outputCap,
+        outputRemaining:
+          outputCap === null
+            ? null
+            : Math.max(0, outputCap - (reported?.output ?? 0)),
+        overReservation:
+          admission.parts !== null && consumed > admission.parts.reserved,
+      };
+    };
+
+    const reportUsage = (usage: TokenUsage): UsageReport => {
+      const valid = validateTokenUsage(usage);
+      const previous = reported;
+      reported = previous
+        ? {
+            input: Math.max(previous.input, valid.input),
+            output: Math.max(previous.output, valid.output),
+          }
+        : valid;
+      const changed =
+        previous === undefined ||
+        reported.input !== previous.input ||
+        reported.output !== previous.output;
+      if (!settled && changed) {
+        usageSequence++;
+        const current = snapshot();
+        emit("bypassUsage", {
+          request,
+          admissionId,
+          priority: admission.priority,
+          reason,
+          sequence: usageSequence,
+          reservation,
+          usage: { ...reported },
+          outputCap: current.outputCap,
+          outputRemaining: current.outputRemaining,
+          overReservation: current.overReservation,
+        });
+      }
+      return snapshot();
+    };
+
+    const context: LLMRunContext = {
+      admissionId,
+      reservation,
+      admission: "bypassed",
+      bypassReason: reason,
+      ...(detail !== undefined && { bypassDetail: detail }),
+      reportUsage,
+    };
+
+    const finish = (usage: TokenUsage | undefined): void => {
+      if (settled) return;
+      settled = true;
+      if (usage !== undefined) {
+        observeUsageReported++;
+        observeTotalInputTokens += usage.input;
+        observeTotalOutputTokens += usage.output;
+      }
+      emit("bypassRelease", {
+        request,
+        admissionId,
+        priority: admission.priority,
+        reason,
+        reservation,
+        usageSequence,
+        ...(usage !== undefined && { usage }),
+      });
+    };
+
+    try {
+      const result = await fn(opts.signal, context);
+      let finalUsage: TokenUsage | undefined;
+      if (opts.getUsage !== undefined) {
+        try {
+          const extracted = opts.getUsage(result);
+          finalUsage =
+            extracted === undefined ? undefined : validateTokenUsage(extracted);
+        } catch {
+          // A bad extractor must not turn observed work into a failure.
+        }
+      }
+      finish(finalUsage ?? reported);
+      return result;
+    } catch (error) {
+      finish(reported);
+      throw error;
+    }
   }
 
   /**
@@ -803,37 +1035,18 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
   async function run<T>(
     request: LLMRequest,
     fn: (signal?: BulkheadSignal, ctx?: LLMRunContext) => Promise<T>,
-    ao: LLMAcquireOptions & {
-      getUsage?: (result: T) => TokenUsage | undefined;
-      /**
-       * Deduplication scope. Requests deduplicate only within the same
-       * scope — calls with different scopes never share an in-flight
-       * call, even with identical keys. Use this to carry the tenant /
-       * API-key identity in multi-tenant gateways so responses are never
-       * shared across tenants. Ignored when deduplication is disabled.
-       * Default: `""` (single global scope).
-       */
-      dedupScope?: string;
-      /**
-       * Per-call deduplication opt-out (v3.5). Pass `false` to make
-       * this call always execute independently — it neither joins an
-       * existing in-flight call nor registers itself as joinable.
-       *
-       * Intended for streaming routes on a bulkhead where dedup is
-       * otherwise useful: shared stream results are single-consumer
-       * (see `deduplication.shareResult`), so streaming calls can skip
-       * dedup here instead of encoding the exemption in a bulkhead-wide
-       * `keyFn`.
-       *
-       * `true` is accepted but cannot enable deduplication when it is
-       * disabled at the bulkhead level (the key function and shared
-       * state live there); it is treated the same as omitting the
-       * option. Ignored by `acquire()`, which never deduplicates.
-       */
-      dedup?: boolean;
-    } = {},
+    ao: LLMRunOptions<T> = {},
   ): Promise<T> {
-    const { getUsage, dedupScope, dedup: perCallDedup, ...acquireOpts } = ao;
+    const {
+      getUsage,
+      mode: requestedMode,
+      shadowReasons: requestedShadowReasons,
+      dedupScope,
+      dedup: perCallDedup,
+      ...acquireOpts
+    } = ao;
+    const mode = resolveAdmissionMode(requestedMode);
+    const shadowReasons = resolveShadowReasons(requestedShadowReasons);
 
     // ---- Deduplication ----
     let dedupKey = "";
@@ -864,7 +1077,34 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       if (existing) {
         dedupHits++;
         emit("dedup", { request });
-        return waitForSharedDedup(existing as Promise<T>, request, acquireOpts);
+        try {
+          return await waitForSharedDedup(
+            existing as Promise<T>,
+            request,
+            acquireOpts,
+          );
+        } catch (error) {
+          if (
+            mode === "observe" &&
+            error instanceof LLMBulkheadRejectedError &&
+            dedupWaitErrors.has(error) &&
+            shouldBypass(error.reason, shadowReasons)
+          ) {
+            return runBypassed(
+              request,
+              fn,
+              {
+                ...(ao.signal !== undefined && { signal: ao.signal }),
+                ...(getUsage !== undefined && { getUsage }),
+              },
+              resolveAdmission(request, acquireOpts),
+              error.reason,
+              error.detail,
+              false,
+            );
+          }
+          throw error;
+        }
       }
       deferred = createDeferred<T>();
       resultPromise = deferred.promise;
@@ -881,15 +1121,71 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       void deferred.promise.then(cleanup, cleanup);
     }
 
+    const publish = (work: Promise<T>): Promise<T> => {
+      if (deferred) {
+        void work.then(
+          (value) => deferred!.resolve(value),
+          (error) => deferred!.reject(error),
+        );
+        return resultPromise!;
+      }
+      return work;
+    };
+
     try {
-      const r = await _acquire(request, acquireOpts);
+      let resolved: ResolvedAdmission | undefined;
+      let advisory: LLMWouldAdmitResult | undefined;
+
+      if (mode === "observe") {
+        resolved = resolveAdmission(request, acquireOpts);
+        advisory = wouldAdmitResolved(resolved, true);
+        if (
+          !advisory.admit &&
+          advisory.reason !== undefined &&
+          shouldBypass(advisory.reason, shadowReasons)
+        ) {
+          return publish(
+            runBypassed(
+              request,
+              fn,
+              {
+                ...(ao.signal !== undefined && { signal: ao.signal }),
+                ...(getUsage !== undefined && { getUsage }),
+              },
+              resolved,
+              advisory.reason,
+              advisory.detail,
+              false,
+            ),
+          );
+        }
+      }
+
+      const r = await _acquire(request, acquireOpts, resolved);
       if (!r.ok) {
+        if (mode === "observe" && shouldBypass(r.reason, shadowReasons)) {
+          return publish(
+            runBypassed(
+              request,
+              fn,
+              {
+                ...(ao.signal !== undefined && { signal: ao.signal }),
+                ...(getUsage !== undefined && { getUsage }),
+              },
+              resolved ?? resolveAdmission(request, acquireOpts),
+              r.reason,
+              r.detail,
+              advisory?.admit === true,
+            ),
+          );
+        }
         throw new LLMBulkheadRejectedError(r.reason, r.detail);
       }
 
       const ctx: LLMRunContext = {
         admissionId: r.admissionId,
         reservation: r.reservation,
+        admission: "admitted",
         reportUsage: (usage) => r.token.reportUsage(usage),
       };
 
@@ -917,15 +1213,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         return result;
       })();
 
-      if (deferred) {
-        void work.then(
-          (v) => deferred.resolve(v),
-          (e) => deferred.reject(e),
-        );
-        return resultPromise!;
-      }
-
-      return work;
+      return publish(work);
     } catch (err) {
       if (deferred) {
         deferred.reject(err);
@@ -961,6 +1249,16 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       };
     }
 
+    if (observeBypassed > 0) {
+      result.observe = {
+        bypassed: observeBypassed,
+        raceBypassed: observeRaceBypassed,
+        bypassedByReason: { ...observeBypassedByReason },
+        usageReported: observeUsageReported,
+        totalInputTokens: observeTotalInputTokens,
+        totalOutputTokens: observeTotalOutputTokens,
+      };
+    }
 
     if (dedup.enabled) {
       result.deduplication = {

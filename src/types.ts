@@ -205,6 +205,30 @@ export type LLMRejectReason =
 export type LLMPriority = "high" | "normal";
 
 /**
+ * Admission behavior for `run()`.
+ *
+ * - `"enforce"` (default) preserves normal fail-fast behavior.
+ * - `"observe"` executes the callback without holding capacity when a
+ *   configured capacity-related rejection occurs, while recording the
+ *   simulated rejection and usage separately.
+ */
+export type LLMAdmissionMode = "enforce" | "observe";
+
+/**
+ * Rejection reasons that observe mode is allowed to bypass.
+ *
+ * Shutdown, caller cancellation, and unsafe deduplication fan-out remain
+ * hard failures and are intentionally excluded from this type.
+ */
+export type LLMShadowableRejectReason = Extract<
+  LLMRejectReason,
+  "budget_limit" | "concurrency_limit" | "queue_limit" | "timeout"
+>;
+
+/** Whether a `run()` callback holds real bulkhead capacity. */
+export type LLMRunAdmission = "admitted" | "bypassed";
+
+/**
  * Capacity snapshot attached to rejections so callers (e.g. gateways)
  * can build informative 429/503 responses.
  *
@@ -271,6 +295,21 @@ export type LLMRequestStats = {
   rejectedByReason: Partial<Record<LLMRejectReason, number>>;
 };
 
+export type LLMObserveStats = {
+  /** Callbacks executed without acquiring concurrency or token capacity. */
+  bypassed: number;
+  /** Bypasses caused by a rejection after an advisory positive decision. */
+  raceBypassed: number;
+  /** Bypassed callbacks grouped by the simulated/authoritative reason. */
+  bypassedByReason: Partial<Record<LLMShadowableRejectReason, number>>;
+  /** Bypassed callbacks for which final usage was available. */
+  usageReported: number;
+  /** Cumulative final input usage from bypassed callbacks. */
+  totalInputTokens: number;
+  /** Cumulative final output usage from bypassed callbacks. */
+  totalOutputTokens: number;
+};
+
 export type LLMStats = {
   /** Underlying async-bulkhead-ts stats. */
   bulkhead: Stats;
@@ -309,6 +348,8 @@ export type LLMStats = {
     /** Budget headroom reserved for `priority: "high"` requests. */
     highPriorityReserve: number;
   };
+  /** Present after at least one observe-mode bypass has occurred. */
+  observe?: LLMObserveStats;
   /** Present only when deduplication is enabled. */
   deduplication?: {
     /** Number of distinct in-flight deduplication keys. */
@@ -386,6 +427,44 @@ export type LLMEventMap = {
     outputCap: number | null;
     outputRemaining: number | null;
     overReservation: boolean;
+  };
+  /**
+   * Fired when observe mode executes a callback without holding capacity.
+   * This is separate from `admit`: bypassed work does not affect concurrency
+   * or token-budget accounting.
+   */
+  bypass: {
+    request: LLMRequest;
+    admissionId: string;
+    priority: LLMPriority;
+    reason: LLMShadowableRejectReason;
+    detail?: LLMRejectDetail;
+    reservation: LLMReservationEstimate | null;
+    /** True when an advisory positive decision raced with a real rejection. */
+    raced: boolean;
+  };
+  /** Fired after an effective cumulative usage update for bypassed work. */
+  bypassUsage: {
+    request: LLMRequest;
+    admissionId: string;
+    priority: LLMPriority;
+    reason: LLMShadowableRejectReason;
+    sequence: number;
+    reservation: LLMReservationEstimate | null;
+    usage: TokenUsage;
+    outputCap: number | null;
+    outputRemaining: number | null;
+    overReservation: boolean;
+  };
+  /** Fired when bypassed work settles, whether successfully or by throwing. */
+  bypassRelease: {
+    request: LLMRequest;
+    admissionId: string;
+    priority: LLMPriority;
+    reason: LLMShadowableRejectReason;
+    reservation: LLMReservationEstimate | null;
+    usageSequence: number;
+    usage?: TokenUsage;
   };
   /** Fired when a request joins an existing in-flight call via dedup. */
   dedup: { request: LLMRequest };
@@ -603,11 +682,40 @@ export type UsageReport = {
 
 /** Context passed to `run()` callbacks for mid-flight usage reporting. */
 export type LLMRunContext = {
-  /** Stable identifier for this successful admission. */
+  /** Stable identifier for this execution. Bypasses use a `shadow-` prefix. */
   readonly admissionId: string;
-  /** Exact reservation used at admission, or `null` without a token budget. */
+  /** Exact reservation evaluated for this call, or `null` without a budget. */
   readonly reservation: LLMReservationEstimate | null;
+  /** Whether the callback holds real bulkhead capacity. */
+  readonly admission: LLMRunAdmission;
+  /** Simulated or authoritative reason when `admission === "bypassed"`. */
+  readonly bypassReason?: LLMShadowableRejectReason;
+  /** Capacity snapshot associated with the bypass decision, when available. */
+  readonly bypassDetail?: LLMRejectDetail;
   reportUsage(usage: TokenUsage): UsageReport;
+};
+
+/** Options accepted by `run()`. */
+export type LLMRunOptions<T> = LLMAcquireOptions & {
+  getUsage?: (result: T) => TokenUsage | undefined;
+  /**
+   * Admission behavior. `"enforce"` is the default. In `"observe"` mode,
+   * configured capacity-related rejections execute without holding capacity.
+   */
+  mode?: LLMAdmissionMode;
+  /**
+   * Capacity reasons observe mode may bypass. Defaults to all four
+   * `LLMShadowableRejectReason` values. Pass an empty array to observe the
+   * callback context without bypassing any rejection.
+   */
+  shadowReasons?: readonly LLMShadowableRejectReason[];
+  /**
+   * Deduplication scope. Requests deduplicate only within the same scope.
+   * Ignored when deduplication is disabled. Default: `""`.
+   */
+  dedupScope?: string;
+  /** Per-call deduplication opt-out. */
+  dedup?: boolean;
 };
 
 /**

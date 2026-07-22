@@ -17,6 +17,7 @@ Designed for services that need to enforce **cost ceilings, concurrency limits, 
 - ✅ **Full-request estimation** — `system` prompts counted natively; `extraInputTokens` carries caller-computed costs (tool schemas, provider-priced media)
 - ✅ **Per-call reservation override** — gateways with their own estimate can bypass the estimator via `reservation` on `acquire()`/`run()`/`wouldAdmit()`
 - ✅ **Fail-fast by default** — shed load early, never silently queue
+- ✅ **Observe/shadow mode** — measure capacity-policy impact while still executing selected would-be-rejected calls
 - ✅ **Opinionated profiles** — `'interactive'` and `'batch'` presets with escape hatch
 - ✅ **In-flight deduplication** — identical requests share one LLM call; hashed keys, whole-request equality
 - ✅ **Custom dedup key + per-tenant scope** — bring your own equivalence function; `dedupScope` isolates tenants
@@ -26,7 +27,7 @@ Designed for services that need to enforce **cost ceilings, concurrency limits, 
 - ✅ **Advisory capacity snapshots** — `wouldAdmit(request, { detail: true })` returns the same capacity numbers rejections carry
 - ✅ **Stable admission IDs** — correlate gateway requests, traces, usage, and release
 - ✅ **Ordered usage events** — sequence-numbered hold changes for external coordinators
-- ✅ **Event hooks** — `on('admit' | 'reject' | 'usage' | 'release' | 'dedup', fn)`
+- ✅ **Event hooks** — admitted and bypassed lifecycles have separate telemetry events
 - ✅ **Graceful shutdown** — `close()` + `drain()`, with an optional bounded wait: `drain({ timeoutMs })`
 - ✅ Optional **AbortSignal** and **timeout** cancellation
 - ✅ `bulkhead.run(request, fn)` — acquire + release handled automatically
@@ -55,6 +56,7 @@ Non-goals (by design):
 | **Concurrency limits** | ✅ Yes | ⚠️ Indirect | ❌ No | ✅ Yes | ⚠️ Indirect |
 | **Bounded queue (optional)** | ✅ Yes | ⚠️ Internal | ❌ No | ✅ Yes | ⚠️ Indirect |
 | **Fail-fast overload handling** | ✅ Core feature | ❌ No | ❌ No | ❌ No | ⚠️ Indirect |
+| **Observe/shadow rollout mode** | ✅ Yes | ❌ No | ❌ No | ❌ No | ❌ No |
 | **In-flight deduplication** | ✅ Yes | ⚠️ Partial caching | ❌ No | ❌ No | ❌ No |
 | **Custom dedup key** | ✅ Yes | ❌ No | ❌ No | ❌ No | ❌ No |
 | **Model-aware estimation** | ✅ Yes | ❌ No | ❌ No | ❌ No | ❌ No |
@@ -127,6 +129,104 @@ const result = await bulkhead.run(request, async () => {
   return callYourLLMProvider(request);
 });
 ```
+
+---
+
+## What's New in v3.9 — First-class observe mode
+
+v3.9 adds an explicit rollout mode for measuring admission policy before fully
+enforcing it. `run()` still attempts normal admission first. When a configured
+capacity-related rejection occurs, observe mode executes the callback without
+holding a concurrency slot or token reservation and records the bypass on a
+separate telemetry surface.
+
+```ts
+const result = await bulkhead.run(
+  request,
+  async (signal, ctx) => {
+    logger.info({
+      admissionId: ctx?.admissionId,
+      admission: ctx?.admission,          // "admitted" | "bypassed"
+      bypassReason: ctx?.bypassReason,    // set only for bypassed work
+      bypassDetail: ctx?.bypassDetail,    // capacity snapshot, when available
+    });
+
+    return callYourLLMProvider(request, {
+      signal,
+      onUsage: (usage) => ctx?.reportUsage(usage),
+    });
+  },
+  { mode: "observe" },
+);
+```
+
+By default, observe mode may bypass these capacity outcomes:
+
+```ts
+"budget_limit" | "concurrency_limit" | "queue_limit" | "timeout"
+```
+
+Shutdown, caller cancellation, and unsafe deduplication fan-out remain hard
+failures. Observe mode is therefore not a global "ignore every rejection"
+switch.
+
+### Restrict which outcomes may be bypassed
+
+Use `shadowReasons` to roll out one policy at a time:
+
+```ts
+await bulkhead.run(request, fn, {
+  mode: "observe",
+  shadowReasons: ["budget_limit"],
+});
+```
+
+An empty `shadowReasons` array keeps normal enforcement while still exposing
+`ctx.admission === "admitted"` to callbacks.
+
+### Admitted and bypassed callback context
+
+Normally admitted calls receive the same context with:
+
+```ts
+ctx.admission === "admitted"
+ctx.bypassReason === undefined
+```
+
+Bypassed calls receive a `shadow-`-prefixed `admissionId`, the exact evaluated
+reservation, the bypass reason, and the associated capacity detail. Their
+`reportUsage()` snapshots always report `held: 0`, because observed work does
+not consume bulkhead accounting capacity.
+
+### Separate observe telemetry
+
+Bypassed work does not increment normal `admit`/`release` counters. It is
+reported through:
+
+```ts
+bulkhead.on("bypass", listener);
+bulkhead.on("bypassUsage", listener);
+bulkhead.on("bypassRelease", listener);
+
+const observe = bulkhead.stats().observe;
+// {
+//   bypassed,
+//   raceBypassed,
+//   bypassedByReason,
+//   usageReported,
+//   totalInputTokens,
+//   totalOutputTokens,
+// }
+```
+
+`raceBypassed` counts calls whose advisory check passed but whose authoritative
+acquisition later rejected—for example, a queued request that timed out while
+capacity changed. This makes preview-to-admission races visible instead of
+silently merging them into ordinary bypasses.
+
+> Observe mode intentionally allows work to proceed without capacity
+> protection. Use it for policy calibration, migration, and audit periods—not
+> as the steady-state overload posture of a saturated service.
 
 ---
 
@@ -818,7 +918,14 @@ s.bulkhead.closed                    // true after close()
 s.llm.admitted
 s.llm.released
 s.llm.rejected
-s.llm.rejectedByReason?.budget_limit                        // true after close()
+s.llm.rejectedByReason?.budget_limit
+
+s.observe?.bypassed                 // v3.9: callbacks run without capacity
+s.observe?.raceBypassed             // advisory admit raced with rejection
+s.observe?.bypassedByReason
+s.observe?.usageReported
+s.observe?.totalInputTokens
+s.observe?.totalOutputTokens
 
 s.tokenBudget?.budget
 s.tokenBudget?.inFlightTokens
@@ -848,6 +955,17 @@ type LLMStats = {
     totalConsumed: number;
     totalRefunded: number;
   };
+  observe?: {
+    bypassed: number;
+    raceBypassed: number;
+    bypassedByReason: Partial<Record<
+      'budget_limit' | 'concurrency_limit' | 'queue_limit' | 'timeout',
+      number
+    >>;
+    usageReported: number;
+    totalInputTokens: number;
+    totalOutputTokens: number;
+  };
   deduplication?: {
     active: number;
     hits: number;
@@ -875,6 +993,9 @@ off();
 | `reject`  | `{ request, reason, detail? }` |
 | `usage`   | `{ request, admissionId, priority, sequence, reservedTokens, previousHeldTokens, heldTokens, deltaTokens, usage, outputCap, outputRemaining, overReservation }` |
 | `release` | `{ request, admissionId, priority, reservedTokens, heldTokens, refundedTokens, usageSequence, usage? }` |
+| `bypass` | `{ request, admissionId, priority, reason, detail?, reservation, raced }` |
+| `bypassUsage` | `{ request, admissionId, priority, reason, sequence, reservation, usage, outputCap, outputRemaining, overReservation }` |
+| `bypassRelease` | `{ request, admissionId, priority, reason, reservation, usageSequence, usage? }` |
 | `dedup`   | `{ request }` |
 
 Listeners are synchronous and fire-and-forget. Exceptions are silently caught.
@@ -931,15 +1052,26 @@ run<T>(
     timeoutMs?:  number; // integer >= 0
     priority?:   'normal' | 'high';
     getUsage?:   (result: T) => TokenUsage | undefined;
+    mode?:       'enforce' | 'observe'; // default: 'enforce' (v3.9)
+    shadowReasons?: readonly (
+      | 'budget_limit'
+      | 'concurrency_limit'
+      | 'queue_limit'
+      | 'timeout'
+    )[];
     dedupScope?: string;  // dedup isolation scope (e.g. tenant / API key)
     dedup?:      boolean; // false = opt this call out of dedup (v3.5)
   },
 ): Promise<T>
 ```
 
-`ctx.admissionId` is the stable admission identifier. `ctx.reservation` is
-the exact reservation used at admission (or `null` when token budgeting is
-disabled), and `ctx.reportUsage()` reports cumulative streaming usage.
+`ctx.admissionId` is the stable execution identifier. In observe-mode
+bypasses it uses a `shadow-` prefix. `ctx.reservation` is the exact evaluated
+reservation (or `null` when token budgeting is disabled),
+`ctx.admission` distinguishes `"admitted"` from `"bypassed"`, and
+`ctx.bypassReason` / `ctx.bypassDetail` describe a bypass.
+`ctx.reportUsage()` reports cumulative streaming usage; bypassed usage is
+recorded for telemetry but never changes bulkhead capacity accounting.
 
 ### `bulkhead.estimate(request)`
 
