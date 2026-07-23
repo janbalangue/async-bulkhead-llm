@@ -20,6 +20,8 @@
 export type {
   ContentBlock,
   DeduplicationOptions,
+  LLMAdmissionLimits,
+  LLMApplyLimitsResult,
   LLMAcquireOptions,
   LLMAcquireResult,
   LLMAdmissionMode,

@@ -7,6 +7,38 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.10.0] - 2026-07-23
+
+### Added
+
+* **Atomic, versioned admission-limit reconfiguration.**
+  `bulkhead.applyLimits(snapshot)` replaces `maxConcurrent`, `maxQueue`,
+  `tokenBudget.budget`, and `tokenBudget.highPriorityReserve` as one complete
+  snapshot. Updates require a strictly increasing non-negative safe-integer
+  `revision`; equal or lower revisions return
+  `{ applied: false, reason: "stale_revision" }` without mutation.
+
+* **Runtime concurrency and queue changes.** Lower ceilings use
+  shrink-by-attrition: in-flight work and already accepted waiters are not
+  cancelled. Raising concurrency pumps accepted waiters immediately. A
+  runtime `maxConcurrent: 0` acts as a fail-fast kill switch for new work.
+
+* **Limit inspection and telemetry.** `bulkhead.limits()` and
+  `stats().limits` expose the currently applied frozen snapshot.
+  `initialRevision` seeds the constructor state, and the new `reconfigure`
+  event contains the previous and current snapshots.
+
+### Changed
+
+* `setBudget(tokens)` remains backward compatible but now delegates to a
+  complete local reconfiguration and advances the revision by one. Distributed
+  control-plane integrations should use `applyLimits()` exclusively so one
+  authority owns the revision stream.
+
+* The internal concurrency gate now supports dynamic `maxConcurrent` and
+  `maxQueue` while preserving the public stats and rejection semantics used by
+  the LLM bulkhead.
+
 ## [3.9.0] - 2026-07-22
 
 ### Added

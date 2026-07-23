@@ -280,6 +280,42 @@ export type LLMAcquireOptions = AcquireOptions & {
   reservation?: LLMReservationOverride;
 };
 
+
+/**
+ * Complete, versioned snapshot of every admission limit that can change at
+ * runtime. Updates are intentionally not partial: callers must provide the
+ * whole snapshot so the bulkhead can validate and apply it atomically.
+ *
+ * `tokenBudget` must be present when the bulkhead was constructed with a
+ * token budget and absent otherwise. Runtime enable/disable is deliberately
+ * unsupported because estimator configuration is construction-time state.
+ */
+export type LLMAdmissionLimits = {
+  /** Monotonically increasing non-negative safe integer. */
+  readonly revision: number;
+  /** 0 is a fail-fast kill switch for new admissions. */
+  readonly maxConcurrent: number;
+  /** Existing waiters are preserved when this shrinks. */
+  readonly maxQueue: number;
+  readonly tokenBudget?: {
+    readonly budget: number;
+    readonly highPriorityReserve: number;
+  };
+};
+
+/** Result of applying a versioned admission-limit snapshot. */
+export type LLMApplyLimitsResult =
+  | {
+      readonly applied: true;
+      readonly previous: LLMAdmissionLimits;
+      readonly current: LLMAdmissionLimits;
+    }
+  | {
+      readonly applied: false;
+      readonly reason: "stale_revision";
+      readonly current: LLMAdmissionLimits;
+    };
+
 // ────────────────────────────────────────────
 // Stats
 // ────────────────────────────────────────────
@@ -311,7 +347,9 @@ export type LLMObserveStats = {
 };
 
 export type LLMStats = {
-  /** Underlying async-bulkhead-ts stats. */
+  /** Currently applied atomic admission-limit snapshot. */
+  limits: LLMAdmissionLimits;
+  /** Underlying async-bulkhead-ts-compatible stats. */
   bulkhead: Stats;
   /** LLM-layer request stats. */
   llm: LLMRequestStats;
@@ -466,6 +504,11 @@ export type LLMEventMap = {
     usageSequence: number;
     usage?: TokenUsage;
   };
+  /** Fired after a higher-revision admission-limit snapshot is applied. */
+  reconfigure: {
+    previous: LLMAdmissionLimits;
+    current: LLMAdmissionLimits;
+  };
   /** Fired when a request joins an existing in-flight call via dedup. */
   dedup: { request: LLMRequest };
 };
@@ -487,7 +530,7 @@ export type TokenBudgetOptions = {
    * represents a pool with no budget to grant this cycle (e.g. a lease
    * ledger reporting exhaustion) and results in every budget-gated
    * admission being rejected with `"budget_limit"` until the ceiling is
-   * raised (via `setBudget()`) or `tokenBudget` admits a zero-token
+   * raised (via `applyLimits()` or `setBudget()`) or `tokenBudget` admits a zero-token
    * request.
    */
   budget: number;
@@ -611,6 +654,12 @@ export type LLMBulkheadOptions = {
 
   /** Maximum number of requests in-flight simultaneously. */
   maxConcurrent: number;
+
+  /**
+   * Initial revision for the admission-limit snapshot. Default: 0.
+   * Subsequent `applyLimits()` calls must use a strictly higher revision.
+   */
+  initialRevision?: number;
 
   /**
    * Maximum number of requests waiting for admission.

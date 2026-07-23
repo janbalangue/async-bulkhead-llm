@@ -9,6 +9,7 @@ Designed for services that need to enforce **cost ceilings, concurrency limits, 
 ## Features
 
 - ✅ Hard **max in-flight** concurrency (`maxConcurrent`)
+- ✅ **Atomic versioned limit updates** — apply concurrency, queue, token budget, and priority reserve as one revisioned snapshot
 - ✅ **Token-aware admission** — reserves against estimated input + max output tokens
 - ✅ **Token refund** — reclaim unused budget capacity from actual usage post-completion
 - ✅ **Model-aware estimation** — per-model character ratios for known providers
@@ -129,6 +130,52 @@ const result = await bulkhead.run(request, async () => {
   return callYourLLMProvider(request);
 });
 ```
+
+---
+
+## What's New in v3.10 — Atomic, versioned admission limits
+
+v3.10 makes `async-bulkhead-llm` safer to operate from gateways and distributed
+control-plane agents. All mutable admission limits can now be replaced in one
+validated, revisioned snapshot instead of being updated independently.
+
+### Highlights
+
+- **Atomic updates:** `maxConcurrent`, `maxQueue`, token budget, and
+  high-priority reserve change together or not at all.
+- **Stale-update protection:** every snapshot carries a strictly increasing
+  `revision`; equal or older revisions are rejected without mutating state.
+- **Shrink by attrition:** lowering limits never cancels in-flight work or
+  already accepted queue waiters. New work is admitted only as capacity returns.
+- **Immediate scale-up:** raising concurrency starts eligible queued work as soon
+  as the new snapshot is applied.
+- **Runtime kill switch:** setting `maxConcurrent` to `0` stops new admissions
+  while existing work drains normally.
+- **Observable state:** `limits()`, `stats().limits`, and the `reconfigure` event
+  expose the active revision and previous/current snapshots.
+
+```ts
+const result = bulkhead.applyLimits({
+  revision: 42,
+  maxConcurrent: 12,
+  maxQueue: 0,
+  tokenBudget: {
+    budget: 120_000,
+    highPriorityReserve: 20_000,
+  },
+});
+
+if (!result.applied) {
+  // Equal and lower revisions are ignored without mutation.
+  console.log(result.reason); // "stale_revision"
+}
+```
+
+Use `initialRevision` when restoring persisted control-plane state. A configured
+token budget must remain configured in every later snapshot; estimator and
+output-cap policy remain construction-time settings. `setBudget()` is still
+supported for local use, but distributed integrations should use
+`applyLimits()` exclusively so a single authority owns the revision sequence.
 
 ---
 
@@ -586,7 +633,7 @@ const off = bulkhead.on('release', ({ reservedTokens, refundedTokens, usage }) =
 off(); // unsubscribe
 ```
 
-Events: `'admit'`, `'reject'`, `'usage'`, `'release'`, `'dedup'`.
+Events: `'admit'`, `'reject'`, `'usage'`, `'release'`, `'reconfigure'`, `'dedup'`.
 
 ### Graceful Shutdown
 
@@ -707,28 +754,70 @@ adaptive.corrections();                // per-model calibration snapshot
 adaptive.reset();                      // clear calibration
 ```
 
-### Runtime Budget Adjustment
+### Atomic Runtime Reconfiguration
 
-`setBudget(tokens)` mutates the token budget ceiling at runtime — useful for gateways that adjust cost limits based on external signals (billing tier changes, incident response, time-of-day throttling) without recreating the bulkhead.
+`applyLimits(snapshot)` is the preferred runtime control surface for gateways
+and distributed control-plane agents. The snapshot is complete rather than
+partial, so concurrency, queue, budget, and reserve values cannot drift across
+separate setter calls.
 
 ```ts
 const bulkhead = createLLMBulkhead({
-  model:         'claude-sonnet-4',
+  model: 'claude-sonnet-4',
   maxConcurrent: 10,
-  tokenBudget: { budget: 200_000 },
+  maxQueue: 0,
+  initialRevision: 100,
+  tokenBudget: {
+    budget: 200_000,
+    highPriorityReserve: 25_000,
+  },
 });
 
-bulkhead.setBudget(300_000); // raise the ceiling
-bulkhead.setBudget(50_000);  // shrink the ceiling
+const update = bulkhead.applyLimits({
+  revision: 101,
+  maxConcurrent: 6,
+  maxQueue: 20,
+  tokenBudget: {
+    budget: 90_000,
+    highPriorityReserve: 15_000,
+  },
+});
 ```
 
-Semantics, pinned deliberately:
+Semantics:
 
-* **Raising takes effect immediately.** The very next `acquire()`/`run()`/`wouldAdmit()` call sees the new headroom — there is no caching to invalidate.
-* **Lowering below `inFlightTokens` is legal — shrink by attrition.** No in-flight request is revoked or cancelled. New admissions reject with `"budget_limit"` until enough in-flight work releases to bring `stats().tokenBudget.inFlightTokens` back under the new ceiling. This is consistent with the library's existing overrun tolerance — `inFlightTokens` can already exceed `budget` via `reportUsage()` overrun, so an over-budget in-flight state is an established, intentional condition rather than an edge case.
-* **Throws if `tokenBudget` was never configured at construction.** There is no ceiling to adjust, so an explicit error is raised instead of silently no-op'ing.
-* **Validates `tokens` as a non-negative integer** (`0` is valid — it fully closes admission until either budget is raised or in-flight work drains and no further reservation exists).
-* **Not re-validated against `highPriorityReserve`.** Construction requires `highPriorityReserve <= budget` (catches config typos), but `setBudget()` trusts the caller — a renewal-driven ledger grant is reality, and the bulkhead has no standing to refuse it even if it drops below the configured reserve. If that happens, the normal-priority ceiling (`budget - highPriorityReserve`) is clamped to `0`: normal-priority traffic is fully rejected with `"budget_limit"` while `priority: "high"` requests are still checked against the full (shrunk) budget and can keep admitting. This is the intended degraded behavior — protecting interactive traffic when capacity is scarcest is exactly what `highPriorityReserve` is for.
+* **Strictly increasing revision.** Equal or lower revisions return a stale
+  result and do not mutate any limit.
+* **Full validation before mutation.** Invalid higher-revision snapshots throw
+  while the previous revision remains active.
+* **Shrink by attrition.** In-flight work and accepted queue waiters are never
+  revoked. New admissions obey the lower ceilings immediately.
+* **Immediate expansion.** Raising `maxConcurrent` pumps accepted waiters in
+  the same synchronous update, after the complete LLM-layer snapshot is active.
+* **Zero-concurrency kill switch.** `maxConcurrent: 0` rejects new callers with
+  `"concurrency_limit"` instead of queueing them.
+* **Budget reserve may exceed a shrunken budget.** The normal-priority ceiling
+  is clamped to 0 while high-priority traffic is checked against the full
+  budget, preserving the existing degraded-priority behavior.
+* **Budget feature shape is fixed at construction.** A bulkhead created with
+  `tokenBudget` requires `tokenBudget` in every update. A bulkhead created
+  without it must omit that field; estimator policy is not hot-swapped.
+
+```ts
+const current = bulkhead.limits();
+// { revision, maxConcurrent, maxQueue, tokenBudget? }
+
+bulkhead.on('reconfigure', ({ previous, current }) => {
+  publishAppliedRevision(previous.revision, current.revision);
+});
+```
+
+#### Compatibility: `setBudget(tokens)`
+
+`setBudget(tokens)` remains available for existing callers. It now applies a
+complete budget-only update at `currentRevision + 1`. Do not mix it with an
+external revision authority; distributed integrations should use
+`applyLimits()` exclusively.
 
 
 ---
@@ -909,6 +998,12 @@ try {
 ```ts
 const s = bulkhead.stats();
 
+s.limits.revision
+s.limits.maxConcurrent
+s.limits.maxQueue
+s.limits.tokenBudget?.budget
+s.limits.tokenBudget?.highPriorityReserve
+
 s.bulkhead.inFlight
 s.bulkhead.pending
 s.bulkhead.maxConcurrent
@@ -940,6 +1035,7 @@ s.deduplication?.hits
 
 ```ts
 type LLMStats = {
+  limits: LLMAdmissionLimits;
   bulkhead: Stats;
   llm: {
     admitted: number;
@@ -996,6 +1092,7 @@ off();
 | `bypass` | `{ request, admissionId, priority, reason, detail?, reservation, raced }` |
 | `bypassUsage` | `{ request, admissionId, priority, reason, sequence, reservation, usage, outputCap, outputRemaining, overReservation }` |
 | `bypassRelease` | `{ request, admissionId, priority, reason, reservation, usageSequence, usage? }` |
+| `reconfigure` | `{ previous, current }` |
 | `dedup`   | `{ request }` |
 
 Listeners are synchronous and fire-and-forget. Exceptions are silently caught.
@@ -1023,6 +1120,7 @@ await bulkhead.drain();  // wait for in-flight work to finish
 type LLMBulkheadOptions = {
   model:          string;
   maxConcurrent:  number;
+  initialRevision?: number; // non-negative safe integer; default 0
   maxQueue?:      number;
   timeoutMs?:     number; // integer >= 0
   profile?:       'interactive' | 'batch' | LLMBulkheadPreset;
@@ -1119,15 +1217,43 @@ type LLMToken = {
 
 ### `bulkhead.stats()`
 
+### `bulkhead.limits()`
+
+```ts
+limits(): LLMAdmissionLimits
+```
+
+Returns a frozen copy of the currently applied complete snapshot.
+
+### `bulkhead.applyLimits(snapshot)`
+
+```ts
+applyLimits(snapshot: LLMAdmissionLimits): LLMApplyLimitsResult
+
+type LLMAdmissionLimits = {
+  readonly revision: number;
+  readonly maxConcurrent: number; // runtime 0 = fail-fast kill switch
+  readonly maxQueue: number;
+  readonly tokenBudget?: {
+    readonly budget: number;
+    readonly highPriorityReserve: number;
+  };
+};
+```
+
+Applies only strictly higher revisions. See
+[Atomic Runtime Reconfiguration](#atomic-runtime-reconfiguration).
+
 ### `bulkhead.setBudget(tokens)`
 
 ```ts
 setBudget(tokens: number): void
 ```
 
-Mutates the token budget ceiling at runtime. Throws if `tokenBudget` was not
-configured at construction. Throws if `tokens` is not a non-negative integer.
-See [Runtime Budget Adjustment](#runtime-budget-adjustment) for full semantics.
+Applies a complete budget-only update and advances the local revision by one.
+Throws if `tokenBudget` was not configured at construction or if `tokens` is
+not a non-negative integer. Externally managed callers should use
+`applyLimits()` instead.
 
 ### `bulkhead.close()`
 
@@ -1195,6 +1321,14 @@ type LLMRejectReason =
 ---
 
 ## Migration
+
+### v3.9 → v3.10
+
+Existing admission calls require no changes. `stats()` gains a `limits` block,
+`LLMEventType` gains `"reconfigure"`, and `setBudget()` now advances the local
+revision. Code that exhaustively enumerates event types should add the new
+case. Control-plane integrations should move from `setBudget()` to complete
+`applyLimits()` snapshots.
 
 ### v3.5 → v3.6
 

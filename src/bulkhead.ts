@@ -3,14 +3,12 @@
  * priority), reservation and refund accounting, streaming usage
  * reports, deduplication orchestration, events, stats, and shutdown.
  */
-import {
-  createBulkhead,
-  type AcquireOptions,
-  type Token,
-} from "async-bulkhead-ts";
+import type { AcquireOptions, Token } from "async-bulkhead-ts";
 import { randomUUID } from "node:crypto";
 import type {
   Listener,
+  LLMAdmissionLimits,
+  LLMApplyLimitsResult,
   LLMAcquireOptions,
   LLMAcquireResult,
   LLMAdmissionMode,
@@ -44,6 +42,7 @@ import {
   validateTokenUsage,
 } from "./validation.js";
 import { hashDedupKey, isUnsafeToShare, resolveDedup } from "./dedup.js";
+import { createReconfigurableBulkhead } from "./reconfigurable-bulkhead.js";
 
 type BulkheadSignal = NonNullable<AcquireOptions["signal"]>;
 
@@ -80,6 +79,10 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     throw new Error("model must be a non-empty string");
   }
   assertPositiveInteger(opts.maxConcurrent, "maxConcurrent");
+  const initialRevision = opts.initialRevision ?? 0;
+  if (!Number.isSafeInteger(initialRevision) || initialRevision < 0) {
+    throw new Error("initialRevision must be a non-negative safe integer");
+  }
 
   // ---- Resolve profile defaults ----
   const preset = resolvePreset(opts.profile);
@@ -108,8 +111,8 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     }
   }
 
-  // ---- Internal bulkhead from async-bulkhead-ts ----
-  const bulkhead = createBulkhead({
+  // ---- Internal reconfigurable concurrency bulkhead ----
+  const bulkhead = createReconfigurableBulkhead({
     maxConcurrent: opts.maxConcurrent,
     maxQueue,
   });
@@ -123,17 +126,10 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       outputCap: budget?.outputCap,
     });
 
-  const highPriorityReserve = budget?.highPriorityReserve ?? 0;
-
-  /**
-   * Mutable budget ceiling, initialized from `tokenBudget.budget`.
-   * `undefined` when `tokenBudget` was never configured — `setBudget()`
-   * throws in that case rather than silently no-op'ing.
-   * Mutated only by `setBudget()`. All admission math reads this value
-   * (via `effectiveBudget()`), not the frozen `opts.tokenBudget.budget`,
-   * so budget changes take effect on the very next admission check.
-   */
+  /** Current versioned admission-limit state. */
+  let currentRevision = initialRevision;
   let currentBudget: number | undefined = budget?.budget;
+  let currentHighPriorityReserve = budget?.highPriorityReserve ?? 0;
 
   let inFlightTokens = 0;
 
@@ -169,6 +165,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     bypass: new Set(),
     bypassUsage: new Set(),
     bypassRelease: new Set(),
+    reconfigure: new Set(),
     dedup: new Set(),
   };
 
@@ -336,14 +333,15 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
    * `tokenBudget` validation block above) — that check catches config
    * typos once, at startup. It intentionally does *not* run again here.
    *
-   * `setBudget()` can lower `currentBudget` below `highPriorityReserve` at
+   * `applyLimits()` or `setBudget()` can lower `currentBudget` below
+   * `highPriorityReserve` at
    * runtime (e.g. a lease-renewal ledger reporting a shrunk grant), and
    * that is allowed, not re-validated. Rejecting a renewal-driven update
    * would be wrong: the ledger's grant is reality — the bulkhead has no
    * standing to refuse it. So `currentBudget` can legitimately end up
    * smaller than `highPriorityReserve`.
    *
-   * Consequence, deliberately embraced: `currentBudget! - highPriorityReserve`
+   * Consequence, deliberately embraced: `currentBudget! - currentHighPriorityReserve`
    * would go negative in that state, so it is clamped to `0` here. That
    * means normal-priority admission is fully rejected (nothing fits under
    * a `0` ceiling) while high-priority admission is still checked against
@@ -357,10 +355,8 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     if (!budget) return Infinity;
     return priority === "high"
       ? currentBudget!
-      : Math.max(0, currentBudget! - highPriorityReserve);
+      : Math.max(0, currentBudget! - currentHighPriorityReserve);
   }
-
-
 
   /**
    * Attempt token budget admission synchronously for a precomputed
@@ -437,6 +433,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     if (base.inFlight < base.maxConcurrent) {
       return withDetail({ admit: true });
     }
+    if (base.maxConcurrent === 0) {
+      return withDetail({ admit: false, reason: "concurrency_limit" });
+    }
     if (base.pending < base.maxQueue) {
       return withDetail({ admit: true });
     }
@@ -446,25 +445,106 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     });
   }
 
+  /** Return a detached snapshot of the currently applied limits. */
+  function limits(): LLMAdmissionLimits {
+    const base = bulkhead.stats();
+    const snapshot: LLMAdmissionLimits = {
+      revision: currentRevision,
+      maxConcurrent: base.maxConcurrent,
+      maxQueue: base.maxQueue,
+      ...(budget
+        ? {
+            tokenBudget: {
+              budget: currentBudget!,
+              highPriorityReserve: currentHighPriorityReserve,
+            },
+          }
+        : {}),
+    };
+    return Object.freeze({
+      ...snapshot,
+      ...(snapshot.tokenBudget
+        ? { tokenBudget: Object.freeze({ ...snapshot.tokenBudget }) }
+        : {}),
+    });
+  }
+
   /**
-   * Update the token budget ceiling at runtime.
+   * Atomically apply a complete, higher-revision admission-limit snapshot.
    *
-   * Semantics (deliberate, not incidental):
+   * All fields are validated before any state changes. Equal or lower
+   * revisions are rejected as stale without mutation. Lower concurrency,
+   * queue, or token ceilings use shrink-by-attrition: in-flight work and
+   * already accepted waiters are not cancelled. Raising concurrency pumps
+   * accepted waiters immediately after the complete snapshot is installed.
+   */
+  function applyLimits(next: LLMAdmissionLimits): LLMApplyLimitsResult {
+    // Read each externally supplied property once. This prevents accessor
+    // objects from returning one value during validation and another during
+    // installation.
+    const revision = next.revision;
+    const maxConcurrent = next.maxConcurrent;
+    const maxQueue = next.maxQueue;
+    const nextTokenBudget = next.tokenBudget;
+
+    if (!Number.isSafeInteger(revision) || revision < 0) {
+      throw new Error("limits.revision must be a non-negative safe integer");
+    }
+    if (revision <= currentRevision) {
+      return {
+        applied: false,
+        reason: "stale_revision",
+        current: limits(),
+      };
+    }
+
+    assertNonNegativeInteger(maxConcurrent, "limits.maxConcurrent");
+    assertNonNegativeInteger(maxQueue, "limits.maxQueue");
+
+    let nextBudget: number | undefined;
+    let nextHighPriorityReserve: number | undefined;
+    if (budget) {
+      if (nextTokenBudget === undefined) {
+        throw new Error(
+          "limits.tokenBudget is required because tokenBudget was configured at construction",
+        );
+      }
+      nextBudget = nextTokenBudget.budget;
+      nextHighPriorityReserve = nextTokenBudget.highPriorityReserve;
+      assertNonNegativeInteger(nextBudget, "limits.tokenBudget.budget");
+      assertNonNegativeInteger(
+        nextHighPriorityReserve,
+        "limits.tokenBudget.highPriorityReserve",
+      );
+    } else if (nextTokenBudget !== undefined) {
+      throw new Error(
+        "limits.tokenBudget must be omitted because tokenBudget was not configured at construction",
+      );
+    }
+
+    const previous = limits();
+
+    // Install every LLM-layer value before pumping the concurrency queue.
+    // Promise continuations from admitted waiters run only after this
+    // synchronous operation returns, so they observe one coherent revision.
+    currentRevision = revision;
+    if (budget) {
+      currentBudget = nextBudget!;
+      currentHighPriorityReserve = nextHighPriorityReserve!;
+    }
+    bulkhead.applyLimits({ maxConcurrent, maxQueue });
+
+    const current = limits();
+    emit("reconfigure", { previous, current });
+    return { applied: true, previous, current };
+  }
+
+  /**
+   * Backward-compatible budget-only setter.
    *
-   * - **Raising takes effect immediately.** The very next admission check
-   *   reads the new ceiling via `effectiveBudget()` — no caching to
-   *   invalidate, no in-flight work touched.
-   * - **Lowering below `inFlightTokens` is legal — shrink by attrition.**
-   *   No in-flight work is revoked or cancelled. New admissions reject
-   *   with `"budget_limit"` until enough in-flight work releases to bring
-   *   `inFlightTokens` back under the new ceiling. This mirrors the
-   *   library's existing overrun tolerance (`inFlightTokens` can already
-   *   exceed `budget` via `reportUsage()` overrun) — over-budget in-flight
-   *   state is an established, intentional condition, not an invariant
-   *   violation.
-   * - **Throws if `tokenBudget` was never configured.** An explicit error
-   *   beats a silent no-op — there is no budget ceiling to adjust.
-   * - **Validation:** `tokens` must be a non-negative integer.
+   * This is implemented as a complete local reconfiguration at
+   * `currentRevision + 1`. Externally managed deployments should use
+   * `applyLimits()` exclusively so one authority owns the revision stream.
    */
   function setBudget(tokens: number): void {
     if (!budget) {
@@ -473,7 +553,19 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       );
     }
     assertNonNegativeInteger(tokens, "tokens");
-    currentBudget = tokens;
+    if (currentRevision >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("cannot advance admission-limit revision beyond MAX_SAFE_INTEGER");
+    }
+    const current = limits();
+    applyLimits({
+      revision: currentRevision + 1,
+      maxConcurrent: current.maxConcurrent,
+      maxQueue: current.maxQueue,
+      tokenBudget: {
+        budget: tokens,
+        highPriorityReserve: currentHighPriorityReserve,
+      },
+    });
   }
 
 
@@ -1227,6 +1319,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
   function stats(): LLMStats {
     const base = bulkhead.stats();
     const result: LLMStats = {
+      limits: limits(),
       bulkhead: base,
       llm: {
         admitted: llmAdmitted,
@@ -1245,7 +1338,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         totalConsumed,
         totalRefunded,
         totalOverrun,
-        highPriorityReserve,
+        highPriorityReserve: currentHighPriorityReserve,
       };
     }
 
@@ -1353,6 +1446,8 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     run,
     wouldAdmit,
     stats,
+    limits,
+    applyLimits,
     setBudget,
     close,
     drain,
