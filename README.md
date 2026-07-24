@@ -134,6 +134,32 @@ const result = await bulkhead.run(request, async () => {
 
 ---
 
+## What's New in v3.11.1 — Security and package integrity patch
+
+v3.11.1 is the supported patch release for the v3.11 admission-provenance
+changes. It preserves the v3.11 runtime API and behavior while fixing the
+release artifact and development dependency audit issues.
+
+### Highlights
+
+- **Security maintenance:** the development lockfile now resolves
+  `brace-expansion` 5.0.8 through the ESLint/minimatch toolchain, clearing the
+  reported high-severity audit finding. This package is not part of the
+  published runtime dependency graph.
+- **Immutable replacement for v3.11.0:** publish and install v3.11.1 instead of
+  retrying the conflicting v3.11.0 tarball whose registry metadata and served
+  bytes produced an `EINTEGRITY` failure.
+- **Corrected strict snapshot test:** the admit-capacity assertion now includes
+  `limitRevision: 0`, matching the additive v3.11 event shape.
+- **No runtime migration:** code already written for v3.11.0 requires no API
+  changes. All admission-linearized revision behavior remains the same.
+
+```bash
+npm install async-bulkhead-llm@3.11.1
+```
+
+---
+
 ## What's New in v3.11 — Admission-linearized limit revisions
 
 v3.11 makes every capacity decision traceable to the exact immutable limit
@@ -1385,6 +1411,13 @@ type LLMRejectReason =
 ---
 
 ## Migration
+
+### v3.11.0 → v3.11.1
+
+No code changes are required. Update the dependency to v3.11.1 and regenerate
+your lockfile. The patch keeps the v3.11 API unchanged, replaces the conflicting
+v3.11.0 package artifact, updates the development dependency lockfile, and
+corrects the strict capacity-snapshot test expectation.
 
 ### v3.10 → v3.11
 

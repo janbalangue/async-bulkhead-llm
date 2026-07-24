@@ -7,6 +7,24 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.11.1] - 2026-07-24
+
+### Security
+
+* Refreshed the development dependency lockfile so the ESLint/minimatch toolchain
+  uses `brace-expansion` 5.0.8, resolving the reported high-severity audit
+  finding. This dependency is development-only; the runtime dependency graph is
+  unchanged.
+
+### Fixed
+
+* Published the finalized v3.11 contents under a new immutable package version
+  after the v3.11.0 registry tarball produced an integrity mismatch. Consumers
+  should install v3.11.1 rather than retrying the conflicting v3.11.0 artifact.
+
+* Updated the strict admit-capacity snapshot test to include the additive
+  `limitRevision: 0` field introduced in v3.11.
+
 ## [3.11.0] - 2026-07-24
 
 ### Added
