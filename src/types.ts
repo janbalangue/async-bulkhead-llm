@@ -236,6 +236,8 @@ export type LLMRunAdmission = "admitted" | "bypassed";
  * no honest ETA for capacity. Expose these numbers instead.
  */
 export type LLMRejectDetail = {
+  /** Limit revision captured with this capacity decision. */
+  limitRevision: number;
   inFlight: number;
   maxConcurrent: number;
   pending: number;
@@ -406,6 +408,7 @@ export type LLMEventMap = {
   admit: {
     request: LLMRequest;
     admissionId: string;
+    limitRevision: number;
     priority: LLMPriority;
     reservedTokens: number;
   };
@@ -413,6 +416,8 @@ export type LLMEventMap = {
   reject: {
     request: LLMRequest;
     reason: LLMRejectReason;
+    /** Limit revision captured with the rejection decision. */
+    limitRevision: number;
     /** Capacity snapshot; absent for dedup-wait rejections. */
     detail?: LLMRejectDetail;
   };
@@ -435,6 +440,7 @@ export type LLMEventMap = {
   release: {
     request: LLMRequest;
     admissionId: string;
+    limitRevision: number;
     priority: LLMPriority;
     reservedTokens: number;
     /** Tokens held immediately before release returned them. */
@@ -455,6 +461,7 @@ export type LLMEventMap = {
   usage: {
     request: LLMRequest;
     admissionId: string;
+    limitRevision: number;
     priority: LLMPriority;
     sequence: number;
     reservedTokens: number;
@@ -474,6 +481,7 @@ export type LLMEventMap = {
   bypass: {
     request: LLMRequest;
     admissionId: string;
+    limitRevision: number;
     priority: LLMPriority;
     reason: LLMShadowableRejectReason;
     detail?: LLMRejectDetail;
@@ -485,6 +493,7 @@ export type LLMEventMap = {
   bypassUsage: {
     request: LLMRequest;
     admissionId: string;
+    limitRevision: number;
     priority: LLMPriority;
     reason: LLMShadowableRejectReason;
     sequence: number;
@@ -498,6 +507,7 @@ export type LLMEventMap = {
   bypassRelease: {
     request: LLMRequest;
     admissionId: string;
+    limitRevision: number;
     priority: LLMPriority;
     reason: LLMShadowableRejectReason;
     reservation: LLMReservationEstimate | null;
@@ -709,6 +719,8 @@ export type LLMBulkheadOptions = {
 export type UsageReport = {
   /** Stable identifier of the admission this usage belongs to. */
   admissionId: string;
+  /** Immutable limit revision captured when this work was admitted or bypassed. */
+  limitRevision: number;
   /**
    * Last effective usage-update sequence for this admission.
    * Starts at 0 before any effective report, increments only when either
@@ -733,6 +745,8 @@ export type UsageReport = {
 export type LLMRunContext = {
   /** Stable identifier for this execution. Bypasses use a `shadow-` prefix. */
   readonly admissionId: string;
+  /** Immutable limit revision associated with this admission or bypass decision. */
+  readonly limitRevision: number;
   /** Exact reservation evaluated for this call, or `null` without a budget. */
   readonly reservation: LLMReservationEstimate | null;
   /** Whether the callback holds real bulkhead capacity. */
@@ -790,6 +804,8 @@ export type LLMRunOptions<T> = LLMAcquireOptions & {
 export type LLMToken = {
   /** Stable identifier for this successful admission. */
   readonly admissionId: string;
+  /** Immutable limit revision captured at successful admission. */
+  readonly limitRevision: number;
   /** Exact reservation used at admission, or `null` without a token budget. */
   readonly reservation: LLMReservationEstimate | null;
   release(usage?: TokenUsage): void;
@@ -800,6 +816,7 @@ export type LLMAcquireResult =
   | {
       ok: true;
       admissionId: string;
+      limitRevision: number;
       reservation: LLMReservationEstimate | null;
       token: LLMToken;
     }

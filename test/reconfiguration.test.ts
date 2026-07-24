@@ -153,6 +153,49 @@ describe("atomic versioned admission-limit reconfiguration", () => {
     first.token.release();
   });
 
+  it("pins the exact revision to admitted work before listeners can reconfigure", async () => {
+    const b = budgeted();
+    const admitted: LLMEventMap["admit"][] = [];
+    const usage: LLMEventMap["usage"][] = [];
+    const released: LLMEventMap["release"][] = [];
+
+    b.on("admit", (event) => {
+      admitted.push(event);
+      const applied = b.applyLimits({
+        revision: 8,
+        maxConcurrent: 2,
+        maxQueue: 0,
+        tokenBudget: { budget: 2_000, highPriorityReserve: 0 },
+      });
+      expect(applied.applied).toBe(true);
+    });
+    b.on("usage", (event) => usage.push(event));
+    b.on("release", (event) => released.push(event));
+
+    let callbackRevision: number | undefined;
+    await b.run(request, async (_signal, context) => {
+      expect(context).toBeDefined();
+      callbackRevision = context?.limitRevision;
+      context?.reportUsage({ input: 80, output: 20 });
+      return "ok";
+    });
+
+    expect(b.limits().revision).toBe(8);
+    expect(callbackRevision).toBe(7);
+    expect(admitted).toHaveLength(1);
+    expect(admitted[0]?.limitRevision).toBe(7);
+    expect(usage[0]?.limitRevision).toBe(7);
+    expect(released[0]?.limitRevision).toBe(7);
+
+    const next = await b.acquire(request);
+    expect(next.ok).toBe(true);
+    if (next.ok) {
+      expect(next.limitRevision).toBe(8);
+      expect(next.token.limitRevision).toBe(8);
+      next.token.release();
+    }
+  });
+
   it("shrinks concurrency by attrition without revoking in-flight work", async () => {
     const b = createLLMBulkhead({
       model: "gpt-4o",

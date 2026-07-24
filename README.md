@@ -10,6 +10,7 @@ Designed for services that need to enforce **cost ceilings, concurrency limits, 
 
 - ✅ Hard **max in-flight** concurrency (`maxConcurrent`)
 - ✅ **Atomic versioned limit updates** — apply concurrency, queue, token budget, and priority reserve as one revisioned snapshot
+- ✅ **Admission-linearized revisions** — every admitted or bypassed lifecycle retains the exact limit revision that made the decision
 - ✅ **Token-aware admission** — reserves against estimated input + max output tokens
 - ✅ **Token refund** — reclaim unused budget capacity from actual usage post-completion
 - ✅ **Model-aware estimation** — per-model character ratios for known providers
@@ -130,6 +131,60 @@ const result = await bulkhead.run(request, async () => {
   return callYourLLMProvider(request);
 });
 ```
+
+---
+
+## What's New in v3.11 — Admission-linearized limit revisions
+
+v3.11 makes every capacity decision traceable to the exact immutable limit
+revision that produced it. The revision is captured at the admission or
+rejection decision itself, so a concurrent reconfiguration cannot relabel work
+that was evaluated under an earlier snapshot.
+
+### Highlights
+
+- **Exact admission provenance:** successful `acquire()` results, `LLMToken`,
+  and `LLMRunContext` expose `limitRevision`.
+- **Lifecycle consistency:** `admit`, `usage`, `release`, `bypass`,
+  `bypassUsage`, and `bypassRelease` events retain that same revision for the
+  full lifetime of the execution.
+- **Revisioned rejection snapshots:** `LLMRejectDetail.limitRevision` records
+  the snapshot used for a capacity rejection, while every `reject` event also
+  includes a top-level `limitRevision`.
+- **Race-safe reporting:** gateways no longer need to call `limits()` after
+  admission, which could observe a newer revision than the one that actually
+  authorized the request.
+- **Additive API change:** existing call sites continue to work. Tests or
+  consumers that assert exact event or detail object shapes must include the
+  new `limitRevision` field.
+
+```ts
+const acquired = await bulkhead.acquire(request);
+
+if (acquired.ok) {
+  console.log(acquired.admissionId);
+  console.log(acquired.limitRevision);
+  console.log(acquired.token.limitRevision); // same immutable revision
+  acquired.token.release();
+}
+
+await bulkhead.run(request, async (_signal, ctx) => {
+  auditLog({
+    admissionId: ctx?.admissionId,
+    limitRevision: ctx?.limitRevision,
+  });
+
+  return callYourLLMProvider(request);
+});
+
+bulkhead.on('reject', ({ reason, limitRevision, detail }) => {
+  auditLog({ reason, limitRevision, capacity: detail });
+});
+```
+
+The revision identifies the library limit snapshot, not an external control
+plane grant by itself. A gateway can associate that revision with its own
+immutable grant metadata to provide end-to-end admission provenance.
 
 ---
 
@@ -802,6 +857,10 @@ Semantics:
 * **Budget feature shape is fixed at construction.** A bulkhead created with
   `tokenBudget` requires `tokenBudget` in every update. A bulkhead created
   without it must omit that field; estimator policy is not hot-swapped.
+* **Admission provenance is immutable.** `acquire()` results, tokens,
+  `LLMRunContext`, usage reports, and lifecycle events retain the revision
+  captured when the slot and token reservation were successfully acquired.
+  A later `applyLimits()` call cannot relabel already admitted work.
 
 ```ts
 const current = bulkhead.limits();
@@ -1085,13 +1144,13 @@ off();
 
 | Event     | Payload |
 |-----------|---------|
-| `admit`   | `{ request, admissionId, priority, reservedTokens }` |
-| `reject`  | `{ request, reason, detail? }` |
-| `usage`   | `{ request, admissionId, priority, sequence, reservedTokens, previousHeldTokens, heldTokens, deltaTokens, usage, outputCap, outputRemaining, overReservation }` |
-| `release` | `{ request, admissionId, priority, reservedTokens, heldTokens, refundedTokens, usageSequence, usage? }` |
-| `bypass` | `{ request, admissionId, priority, reason, detail?, reservation, raced }` |
-| `bypassUsage` | `{ request, admissionId, priority, reason, sequence, reservation, usage, outputCap, outputRemaining, overReservation }` |
-| `bypassRelease` | `{ request, admissionId, priority, reason, reservation, usageSequence, usage? }` |
+| `admit`   | `{ request, admissionId, limitRevision, priority, reservedTokens }` |
+| `reject`  | `{ request, reason, limitRevision, detail? }` |
+| `usage`   | `{ request, admissionId, limitRevision, priority, sequence, reservedTokens, previousHeldTokens, heldTokens, deltaTokens, usage, outputCap, outputRemaining, overReservation }` |
+| `release` | `{ request, admissionId, limitRevision, priority, reservedTokens, heldTokens, refundedTokens, usageSequence, usage? }` |
+| `bypass` | `{ request, admissionId, limitRevision, priority, reason, detail?, reservation, raced }` |
+| `bypassUsage` | `{ request, admissionId, limitRevision, priority, reason, sequence, reservation, usage, outputCap, outputRemaining, overReservation }` |
+| `bypassRelease` | `{ request, admissionId, limitRevision, priority, reason, reservation, usageSequence, usage? }` |
 | `reconfigure` | `{ previous, current }` |
 | `dedup`   | `{ request }` |
 
@@ -1163,7 +1222,9 @@ run<T>(
 ): Promise<T>
 ```
 
-`ctx.admissionId` is the stable execution identifier. In observe-mode
+`ctx.admissionId` is the stable execution identifier and
+`ctx.limitRevision` is the immutable revision associated with the admission
+or bypass decision. In observe-mode
 bypasses it uses a `shadow-` prefix. `ctx.reservation` is the exact evaluated
 reservation (or `null` when token budgeting is disabled),
 `ctx.admission` distinguishes `"admitted"` from `"bypassed"`, and
@@ -1202,13 +1263,15 @@ type LLMAcquireResult =
   | {
       ok: true;
       admissionId: string;
+      limitRevision: number;
       reservation: LLMReservationEstimate | null;
       token: LLMToken;
     }
-  | { ok: false; reason: LLMRejectReason };
+  | { ok: false; reason: LLMRejectReason; detail?: LLMRejectDetail };
 
 type LLMToken = {
   readonly admissionId: string;
+  readonly limitRevision: number;
   readonly reservation: LLMReservationEstimate | null;
   reportUsage(usage: TokenUsage): UsageReport;
   release(usage?: TokenUsage): void;
@@ -1299,6 +1362,7 @@ type TokenEstimator = (request: LLMRequest) => TokenEstimate;
 type TokenUsage     = { input: number; output: number };
 type UsageReport = {
   admissionId: string;
+  limitRevision: number;
   sequence: number;
   reserved: number;
   held: number;
@@ -1321,6 +1385,15 @@ type LLMRejectReason =
 ---
 
 ## Migration
+
+### v3.10 → v3.11
+
+No admission call-site changes are required. Successful acquire results,
+admission tokens, run contexts, usage reports, lifecycle events, and rejection
+capacity details gain `limitRevision`. Code that uses exact deep equality on
+these objects must add the field. Gateways should read the captured revision
+from the result, token, context, event, or rejection detail instead of calling
+`limits()` after the decision.
 
 ### v3.9 → v3.10
 

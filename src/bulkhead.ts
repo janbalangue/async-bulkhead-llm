@@ -392,6 +392,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
   ): LLMRejectDetail {
     const base = bulkhead.stats();
     const detail: LLMRejectDetail = {
+      limitRevision: currentRevision,
       inFlight: base.inFlight,
       pending: base.pending,
       maxConcurrent: base.maxConcurrent,
@@ -588,7 +589,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     >,
   ): LLMBulkheadRejectedError {
     noteLLMReject(reason);
-    emit("reject", { request, reason });
+    emit("reject", { request, reason, limitRevision: currentRevision });
     const error = new LLMBulkheadRejectedError(reason);
     dedupWaitErrors.add(error);
     return error;
@@ -707,6 +708,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     parts: ReservationParts | null,
     request: LLMRequest,
     admissionId: string,
+    limitRevision: number,
     priority: LLMPriority,
   ): LLMToken {
     let released = false;
@@ -726,6 +728,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       const outputCap = parts ? parts.maxOutput : null;
       return {
         admissionId,
+        limitRevision,
         sequence: usageSequence,
         reserved: parts?.reserved ?? 0,
         held,
@@ -785,6 +788,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         emit("usage", {
           request,
           admissionId,
+          limitRevision,
           priority,
           sequence: usageSequence,
           reservedTokens: parts?.reserved ?? 0,
@@ -803,6 +807,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
 
     return {
       admissionId,
+      limitRevision,
       reservation,
       reportUsage,
       release(usage?: TokenUsage) {
@@ -838,6 +843,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
           emit("release", {
             request,
             admissionId,
+            limitRevision,
             priority,
             reservedTokens: parts?.reserved ?? 0,
             heldTokens: heldAtRelease,
@@ -864,7 +870,12 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     const rejectWith = (reason: LLMRejectReason): LLMAcquireResult => {
       const detail = buildRejectDetail(reserved, priority);
       noteLLMReject(reason);
-      emit("reject", { request, reason, detail });
+      emit("reject", {
+        request,
+        reason,
+        limitRevision: detail.limitRevision,
+        detail,
+      });
       return { ok: false, reason, detail };
     };
 
@@ -887,13 +898,32 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       return rejectWith("budget_limit");
     }
 
+    // Capture the revision at the admission linearization point: both the
+    // concurrency slot and token reservation are held, and no listener or
+    // callback has run yet. Later reconfiguration must not rewrite the
+    // provenance of this admitted work.
+    const limitRevision = currentRevision;
     const admissionId = randomUUID();
-    const token = wrapToken(r.token, parts, request, admissionId, priority);
+    const token = wrapToken(
+      r.token,
+      parts,
+      request,
+      admissionId,
+      limitRevision,
+      priority,
+    );
     noteLLMAdmit();
-    emit("admit", { request, admissionId, priority, reservedTokens: reserved });
+    emit("admit", {
+      request,
+      admissionId,
+      limitRevision,
+      priority,
+      reservedTokens: reserved,
+    });
     return {
       ok: true,
       admissionId,
+      limitRevision,
       reservation: token.reservation,
       token,
     };
@@ -967,6 +997,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     admission: ResolvedAdmission,
     reason: LLMShadowableRejectReason,
     detail: LLMRejectDetail | undefined,
+    limitRevision: number,
     raced: boolean,
   ): Promise<T> {
     const hardReason: Extract<LLMRejectReason, "aborted" | "shutdown"> | undefined =
@@ -981,7 +1012,12 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         admission.priority,
       );
       noteLLMReject(hardReason);
-      emit("reject", { request, reason: hardReason, detail: hardDetail });
+      emit("reject", {
+        request,
+        reason: hardReason,
+        limitRevision: hardDetail.limitRevision,
+        detail: hardDetail,
+      });
       throw new LLMBulkheadRejectedError(hardReason, hardDetail);
     }
 
@@ -1002,6 +1038,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     emit("bypass", {
       request,
       admissionId,
+      limitRevision,
       priority: admission.priority,
       reason,
       ...(detail !== undefined && { detail }),
@@ -1014,6 +1051,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       const outputCap = admission.parts?.maxOutput ?? null;
       return {
         admissionId,
+        limitRevision,
         sequence: usageSequence,
         reserved: admission.reserved,
         held: 0,
@@ -1047,6 +1085,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         emit("bypassUsage", {
           request,
           admissionId,
+          limitRevision,
           priority: admission.priority,
           reason,
           sequence: usageSequence,
@@ -1062,6 +1101,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
 
     const context: LLMRunContext = {
       admissionId,
+      limitRevision,
       reservation,
       admission: "bypassed",
       bypassReason: reason,
@@ -1080,6 +1120,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       emit("bypassRelease", {
         request,
         admissionId,
+        limitRevision,
         priority: admission.priority,
         reason,
         reservation,
@@ -1192,6 +1233,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
               resolveAdmission(request, acquireOpts),
               error.reason,
               error.detail,
+              error.detail?.limitRevision ?? currentRevision,
               false,
             );
           }
@@ -1247,6 +1289,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
               resolved,
               advisory.reason,
               advisory.detail,
+              advisory.detail?.limitRevision ?? currentRevision,
               false,
             ),
           );
@@ -1267,6 +1310,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
               resolved ?? resolveAdmission(request, acquireOpts),
               r.reason,
               r.detail,
+              r.detail?.limitRevision ?? currentRevision,
               advisory?.admit === true,
             ),
           );
@@ -1276,6 +1320,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
 
       const ctx: LLMRunContext = {
         admissionId: r.admissionId,
+        limitRevision: r.limitRevision,
         reservation: r.reservation,
         admission: "admitted",
         reportUsage: (usage) => r.token.reportUsage(usage),

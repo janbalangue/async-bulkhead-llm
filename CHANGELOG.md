@@ -7,6 +7,27 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.11.0] - 2026-07-24
+
+### Added
+
+* **Admission-linearized limit revisions.** Successful `acquire()` results,
+  `LLMToken`, `LLMRunContext`, `UsageReport`, and admitted/bypassed lifecycle
+  events now carry an immutable `limitRevision` captured after both the
+  concurrency slot and token reservation are held.
+
+* **Revisioned rejection snapshots.** `LLMRejectDetail.limitRevision` and the
+  `reject` event identify the exact limit snapshot used for the capacity
+  decision, allowing gateways to report authoritative revisions without a
+  later `limits()` lookup.
+
+### Fixed
+
+* A synchronous `admit` listener can apply a newer limit snapshot before the
+  `run()` callback starts. The callback, usage events, and release event now
+  retain the original admission revision instead of being relabeled with the
+  newer configuration.
+
 ## [3.10.0] - 2026-07-23
 
 ### Added

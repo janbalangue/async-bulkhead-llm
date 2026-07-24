@@ -183,6 +183,7 @@ describe("wouldAdmit — opt-in capacity detail (v3.8)", () => {
     expect(result.admit).toBe(true);
     expect(result.reason).toBeUndefined();
     expect(result.detail).toEqual({
+      limitRevision: 0,
       inFlight: 0,
       pending: 0,
       maxConcurrent: 3,
