@@ -37,7 +37,6 @@ import { createModelAwareTokenEstimator } from "./estimators.js";
 import {
   assertNonNegativeInteger,
   assertOptionalNonNegativeInteger,
-  assertPositiveInteger,
   validateTokenEstimate,
   validateTokenUsage,
 } from "./validation.js";
@@ -78,7 +77,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
   if (typeof opts.model !== "string" || opts.model.trim() === "") {
     throw new Error("model must be a non-empty string");
   }
-  assertPositiveInteger(opts.maxConcurrent, "maxConcurrent");
+  assertNonNegativeInteger(opts.maxConcurrent, "maxConcurrent");
   const initialRevision = opts.initialRevision ?? 0;
   if (!Number.isSafeInteger(initialRevision) || initialRevision < 0) {
     throw new Error("initialRevision must be a non-negative safe integer");

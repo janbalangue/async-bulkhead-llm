@@ -7,6 +7,16 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.12.0] - 2026-07-26
+
+### Added
+
+* **Fail-closed construction.** `createLLMBulkhead()` now accepts
+  `maxConcurrent: 0`, allowing gateways to start with no admission capacity and
+  remain closed until an external control plane installs a higher-revision
+  snapshot. Runtime zero-capacity behavior is unchanged: new work is rejected
+  with `concurrency_limit`, while later expansion begins admitting immediately.
+
 ## [3.11.1] - 2026-07-24
 
 ### Security

@@ -382,10 +382,7 @@ describe("createLLMBulkhead validation", () => {
     );
   });
 
-  it("throws if maxConcurrent is not a positive integer", () => {
-    expect(() =>
-      createLLMBulkhead({ model: "gpt-4o", maxConcurrent: 0 }),
-    ).toThrow("maxConcurrent");
+  it("throws if maxConcurrent is not a non-negative integer", () => {
     expect(() =>
       createLLMBulkhead({ model: "gpt-4o", maxConcurrent: -1 }),
     ).toThrow("maxConcurrent");

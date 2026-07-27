@@ -662,7 +662,10 @@ export type LLMBulkheadOptions = {
    */
   model: string;
 
-  /** Maximum number of requests in-flight simultaneously. */
+  /**
+   * Maximum number of requests in-flight simultaneously. Set to `0` to
+   * start fail-closed until a higher-revision limit snapshot enables work.
+   */
   maxConcurrent: number;
 
   /**

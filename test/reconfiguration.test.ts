@@ -31,6 +31,33 @@ function budgeted() {
 }
 
 describe("atomic versioned admission-limit reconfiguration", () => {
+  it("supports fail-closed construction and later activation", async () => {
+    const b = createLLMBulkhead({
+      model: "gpt-4o",
+      maxConcurrent: 0,
+      maxQueue: 0,
+      initialRevision: 0,
+    });
+
+    await expect(b.acquire(request)).resolves.toMatchObject({
+      ok: false,
+      reason: "concurrency_limit",
+    });
+    expect(b.limits()).toEqual({
+      revision: 0,
+      maxConcurrent: 0,
+      maxQueue: 0,
+    });
+
+    expect(
+      b.applyLimits({ revision: 1, maxConcurrent: 1, maxQueue: 0 }),
+    ).toMatchObject({ applied: true });
+
+    const admitted = await b.acquire(request);
+    expect(admitted.ok).toBe(true);
+    if (admitted.ok) admitted.token.release();
+  });
+
   it("exposes the initial complete snapshot", () => {
     const b = budgeted();
 

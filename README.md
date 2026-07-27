@@ -134,6 +134,33 @@ const result = await bulkhead.run(request, async () => {
 
 ---
 
+## What's New in v3.12 — Fail-closed startup
+
+v3.12 allows `maxConcurrent: 0` at construction time. A gateway managed by an
+external control plane can now open its listener and health endpoint without
+admitting requests before its first valid grant arrives.
+
+```ts
+const bulkhead = createLLMBulkhead({
+  model: "gpt-4o",
+  maxConcurrent: 0,
+  maxQueue: 0,
+  initialRevision: 0,
+});
+
+// Later, after a validated control-plane grant:
+bulkhead.applyLimits({
+  revision: 1,
+  maxConcurrent: 8,
+  maxQueue: 0,
+});
+```
+
+A zero-capacity instance rejects new work with `concurrency_limit`; it does not
+queue work unless `maxQueue` is explicitly greater than zero.
+
+---
+
 ## What's New in v3.11.1 — Security and package integrity patch
 
 v3.11.1 is the supported patch release for the v3.11 admission-provenance
