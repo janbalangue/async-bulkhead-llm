@@ -46,6 +46,7 @@ export type {
   LLMToken,
   LLMWouldAdmitResult,
   OpaqueContentBlock,
+  ProgressiveReconciliationOptions,
   TextContentBlock,
   TokenBudgetOptions,
   TokenEstimate,

@@ -550,3 +550,81 @@ describe("setBudget — runtime budget mutation", () => {
 });
 
 
+
+describe("reportUsage — progressive reservation reconciliation", () => {
+  it("releases processed input and generated output while retaining future headroom", async () => {
+    const b = makeBulkhead(2_000);
+    const r1 = await b.acquire(req("progressive"));
+    expect(r1.ok).toBe(true);
+    if (!r1.ok) return;
+
+    const first = r1.token.reportUsage(
+      { input: 20, output: 100 },
+      { remainingOutputTokens: 900, safetyMarginTokens: 50 },
+    );
+    expect(first.held).toBe(950);
+    expect(first.consumed).toBe(120);
+    expect(b.stats().tokenBudget!.totalRefunded).toBe(150);
+
+    const second = r1.token.reportUsage(
+      { input: 20, output: 400 },
+      { remainingOutputTokens: 600, safetyMarginTokens: 50 },
+    );
+    expect(second.held).toBe(650);
+    expect(second.sequence).toBe(2);
+    expect(b.stats().tokenBudget!.totalRefunded).toBe(450);
+
+    // Earlier release makes room for another standard 1,100-token request.
+    const r2 = await b.acquire(req("follower"));
+    expect(r2.ok).toBe(true);
+    if (r2.ok) r2.token.release({ input: 100, output: 100 });
+
+    r1.token.release({ input: 20, output: 400 });
+    expect(b.stats().tokenBudget!.inFlightTokens).toBe(0);
+  });
+
+  it("retains an explicit safety margin at output completion", async () => {
+    const b = makeBulkhead(5_000);
+    const r = await b.acquire(req());
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+
+    const snap = r.token.reportUsage(
+      { input: 100, output: 1_000 },
+      { remainingOutputTokens: 0, safetyMarginTokens: 128 },
+    );
+    expect(snap.held).toBe(128);
+    expect(snap.outputRemaining).toBe(0);
+    r.token.release({ input: 100, output: 1_000 });
+  });
+
+  it("adds output overrun back on top of the progressive hold", async () => {
+    const b = makeBulkhead(5_000);
+    const r = await b.acquire(req());
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+
+    const snap = r.token.reportUsage(
+      { input: 100, output: 1_200 },
+      { remainingOutputTokens: 0, safetyMarginTokens: 100 },
+    );
+    expect(snap.held).toBe(300);
+    expect(snap.overReservation).toBe(true);
+    r.token.release({ input: 100, output: 1_200 });
+  });
+
+  it("rejects a remaining-output declaration above the reserved cap", async () => {
+    const b = makeBulkhead(5_000);
+    const r = await b.acquire(req());
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+
+    expect(() =>
+      r.token.reportUsage(
+        { input: 100, output: 0 },
+        { remainingOutputTokens: 1_001 },
+      ),
+    ).toThrow(/must not exceed the reserved output cap/);
+    r.token.release();
+  });
+});

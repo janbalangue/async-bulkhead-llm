@@ -7,6 +7,18 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.13.0] - 2026-08-01
+
+### Added
+
+* **Progressive reservation reconciliation.** `reportUsage()` accepts an
+  optional `remainingOutputTokens` plus `safetyMarginTokens` declaration.
+  Gateways can release processed input and already-generated output capacity
+  during a live stream while retaining explicit future-output headroom.
+* Progressive updates retain cumulative-usage monotonicity, preserve output
+  overrun protection, emit sequence-numbered usage events, and remain no-op
+  accounting in observe-mode bypasses.
+
 ## [3.12.0] - 2026-07-26
 
 ### Added

@@ -12,6 +12,7 @@ Designed for services that need to enforce **cost ceilings, concurrency limits, 
 - ✅ **Atomic versioned limit updates** — apply concurrency, queue, token budget, and priority reserve as one revisioned snapshot
 - ✅ **Admission-linearized revisions** — every admitted or bypassed lifecycle retains the exact limit revision that made the decision
 - ✅ **Token-aware admission** — reserves against estimated input + max output tokens
+- ✅ **Progressive reconciliation** — release processed input and generated-output reservation during live streams
 - ✅ **Token refund** — reclaim unused budget capacity from actual usage post-completion
 - ✅ **Model-aware estimation** — per-model character ratios for known providers
 - ✅ **Per-request model** — mixed-model routing through a single bulkhead
@@ -556,6 +557,40 @@ await distributedLedger.setHold({
   heldTokens: report.held,
 });
 ```
+
+---
+
+## What's New in v3.13 — Progressive reconciliation
+
+Gateways that receive cumulative streaming usage may opt into shrinking the
+active hold before request completion:
+
+```ts
+const report = ctx!.reportUsage(
+  { input: actualInput, output: cumulativeOutput },
+  {
+    remainingOutputTokens: Math.max(0, maxOutput - cumulativeOutput),
+    safetyMarginTokens: 128,
+  },
+);
+```
+
+The progressive hold is:
+
+```text
+remainingOutputTokens + safetyMarginTokens + output overrun
+```
+
+This lets processed input and already-generated output stop occupying the
+in-flight budget. The caller must use the option only after prefill is known to
+be complete and must derive `remainingOutputTokens` from an authoritative
+provider output cap. Omitting the second argument preserves the legacy behavior
+of retaining the full output reservation until release. Final `release()`
+settlement remains authoritative.
+
+Progressive updates share the existing sequence-numbered `usage` event. Events
+include `progressive`, `remainingOutputTokens`, and `safetyMarginTokens` when the
+new mode is used.
 
 ---
 
@@ -1326,7 +1361,13 @@ type LLMToken = {
   readonly admissionId: string;
   readonly limitRevision: number;
   readonly reservation: LLMReservationEstimate | null;
-  reportUsage(usage: TokenUsage): UsageReport;
+  reportUsage(
+    usage: TokenUsage,
+    reconciliation?: {
+      remainingOutputTokens: number;
+      safetyMarginTokens?: number;
+    },
+  ): UsageReport;
   release(usage?: TokenUsage): void;
 };
 ```

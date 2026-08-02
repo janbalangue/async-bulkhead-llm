@@ -472,6 +472,9 @@ export type LLMEventMap = {
     outputCap: number | null;
     outputRemaining: number | null;
     overReservation: boolean;
+    progressive?: true;
+    remainingOutputTokens?: number;
+    safetyMarginTokens?: number;
   };
   /**
    * Fired when observe mode executes a callback without holding capacity.
@@ -502,6 +505,9 @@ export type LLMEventMap = {
     outputCap: number | null;
     outputRemaining: number | null;
     overReservation: boolean;
+    progressive?: true;
+    remainingOutputTokens?: number;
+    safetyMarginTokens?: number;
   };
   /** Fired when bypassed work settles, whether successfully or by throwing. */
   bypassRelease: {
@@ -719,6 +725,20 @@ export type LLMBulkheadOptions = {
  * `outputCap` / `outputRemaining` are `null` when `tokenBudget` is not
  * configured (there is no reservation to measure against).
  */
+
+/**
+ * Optional progressive reconciliation applied alongside cumulative usage.
+ *
+ * Use only after the caller knows prefill/input processing has completed.
+ * `remainingOutputTokens` represents the maximum future output still expected
+ * for this active request. `safetyMarginTokens` retains extra headroom until
+ * final release. Both values are non-negative safe integers.
+ */
+export type ProgressiveReconciliationOptions = {
+  remainingOutputTokens: number;
+  safetyMarginTokens?: number;
+};
+
 export type UsageReport = {
   /** Stable identifier of the admission this usage belongs to. */
   admissionId: string;
@@ -726,8 +746,8 @@ export type UsageReport = {
   limitRevision: number;
   /**
    * Last effective usage-update sequence for this admission.
-   * Starts at 0 before any effective report, increments only when either
-   * cumulative usage field increases, and remains stable for stale reports.
+   * Starts at 0 before any effective report, increments when cumulative usage increases or the effective held-token
+   * amount changes, and remains stable for stale/no-op reports.
    */
   sequence: number;
   /** Original pre-admission reservation (0 when budget disabled). */
@@ -758,7 +778,10 @@ export type LLMRunContext = {
   readonly bypassReason?: LLMShadowableRejectReason;
   /** Capacity snapshot associated with the bypass decision, when available. */
   readonly bypassDetail?: LLMRejectDetail;
-  reportUsage(usage: TokenUsage): UsageReport;
+  reportUsage(
+    usage: TokenUsage,
+    reconciliation?: ProgressiveReconciliationOptions,
+  ): UsageReport;
 };
 
 /** Options accepted by `run()`. */
@@ -812,7 +835,10 @@ export type LLMToken = {
   /** Exact reservation used at admission, or `null` without a token budget. */
   readonly reservation: LLMReservationEstimate | null;
   release(usage?: TokenUsage): void;
-  reportUsage(usage: TokenUsage): UsageReport;
+  reportUsage(
+    usage: TokenUsage,
+    reconciliation?: ProgressiveReconciliationOptions,
+  ): UsageReport;
 };
 
 export type LLMAcquireResult =

@@ -30,6 +30,7 @@ import type {
   LLMWouldAdmitResult,
   TokenUsage,
   UsageReport,
+  ProgressiveReconciliationOptions,
 } from "./types.js";
 import { LLMBulkheadRejectedError } from "./errors.js";
 import { PROFILES, type LLMBulkheadPreset } from "./profiles.js";
@@ -741,8 +742,29 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       };
     };
 
-    const reportUsage = (usage: TokenUsage): UsageReport => {
+    const reportUsage = (
+      usage: TokenUsage,
+      reconciliation?: ProgressiveReconciliationOptions,
+    ): UsageReport => {
       const valid = validateTokenUsage(usage);
+      if (reconciliation !== undefined) {
+        assertNonNegativeInteger(
+          reconciliation.remainingOutputTokens,
+          "progressive reconciliation remainingOutputTokens",
+        );
+        assertOptionalNonNegativeInteger(
+          reconciliation.safetyMarginTokens,
+          "progressive reconciliation safetyMarginTokens",
+        );
+        if (
+          parts !== null &&
+          reconciliation.remainingOutputTokens > parts.maxOutput
+        ) {
+          throw new RangeError(
+            "progressive reconciliation remainingOutputTokens must not exceed the reserved output cap",
+          );
+        }
+      }
       const previousReported = reported;
       // Clamp to monotonic non-decreasing per field — cumulative
       // stream usage never shrinks; a lower report is stale.
@@ -761,11 +783,18 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
 
       // Accounting only applies pre-release with a budget configured.
       if (!released && parts && budget) {
-        // Hold = known input + the larger of (output ceiling, actual output).
-        // Keeps the full output reservation while refunding input
-        // over-estimates immediately; expands on output overrun.
+        // Legacy mode holds known input plus the full output reservation.
+        // Progressive mode is opt-in and may be used only after prefill is
+        // known complete: it holds the caller-declared future output plus an
+        // explicit safety margin. Output beyond the configured cap is added
+        // back as overrun protection.
+        const outputOverrun = Math.max(0, reported.output - parts.maxOutput);
         const newHold =
-          reported.input + Math.max(parts.maxOutput, reported.output);
+          reconciliation === undefined
+            ? reported.input + Math.max(parts.maxOutput, reported.output)
+            : reconciliation.remainingOutputTokens +
+              (reconciliation.safetyMarginTokens ?? 0) +
+              outputOverrun;
         const delta = newHold - held;
         if (delta > 0) {
           inFlightTokens += delta;
@@ -777,13 +806,14 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         }
         held = newHold;
       }
-      if (!released && usageChanged) {
+      const holdChanged = held !== previousHeldTokens;
+      if (!released && (usageChanged || holdChanged)) {
         usageSequence++;
       }
 
       const report = snapshot();
 
-      if (!released && usageChanged) {
+      if (!released && (usageChanged || holdChanged)) {
         emit("usage", {
           request,
           admissionId,
@@ -798,6 +828,15 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
           outputCap: report.outputCap,
           outputRemaining: report.outputRemaining,
           overReservation: report.overReservation,
+          ...(reconciliation === undefined
+            ? {}
+            : {
+                progressive: true,
+                remainingOutputTokens:
+                  reconciliation.remainingOutputTokens,
+                safetyMarginTokens:
+                  reconciliation.safetyMarginTokens ?? 0,
+              }),
         });
       }
 
@@ -1065,8 +1104,29 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       };
     };
 
-    const reportUsage = (usage: TokenUsage): UsageReport => {
+    const reportUsage = (
+      usage: TokenUsage,
+      reconciliation?: ProgressiveReconciliationOptions,
+    ): UsageReport => {
       const valid = validateTokenUsage(usage);
+      if (reconciliation !== undefined) {
+        assertNonNegativeInteger(
+          reconciliation.remainingOutputTokens,
+          "progressive reconciliation remainingOutputTokens",
+        );
+        assertOptionalNonNegativeInteger(
+          reconciliation.safetyMarginTokens,
+          "progressive reconciliation safetyMarginTokens",
+        );
+        if (
+          admission.parts !== null &&
+          reconciliation.remainingOutputTokens > admission.parts.maxOutput
+        ) {
+          throw new RangeError(
+            "progressive reconciliation remainingOutputTokens must not exceed the reserved output cap",
+          );
+        }
+      }
       const previous = reported;
       reported = previous
         ? {
@@ -1093,6 +1153,15 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
           outputCap: current.outputCap,
           outputRemaining: current.outputRemaining,
           overReservation: current.overReservation,
+          ...(reconciliation === undefined
+            ? {}
+            : {
+                progressive: true,
+                remainingOutputTokens:
+                  reconciliation.remainingOutputTokens,
+                safetyMarginTokens:
+                  reconciliation.safetyMarginTokens ?? 0,
+              }),
         });
       }
       return snapshot();
@@ -1322,7 +1391,8 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         limitRevision: r.limitRevision,
         reservation: r.reservation,
         admission: "admitted",
-        reportUsage: (usage) => r.token.reportUsage(usage),
+        reportUsage: (usage, reconciliation) =>
+          r.token.reportUsage(usage, reconciliation),
       };
 
       const work = (async () => {
