@@ -7,12 +7,14 @@ import type { AcquireOptions, Token } from "async-bulkhead-ts";
 import { randomUUID } from "node:crypto";
 import type {
   Listener,
+  LLMAdmissionClassLimits,
   LLMAdmissionLimits,
   LLMApplyLimitsResult,
   LLMAcquireOptions,
   LLMAcquireResult,
   LLMAdmissionMode,
   LLMBulkheadOptions,
+  LLMCapacityConstraint,
   LLMDrainResult,
   LLMEventMap,
   LLMEventType,
@@ -69,6 +71,64 @@ function resolvePreset(
   return profile;
 }
 
+type AdmissionClassState = {
+  readonly id: string;
+  maxConcurrent: number | undefined;
+  maxInFlightTokens: number | undefined;
+  inFlight: number;
+  inFlightTokens: number;
+  admitted: number;
+  released: number;
+  rejected: number;
+  rejectedByReason: Partial<Record<LLMRejectReason, number>>;
+  totalReserved: number;
+  totalConsumed: number;
+  totalRefunded: number;
+  totalOverrun: number;
+};
+
+type CapacityFailure = {
+  reason: Extract<LLMRejectReason, "budget_limit" | "concurrency_limit">;
+  constraint: LLMCapacityConstraint;
+};
+
+function validateAdmissionClassId(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`${label} must be a non-empty string`);
+  }
+  return value;
+}
+
+function readAdmissionClassLimits(
+  value: unknown,
+  label: string,
+  tokenBudgetEnabled: boolean,
+): LLMAdmissionClassLimits {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  const source = value as LLMAdmissionClassLimits;
+  const maxConcurrent = source.maxConcurrent;
+  const maxInFlightTokens = source.maxInFlightTokens;
+  assertOptionalNonNegativeInteger(
+    maxConcurrent,
+    `${label}.maxConcurrent`,
+  );
+  assertOptionalNonNegativeInteger(
+    maxInFlightTokens,
+    `${label}.maxInFlightTokens`,
+  );
+  if (!tokenBudgetEnabled && maxInFlightTokens !== undefined) {
+    throw new Error(
+      `${label}.maxInFlightTokens requires tokenBudget to be configured`,
+    );
+  }
+  return Object.freeze({
+    ...(maxConcurrent !== undefined && { maxConcurrent }),
+    ...(maxInFlightTokens !== undefined && { maxInFlightTokens }),
+  });
+}
+
 // ────────────────────────────────────────────
 // createLLMBulkhead
 // ────────────────────────────────────────────
@@ -107,6 +167,54 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     ) {
       throw new Error(
         "tokenBudget.highPriorityReserve must be <= tokenBudget.budget",
+      );
+    }
+  }
+
+  // ---- Bounded admission-class configuration ----
+  const admissionClassOptions = opts.admissionClasses;
+  let defaultAdmissionClass: string | undefined;
+  const admissionClassStates = new Map<string, AdmissionClassState>();
+  if (admissionClassOptions !== undefined) {
+    defaultAdmissionClass = validateAdmissionClassId(
+      admissionClassOptions.defaultClass,
+      "admissionClasses.defaultClass",
+    );
+    const classes = admissionClassOptions.classes;
+    if (typeof classes !== "object" || classes === null || Array.isArray(classes)) {
+      throw new Error("admissionClasses.classes must be an object");
+    }
+    const entries = Object.entries(classes);
+    if (entries.length === 0) {
+      throw new Error("admissionClasses.classes must contain at least one class");
+    }
+    for (const [id, rawLimits] of entries) {
+      validateAdmissionClassId(id, "admissionClasses class id");
+      const limits = readAdmissionClassLimits(
+        rawLimits,
+        `admissionClasses.classes[${JSON.stringify(id)}]`,
+        opts.tokenBudget !== undefined,
+      );
+      admissionClassStates.set(id, {
+        id,
+        maxConcurrent: limits.maxConcurrent,
+        maxInFlightTokens: limits.maxInFlightTokens,
+        inFlight: 0,
+        inFlightTokens: 0,
+        admitted: 0,
+        released: 0,
+        rejected: 0,
+        rejectedByReason: {},
+        totalReserved: 0,
+        totalConsumed: 0,
+        totalRefunded: 0,
+        totalOverrun: 0,
+      });
+    }
+    if (!admissionClassStates.has(defaultAdmissionClass)) {
+      throw new Error(
+        `admissionClasses.defaultClass ${JSON.stringify(defaultAdmissionClass)} ` +
+          `must name a configured class`,
       );
     }
   }
@@ -194,6 +302,59 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     llmRejected++;
     llmRejectedByReason[reason] =
       (llmRejectedByReason[reason] ?? 0) + 1;
+  }
+
+  function resolveAdmissionClass(
+    requested: string | undefined,
+  ): AdmissionClassState | undefined {
+    if (defaultAdmissionClass === undefined) {
+      if (requested !== undefined) {
+        throw new Error(
+          "admissionClass requires admissionClasses to be configured",
+        );
+      }
+      return undefined;
+    }
+    const id =
+      requested === undefined
+        ? defaultAdmissionClass
+        : validateAdmissionClassId(requested, "admissionClass");
+    const state = admissionClassStates.get(id);
+    if (state === undefined) {
+      throw new Error(`unknown admissionClass ${JSON.stringify(id)}`);
+    }
+    return state;
+  }
+
+  function noteAdmissionClassReject(
+    admissionClass: AdmissionClassState | undefined,
+    reason: LLMRejectReason,
+  ): void {
+    if (admissionClass === undefined) return;
+    admissionClass.rejected++;
+    admissionClass.rejectedByReason[reason] =
+      (admissionClass.rejectedByReason[reason] ?? 0) + 1;
+  }
+
+  function admissionClassLimitsSnapshot():
+    | Readonly<Record<string, LLMAdmissionClassLimits>>
+    | undefined {
+    if (defaultAdmissionClass === undefined) return undefined;
+    const entries: Array<[string, LLMAdmissionClassLimits]> = [];
+    for (const [id, state] of admissionClassStates) {
+      entries.push([
+        id,
+        Object.freeze({
+          ...(state.maxConcurrent !== undefined && {
+            maxConcurrent: state.maxConcurrent,
+          }),
+          ...(state.maxInFlightTokens !== undefined && {
+            maxInFlightTokens: state.maxInFlightTokens,
+          }),
+        }),
+      ]);
+    }
+    return Object.freeze(Object.fromEntries(entries));
   }
   // ---- Internal helpers ----
 
@@ -313,17 +474,29 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
 
   type ResolvedAdmission = {
     priority: LLMPriority;
+    admissionClass: AdmissionClassState | undefined;
     parts: ReservationParts | null;
     reserved: number;
   };
 
   function resolveAdmission(
     request: LLMRequest,
-    ao: Pick<LLMAcquireOptions, "priority" | "reservation">,
+    ao: Pick<
+      LLMAcquireOptions,
+      "priority" | "reservation" | "admissionClass"
+    >,
+    resolvedAdmissionClass: AdmissionClassState | undefined =
+      resolveAdmissionClass(ao.admissionClass),
   ): ResolvedAdmission {
     const priority = resolvePriority(ao.priority);
+    const admissionClass = resolvedAdmissionClass;
     const parts = resolveReservation(request, ao.reservation);
-    return { priority, parts, reserved: parts?.reserved ?? 0 };
+    return {
+      priority,
+      admissionClass,
+      parts,
+      reserved: parts?.reserved ?? 0,
+    };
   }
 
   /**
@@ -358,30 +531,90 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       : Math.max(0, currentBudget! - currentHighPriorityReserve);
   }
 
-  /**
-   * Attempt token budget admission synchronously for a precomputed
-   * reservation. Returns false if the priority-adjusted ceiling is
-   * exceeded.
-   */
-  function tryReserveTokens(reserved: number, priority: LLMPriority): boolean {
-    if (!budget) return true;
-    if (inFlightTokens + reserved > effectiveBudget(priority)) return false;
-    inFlightTokens += reserved;
-    totalReserved += reserved;
-    return true;
+  function checkAdmissionCapacity(
+    reserved: number,
+    priority: LLMPriority,
+    admissionClass: AdmissionClassState | undefined,
+  ): CapacityFailure | undefined {
+    if (budget && inFlightTokens + reserved > effectiveBudget(priority)) {
+      return { reason: "budget_limit", constraint: "global" };
+    }
+    if (
+      admissionClass?.maxInFlightTokens !== undefined &&
+      admissionClass.inFlightTokens + reserved >
+        admissionClass.maxInFlightTokens
+    ) {
+      return { reason: "budget_limit", constraint: "admission_class" };
+    }
+    if (
+      admissionClass?.maxConcurrent !== undefined &&
+      admissionClass.inFlight >= admissionClass.maxConcurrent
+    ) {
+      return { reason: "concurrency_limit", constraint: "admission_class" };
+    }
+    return undefined;
   }
 
-  function releaseTokens(held: number, usage?: TokenUsage): number {
+  /**
+   * Atomically reserve every non-queue capacity layer after the global
+   * concurrency slot is held. No counters are changed unless all checks pass.
+   */
+  function tryReserveCapacity(
+    reserved: number,
+    priority: LLMPriority,
+    admissionClass: AdmissionClassState | undefined,
+  ): CapacityFailure | undefined {
+    const failure = checkAdmissionCapacity(
+      reserved,
+      priority,
+      admissionClass,
+    );
+    if (failure !== undefined) return failure;
+
+    if (budget) {
+      inFlightTokens += reserved;
+      totalReserved += reserved;
+    }
+    if (admissionClass !== undefined) {
+      admissionClass.inFlight++;
+      admissionClass.admitted++;
+      if (budget) {
+        admissionClass.inFlightTokens += reserved;
+        admissionClass.totalReserved += reserved;
+      }
+    }
+    return undefined;
+  }
+
+  function releaseCapacity(
+    held: number,
+    usage: TokenUsage | undefined,
+    admissionClass: AdmissionClassState | undefined,
+  ): number {
     let refunded = 0;
     if (usage && held > 0) {
       const actual = usage.input + usage.output;
       totalConsumed += actual;
+      if (admissionClass !== undefined) {
+        admissionClass.totalConsumed += actual;
+      }
       if (actual < held) {
         refunded = held - actual;
         totalRefunded += refunded;
+        if (admissionClass !== undefined) {
+          admissionClass.totalRefunded += refunded;
+        }
       }
     }
     inFlightTokens = Math.max(0, inFlightTokens - held);
+    if (admissionClass !== undefined) {
+      admissionClass.inFlightTokens = Math.max(
+        0,
+        admissionClass.inFlightTokens - held,
+      );
+      admissionClass.inFlight = Math.max(0, admissionClass.inFlight - 1);
+      admissionClass.released++;
+    }
     return refunded;
   }
 
@@ -389,10 +622,15 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
   function buildRejectDetail(
     requested: number,
     priority: LLMPriority,
+    admissionClass: AdmissionClassState | undefined,
+    constraint?: LLMCapacityConstraint,
   ): LLMRejectDetail {
     const base = bulkhead.stats();
     const detail: LLMRejectDetail = {
       limitRevision: currentRevision,
+      ...(admissionClass !== undefined && constraint !== undefined
+        ? { constraint }
+        : {}),
       inFlight: base.inFlight,
       pending: base.pending,
       maxConcurrent: base.maxConcurrent,
@@ -408,6 +646,38 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         requested,
       };
     }
+    if (admissionClass !== undefined) {
+      detail.admissionClass = {
+        id: admissionClass.id,
+        inFlight: admissionClass.inFlight,
+        maxConcurrent: admissionClass.maxConcurrent ?? null,
+        availableConcurrent:
+          admissionClass.maxConcurrent === undefined
+            ? null
+            : Math.max(
+                0,
+                admissionClass.maxConcurrent - admissionClass.inFlight,
+              ),
+        ...(budget
+          ? {
+              tokenBudget: {
+                inFlightTokens: admissionClass.inFlightTokens,
+                maxInFlightTokens:
+                  admissionClass.maxInFlightTokens ?? null,
+                available:
+                  admissionClass.maxInFlightTokens === undefined
+                    ? null
+                    : Math.max(
+                        0,
+                        admissionClass.maxInFlightTokens -
+                          admissionClass.inFlightTokens,
+                      ),
+                requested,
+              },
+            }
+          : {}),
+      };
+    }
     return detail;
   }
 
@@ -415,12 +685,18 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     admission: ResolvedAdmission,
     includeDetail: boolean,
   ): LLMWouldAdmitResult {
-    const { priority, reserved } = admission;
+    const { priority, admissionClass, reserved } = admission;
     const withDetail = (
       result: LLMWouldAdmitResult,
+      constraint?: LLMCapacityConstraint,
     ): LLMWouldAdmitResult => {
       if (includeDetail) {
-        result.detail = buildRejectDetail(reserved, priority);
+        result.detail = buildRejectDetail(
+          reserved,
+          priority,
+          admissionClass,
+          constraint,
+        );
       }
       return result;
     };
@@ -428,27 +704,42 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     if (base.closed) {
       return withDetail({ admit: false, reason: "shutdown" });
     }
-    if (budget && inFlightTokens + reserved > effectiveBudget(priority)) {
-      return withDetail({ admit: false, reason: "budget_limit" });
+    const capacityFailure = checkAdmissionCapacity(
+      reserved,
+      priority,
+      admissionClass,
+    );
+    if (capacityFailure !== undefined) {
+      return withDetail(
+        { admit: false, reason: capacityFailure.reason },
+        capacityFailure.constraint,
+      );
     }
     if (base.inFlight < base.maxConcurrent) {
       return withDetail({ admit: true });
     }
     if (base.maxConcurrent === 0) {
-      return withDetail({ admit: false, reason: "concurrency_limit" });
+      return withDetail(
+        { admit: false, reason: "concurrency_limit" },
+        "global",
+      );
     }
     if (base.pending < base.maxQueue) {
       return withDetail({ admit: true });
     }
-    return withDetail({
-      admit: false,
-      reason: base.maxQueue > 0 ? "queue_limit" : "concurrency_limit",
-    });
+    return withDetail(
+      {
+        admit: false,
+        reason: base.maxQueue > 0 ? "queue_limit" : "concurrency_limit",
+      },
+      "global",
+    );
   }
 
   /** Return a detached snapshot of the currently applied limits. */
   function limits(): LLMAdmissionLimits {
     const base = bulkhead.stats();
+    const classLimits = admissionClassLimitsSnapshot();
     const snapshot: LLMAdmissionLimits = {
       revision: currentRevision,
       maxConcurrent: base.maxConcurrent,
@@ -461,11 +752,17 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
             },
           }
         : {}),
+      ...(classLimits !== undefined
+        ? { admissionClasses: classLimits }
+        : {}),
     };
     return Object.freeze({
       ...snapshot,
       ...(snapshot.tokenBudget
         ? { tokenBudget: Object.freeze({ ...snapshot.tokenBudget }) }
+        : {}),
+      ...(snapshot.admissionClasses
+        ? { admissionClasses: snapshot.admissionClasses }
         : {}),
     });
   }
@@ -487,6 +784,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     const maxConcurrent = next.maxConcurrent;
     const maxQueue = next.maxQueue;
     const nextTokenBudget = next.tokenBudget;
+    const nextAdmissionClasses = next.admissionClasses;
 
     if (!Number.isSafeInteger(revision) || revision < 0) {
       throw new Error("limits.revision must be a non-negative safe integer");
@@ -523,6 +821,50 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       );
     }
 
+    let preparedAdmissionClassLimits:
+      | Map<string, LLMAdmissionClassLimits>
+      | undefined;
+    if (defaultAdmissionClass !== undefined) {
+      if (nextAdmissionClasses === undefined) {
+        throw new Error(
+          "limits.admissionClasses is required because admissionClasses was configured at construction",
+        );
+      }
+      if (
+        typeof nextAdmissionClasses !== "object" ||
+        nextAdmissionClasses === null ||
+        Array.isArray(nextAdmissionClasses)
+      ) {
+        throw new Error("limits.admissionClasses must be an object");
+      }
+      const suppliedKeys = Object.keys(nextAdmissionClasses);
+      if (suppliedKeys.length !== admissionClassStates.size) {
+        throw new Error(
+          "limits.admissionClasses must contain exactly the construction-time class keys",
+        );
+      }
+      preparedAdmissionClassLimits = new Map();
+      for (const id of admissionClassStates.keys()) {
+        if (!Object.prototype.hasOwnProperty.call(nextAdmissionClasses, id)) {
+          throw new Error(
+            "limits.admissionClasses must contain exactly the construction-time class keys",
+          );
+        }
+        preparedAdmissionClassLimits.set(
+          id,
+          readAdmissionClassLimits(
+            nextAdmissionClasses[id],
+            `limits.admissionClasses[${JSON.stringify(id)}]`,
+            budget !== undefined,
+          ),
+        );
+      }
+    } else if (nextAdmissionClasses !== undefined) {
+      throw new Error(
+        "limits.admissionClasses must be omitted because admissionClasses was not configured at construction",
+      );
+    }
+
     const previous = limits();
 
     // Install every LLM-layer value before pumping the concurrency queue.
@@ -532,6 +874,13 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     if (budget) {
       currentBudget = nextBudget!;
       currentHighPriorityReserve = nextHighPriorityReserve!;
+    }
+    if (preparedAdmissionClassLimits !== undefined) {
+      for (const [id, nextLimits] of preparedAdmissionClassLimits) {
+        const state = admissionClassStates.get(id)!;
+        state.maxConcurrent = nextLimits.maxConcurrent;
+        state.maxInFlightTokens = nextLimits.maxInFlightTokens;
+      }
     }
     bulkhead.applyLimits({ maxConcurrent, maxQueue });
 
@@ -566,6 +915,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         budget: tokens,
         highPriorityReserve: currentHighPriorityReserve,
       },
+      ...(current.admissionClasses !== undefined
+        ? { admissionClasses: current.admissionClasses }
+        : {}),
     });
   }
 
@@ -587,9 +939,18 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       LLMRejectReason,
       "aborted" | "timeout" | "unshareable_result"
     >,
+    admissionClass: AdmissionClassState | undefined,
   ): LLMBulkheadRejectedError {
     noteLLMReject(reason);
-    emit("reject", { request, reason, limitRevision: currentRevision });
+    noteAdmissionClassReject(admissionClass, reason);
+    emit("reject", {
+      request,
+      reason,
+      limitRevision: currentRevision,
+      ...(admissionClass !== undefined
+        ? { admissionClass: admissionClass.id }
+        : {}),
+    });
     const error = new LLMBulkheadRejectedError(reason);
     dedupWaitErrors.add(error);
     return error;
@@ -609,12 +970,20 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
    *
    * The leader never passes through this function.
    */
-  function deliverShared<T>(value: T, request: LLMRequest): T {
+  function deliverShared<T>(
+    value: T,
+    request: LLMRequest,
+    admissionClass: AdmissionClassState | undefined,
+  ): T {
     if (dedup.shareResult) {
       return dedup.shareResult(value) as T;
     }
     if (isUnsafeToShare(value)) {
-      throw noteDedupWaitRejection(request, "unshareable_result");
+      throw noteDedupWaitRejection(
+        request,
+        "unshareable_result",
+        admissionClass,
+      );
     }
     return value;
   }
@@ -635,6 +1004,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     shared: Promise<T>,
     request: LLMRequest,
     ao: AcquireOptions,
+    admissionClass: AdmissionClassState | undefined,
   ): Promise<T> {
     const signal = ao.signal;
     const effectiveTimeoutMs = ao.timeoutMs;
@@ -643,10 +1013,14 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     }
 
     if (signal?.aborted) {
-      return Promise.reject(noteDedupWaitRejection(request, "aborted"));
+      return Promise.reject(
+        noteDedupWaitRejection(request, "aborted", admissionClass),
+      );
     }
     if (signal === undefined && effectiveTimeoutMs === undefined) {
-      return shared.then((value) => deliverShared(value, request));
+      return shared.then((value) =>
+        deliverShared(value, request, admissionClass),
+      );
     }
 
     return new Promise<T>((resolve, reject) => {
@@ -669,7 +1043,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
 
       const onAbort = () => {
         settle(() => {
-          reject(noteDedupWaitRejection(request, "aborted"));
+          reject(
+            noteDedupWaitRejection(request, "aborted", admissionClass),
+          );
         });
       };
 
@@ -679,7 +1055,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       if (effectiveTimeoutMs !== undefined) {
         timeoutId = setTimeout(() => {
           settle(() => {
-            reject(noteDedupWaitRejection(request, "timeout"));
+            reject(
+              noteDedupWaitRejection(request, "timeout", admissionClass),
+            );
           });
         }, effectiveTimeoutMs);
       }
@@ -688,7 +1066,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         (value) =>
           settle(() => {
             try {
-              resolve(deliverShared(value, request));
+              resolve(deliverShared(value, request, admissionClass));
             } catch (err) {
               reject(err);
             }
@@ -710,6 +1088,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     admissionId: string,
     limitRevision: number,
     priority: LLMPriority,
+    admissionClass: AdmissionClassState | undefined,
   ): LLMToken {
     let released = false;
     /** Tokens currently held against the budget for this request. */
@@ -729,6 +1108,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       return {
         admissionId,
         limitRevision,
+        ...(admissionClass !== undefined
+          ? { admissionClass: admissionClass.id }
+          : {}),
         sequence: usageSequence,
         reserved: parts?.reserved ?? 0,
         held,
@@ -799,10 +1181,21 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         if (delta > 0) {
           inFlightTokens += delta;
           totalOverrun += delta;
+          if (admissionClass !== undefined) {
+            admissionClass.inFlightTokens += delta;
+            admissionClass.totalOverrun += delta;
+          }
         } else if (delta < 0) {
           const refund = -delta;
           inFlightTokens = Math.max(0, inFlightTokens - refund);
           totalRefunded += refund;
+          if (admissionClass !== undefined) {
+            admissionClass.inFlightTokens = Math.max(
+              0,
+              admissionClass.inFlightTokens - refund,
+            );
+            admissionClass.totalRefunded += refund;
+          }
         }
         held = newHold;
       }
@@ -819,6 +1212,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
           admissionId,
           limitRevision,
           priority,
+          ...(admissionClass !== undefined
+            ? { admissionClass: admissionClass.id }
+            : {}),
           sequence: usageSequence,
           reservedTokens: parts?.reserved ?? 0,
           previousHeldTokens,
@@ -846,6 +1242,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     return {
       admissionId,
       limitRevision,
+      ...(admissionClass !== undefined
+        ? { admissionClass: admissionClass.id }
+        : {}),
       reservation,
       reportUsage,
       release(usage?: TokenUsage) {
@@ -876,13 +1275,20 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
           // stale pre-release hold).
           const heldAtRelease = held;
           held = 0;
-          const refunded = releaseTokens(heldAtRelease, validUsage);
+          const refunded = releaseCapacity(
+            heldAtRelease,
+            validUsage,
+            admissionClass,
+          );
           noteLLMRelease();
           emit("release", {
             request,
             admissionId,
             limitRevision,
             priority,
+            ...(admissionClass !== undefined
+              ? { admissionClass: admissionClass.id }
+              : {}),
             reservedTokens: parts?.reserved ?? 0,
             heldTokens: heldAtRelease,
             refundedTokens: refunded,
@@ -903,23 +1309,41 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     ao: LLMAcquireOptions,
     resolved: ResolvedAdmission = resolveAdmission(request, ao),
   ): Promise<LLMAcquireResult> {
-    const { priority, parts, reserved } = resolved;
+    const { priority, admissionClass, parts, reserved } = resolved;
 
-    const rejectWith = (reason: LLMRejectReason): LLMAcquireResult => {
-      const detail = buildRejectDetail(reserved, priority);
+    const rejectWith = (
+      reason: LLMRejectReason,
+      constraint?: LLMCapacityConstraint,
+    ): LLMAcquireResult => {
+      const detail = buildRejectDetail(
+        reserved,
+        priority,
+        admissionClass,
+        constraint,
+      );
       noteLLMReject(reason);
+      noteAdmissionClassReject(admissionClass, reason);
       emit("reject", {
         request,
         reason,
         limitRevision: detail.limitRevision,
         detail,
+        ...(admissionClass !== undefined
+          ? { admissionClass: admissionClass.id }
+          : {}),
       });
       return { ok: false, reason, detail };
     };
 
-    // Token budget: pre-check before entering the queue.
-    if (budget && inFlightTokens + reserved > effectiveBudget(priority)) {
-      return rejectWith("budget_limit");
+    // Every class ceiling is fail-fast and checked before entering the global
+    // queue. A second atomic check runs after the global slot is acquired.
+    const precheck = checkAdmissionCapacity(
+      reserved,
+      priority,
+      admissionClass,
+    );
+    if (precheck !== undefined) {
+      return rejectWith(precheck.reason, precheck.constraint);
     }
 
     const mergedOptions = normalizeAcquireOptions(ao);
@@ -927,13 +1351,24 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     const r = await bulkhead.acquire(mergedOptions);
 
     if (!r.ok) {
-      return rejectWith(r.reason);
+      const constraint: LLMCapacityConstraint | undefined =
+        r.reason === "concurrency_limit" ||
+        r.reason === "queue_limit" ||
+        r.reason === "timeout"
+          ? "global"
+          : undefined;
+      return rejectWith(r.reason, constraint);
     }
 
-    // Post-admission: reserve the precomputed amount now.
-    if (!tryReserveTokens(reserved, priority)) {
+    // Post-admission: atomically reserve global token and class capacity.
+    const postcheck = tryReserveCapacity(
+      reserved,
+      priority,
+      admissionClass,
+    );
+    if (postcheck !== undefined) {
       r.token.release();
-      return rejectWith("budget_limit");
+      return rejectWith(postcheck.reason, postcheck.constraint);
     }
 
     // Capture the revision at the admission linearization point: both the
@@ -949,6 +1384,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       admissionId,
       limitRevision,
       priority,
+      admissionClass,
     );
     noteLLMAdmit();
     emit("admit", {
@@ -956,12 +1392,18 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       admissionId,
       limitRevision,
       priority,
+      ...(admissionClass !== undefined
+        ? { admissionClass: admissionClass.id }
+        : {}),
       reservedTokens: reserved,
     });
     return {
       ok: true,
       admissionId,
       limitRevision,
+      ...(admissionClass !== undefined
+        ? { admissionClass: admissionClass.id }
+        : {}),
       reservation: token.reservation,
       token,
     };
@@ -1011,6 +1453,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     request: LLMRequest,
     opts: {
       priority?: LLMPriority;
+      admissionClass?: string;
       reservation?: LLMReservationOverride;
       detail?: boolean;
     } = {},
@@ -1048,13 +1491,18 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       const hardDetail = buildRejectDetail(
         admission.reserved,
         admission.priority,
+        admission.admissionClass,
       );
       noteLLMReject(hardReason);
+      noteAdmissionClassReject(admission.admissionClass, hardReason);
       emit("reject", {
         request,
         reason: hardReason,
         limitRevision: hardDetail.limitRevision,
         detail: hardDetail,
+        ...(admission.admissionClass !== undefined
+          ? { admissionClass: admission.admissionClass.id }
+          : {}),
       });
       throw new LLMBulkheadRejectedError(hardReason, hardDetail);
     }
@@ -1078,6 +1526,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       admissionId,
       limitRevision,
       priority: admission.priority,
+      ...(admission.admissionClass !== undefined
+        ? { admissionClass: admission.admissionClass.id }
+        : {}),
       reason,
       ...(detail !== undefined && { detail }),
       reservation,
@@ -1090,6 +1541,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       return {
         admissionId,
         limitRevision,
+        ...(admission.admissionClass !== undefined
+          ? { admissionClass: admission.admissionClass.id }
+          : {}),
         sequence: usageSequence,
         reserved: admission.reserved,
         held: 0,
@@ -1146,6 +1600,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
           admissionId,
           limitRevision,
           priority: admission.priority,
+          ...(admission.admissionClass !== undefined
+            ? { admissionClass: admission.admissionClass.id }
+            : {}),
           reason,
           sequence: usageSequence,
           reservation,
@@ -1170,6 +1627,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     const context: LLMRunContext = {
       admissionId,
       limitRevision,
+      ...(admission.admissionClass !== undefined
+        ? { admissionClass: admission.admissionClass.id }
+        : {}),
       reservation,
       admission: "bypassed",
       bypassReason: reason,
@@ -1190,6 +1650,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         admissionId,
         limitRevision,
         priority: admission.priority,
+        ...(admission.admissionClass !== undefined
+          ? { admissionClass: admission.admissionClass.id }
+          : {}),
         reason,
         reservation,
         usageSequence,
@@ -1248,6 +1711,13 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     } = ao;
     const mode = resolveAdmissionMode(requestedMode);
     const shadowReasons = resolveShadowReasons(requestedShadowReasons);
+    // Resolve before the dedup fast path so unknown class IDs cannot join an
+    // existing call without validation. The resolved class also partitions
+    // deduplication, preventing one policy class from inheriting another
+    // class's admission decision or queue position.
+    const selectedAdmissionClass = resolveAdmissionClass(
+      acquireOpts.admissionClass,
+    );
 
     // ---- Deduplication ----
     let dedupKey = "";
@@ -1260,7 +1730,11 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       }
       // "" opts out; only real keys are scoped + hashed.
       if (rawKey !== "") {
-        dedupKey = hashDedupKey(dedupScope ?? "", rawKey);
+        const effectiveScope =
+          selectedAdmissionClass === undefined
+            ? dedupScope ?? ""
+            : JSON.stringify([dedupScope ?? "", selectedAdmissionClass.id]);
+        dedupKey = hashDedupKey(effectiveScope, rawKey);
       }
     }
 
@@ -1277,12 +1751,18 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       const existing = dedupMap.get(dedupKey);
       if (existing) {
         dedupHits++;
-        emit("dedup", { request });
+        emit("dedup", {
+          request,
+          ...(selectedAdmissionClass !== undefined
+            ? { admissionClass: selectedAdmissionClass.id }
+            : {}),
+        });
         try {
           return await waitForSharedDedup(
             existing as Promise<T>,
             request,
             acquireOpts,
+            selectedAdmissionClass,
           );
         } catch (error) {
           if (
@@ -1298,7 +1778,11 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
                 ...(ao.signal !== undefined && { signal: ao.signal }),
                 ...(getUsage !== undefined && { getUsage }),
               },
-              resolveAdmission(request, acquireOpts),
+              resolveAdmission(
+                request,
+                acquireOpts,
+                selectedAdmissionClass,
+              ),
               error.reason,
               error.detail,
               error.detail?.limitRevision ?? currentRevision,
@@ -1339,7 +1823,11 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       let advisory: LLMWouldAdmitResult | undefined;
 
       if (mode === "observe") {
-        resolved = resolveAdmission(request, acquireOpts);
+        resolved = resolveAdmission(
+          request,
+          acquireOpts,
+          selectedAdmissionClass,
+        );
         advisory = wouldAdmitResolved(resolved, true);
         if (
           !advisory.admit &&
@@ -1364,7 +1852,12 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         }
       }
 
-      const r = await _acquire(request, acquireOpts, resolved);
+      const r = await _acquire(
+        request,
+        acquireOpts,
+        resolved ??
+          resolveAdmission(request, acquireOpts, selectedAdmissionClass),
+      );
       if (!r.ok) {
         if (mode === "observe" && shouldBypass(r.reason, shadowReasons)) {
           return publish(
@@ -1375,7 +1868,12 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
                 ...(ao.signal !== undefined && { signal: ao.signal }),
                 ...(getUsage !== undefined && { getUsage }),
               },
-              resolved ?? resolveAdmission(request, acquireOpts),
+              resolved ??
+                resolveAdmission(
+                  request,
+                  acquireOpts,
+                  selectedAdmissionClass,
+                ),
               r.reason,
               r.detail,
               r.detail?.limitRevision ?? currentRevision,
@@ -1389,6 +1887,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       const ctx: LLMRunContext = {
         admissionId: r.admissionId,
         limitRevision: r.limitRevision,
+        ...(r.admissionClass !== undefined
+          ? { admissionClass: r.admissionClass }
+          : {}),
         reservation: r.reservation,
         admission: "admitted",
         reportUsage: (usage, reconciliation) =>
@@ -1471,6 +1972,37 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       result.deduplication = {
         active: dedupMap.size,
         hits: dedupHits,
+      };
+    }
+
+    if (defaultAdmissionClass !== undefined) {
+      result.admissionClasses = {
+        defaultClass: defaultAdmissionClass,
+        classes: Object.fromEntries(
+          Array.from(admissionClassStates, ([id, state]) => [
+            id,
+            {
+              limits: {
+                ...(state.maxConcurrent !== undefined && {
+                  maxConcurrent: state.maxConcurrent,
+                }),
+                ...(state.maxInFlightTokens !== undefined && {
+                  maxInFlightTokens: state.maxInFlightTokens,
+                }),
+              },
+              inFlight: state.inFlight,
+              inFlightTokens: state.inFlightTokens,
+              admitted: state.admitted,
+              released: state.released,
+              rejected: state.rejected,
+              rejectedByReason: { ...state.rejectedByReason },
+              totalReserved: state.totalReserved,
+              totalConsumed: state.totalConsumed,
+              totalRefunded: state.totalRefunded,
+              totalOverrun: state.totalOverrun,
+            },
+          ]),
+        ),
       };
     }
 

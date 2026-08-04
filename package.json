@@ -1,6 +1,6 @@
 {
   "name": "async-bulkhead-llm",
-  "version": "3.13.0",
+  "version": "3.14.0",
   "description": "Fail-fast admission control for LLM workloads built on async-bulkhead-ts.",
   "license": "Apache-2.0",
   "author": "",
@@ -20,7 +20,9 @@
     "admission-control",
     "rate-limiting",
     "load-shedding",
-    "token-budget"
+    "token-budget",
+    "tenant-isolation",
+    "workload-isolation"
   ],
   "type": "module",
   "main": "./dist/cjs/index.cjs",

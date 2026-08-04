@@ -9,7 +9,8 @@ Designed for services that need to enforce **cost ceilings, concurrency limits, 
 ## Features
 
 - ✅ Hard **max in-flight** concurrency (`maxConcurrent`)
-- ✅ **Atomic versioned limit updates** — apply concurrency, queue, token budget, and priority reserve as one revisioned snapshot
+- ✅ **Atomic versioned limit updates** — apply concurrency, queue, token budget, priority reserve, and admission-class ceilings as one revisioned snapshot
+- ✅ **Bounded admission classes** — isolate policy classes with hard per-class concurrency and in-flight token ceilings
 - ✅ **Admission-linearized revisions** — every admitted or bypassed lifecycle retains the exact limit revision that made the decision
 - ✅ **Token-aware admission** — reserves against estimated input + max output tokens
 - ✅ **Progressive reconciliation** — release processed input and generated-output reservation during live streams
@@ -132,6 +133,95 @@ const result = await bulkhead.run(request, async () => {
   return callYourLLMProvider(request);
 });
 ```
+
+---
+
+## What's New in v3.14 — Bounded admission classes
+
+v3.14 adds a bounded hierarchical admission layer inside one bulkhead. A
+trusted gateway can map tenant or application identity to a small, static set
+of policy classes, then enforce hard concurrency and in-flight token ceilings
+for each class while retaining the enclosing global limits.
+
+```ts
+const bulkhead = createLLMBulkhead({
+  model: "gpt-4o",
+  maxConcurrent: 12,
+  tokenBudget: { budget: 24_000 },
+  admissionClasses: {
+    defaultClass: "standard",
+    classes: {
+      premium:  { maxConcurrent: 8, maxInFlightTokens: 18_000 },
+      standard: { maxConcurrent: 4, maxInFlightTokens: 6_000 },
+    },
+  },
+});
+
+await bulkhead.run(request, callProvider, {
+  admissionClass: "premium",
+  dedupScope: trustedTenantId,
+});
+```
+
+The class table is fixed at construction. Unknown IDs throw instead of creating
+unbounded state or metric cardinality. Class ceilings are fail-fast and are
+checked together with global concurrency, priority-adjusted token budget, and
+shutdown state. `applyLimits()` may update class numbers atomically, but every
+snapshot must contain exactly the construction-time class keys.
+
+When in-flight deduplication is enabled, the selected admission class is an
+automatic deduplication partition. Identical requests in `premium` and
+`standard` therefore execute independently rather than sharing the first
+class's admission decision or queue position. `dedupScope` remains necessary
+for tenant-level isolation inside a class.
+
+Admission classes are intentionally policy buckets, not raw tenant IDs. The
+library does not authenticate callers, assign identities, implement weighted
+fairness, reserve borrowable floors, or coordinate capacity across processes.
+Those responsibilities remain in the gateway and control plane. When
+in-flight deduplication is enabled, `admissionClass` also does not replace
+`dedupScope`; include trusted tenant identity in `dedupScope` when results must
+not be shared across tenants.
+
+Lifecycle results, run contexts, tokens, usage reports, capacity details, and
+telemetry events now carry `admissionClass` when configured. Rejection detail
+also identifies whether the binding constraint was `global` or
+`admission_class`, and `stats().admissionClasses` exposes bounded per-class
+accounting.
+
+---
+
+## What's New in v3.13 — Progressive reconciliation
+
+Gateways that receive cumulative streaming usage may opt into shrinking the
+active hold before request completion:
+
+```ts
+const report = ctx!.reportUsage(
+  { input: actualInput, output: cumulativeOutput },
+  {
+    remainingOutputTokens: Math.max(0, maxOutput - cumulativeOutput),
+    safetyMarginTokens: 128,
+  },
+);
+```
+
+The progressive hold is:
+
+```text
+remainingOutputTokens + safetyMarginTokens + output overrun
+```
+
+This lets processed input and already-generated output stop occupying the
+in-flight budget. The caller must use the option only after prefill is known to
+be complete and must derive `remainingOutputTokens` from an authoritative
+provider output cap. Omitting the second argument preserves the legacy behavior
+of retaining the full output reservation until release. Final `release()`
+settlement remains authoritative.
+
+Progressive updates share the existing sequence-numbered `usage` event. Events
+include `progressive`, `remainingOutputTokens`, and `safetyMarginTokens` when the
+new mode is used.
 
 ---
 
@@ -560,40 +650,6 @@ await distributedLedger.setHold({
 
 ---
 
-## What's New in v3.13 — Progressive reconciliation
-
-Gateways that receive cumulative streaming usage may opt into shrinking the
-active hold before request completion:
-
-```ts
-const report = ctx!.reportUsage(
-  { input: actualInput, output: cumulativeOutput },
-  {
-    remainingOutputTokens: Math.max(0, maxOutput - cumulativeOutput),
-    safetyMarginTokens: 128,
-  },
-);
-```
-
-The progressive hold is:
-
-```text
-remainingOutputTokens + safetyMarginTokens + output overrun
-```
-
-This lets processed input and already-generated output stop occupying the
-in-flight budget. The caller must use the option only after prefill is known to
-be complete and must derive `remainingOutputTokens` from an authoritative
-provider output cap. Omitting the second argument preserves the legacy behavior
-of retaining the full output reservation until release. Final `release()`
-settlement remains authoritative.
-
-Progressive updates share the existing sequence-numbered `usage` event. Events
-include `progressive`, `remainingOutputTokens`, and `safetyMarginTokens` when the
-new mode is used.
-
----
-
 ## What's New in v3.2 — Gateway readiness
 
 v3.2 adds the admission-control primitives an AI gateway needs, all additive:
@@ -817,6 +873,60 @@ const bulkhead = createLLMBulkhead({
 
 ---
 
+## Bounded Admission Classes
+
+Admission classes add a second, bounded capacity layer beneath the global
+bulkhead. They are useful when several trusted workload classes share one
+provider/model pool but need hard limits on each class's share.
+
+```ts
+const bulkhead = createLLMBulkhead({
+  model: 'gpt-4o',
+  maxConcurrent: 20,
+  tokenBudget: { budget: 50_000 },
+  admissionClasses: {
+    defaultClass: 'standard',
+    classes: {
+      latencySensitive: {
+        maxConcurrent: 12,
+        maxInFlightTokens: 32_000,
+      },
+      standard: {
+        maxConcurrent: 6,
+        maxInFlightTokens: 14_000,
+      },
+      background: {
+        maxConcurrent: 2,
+        maxInFlightTokens: 4_000,
+      },
+    },
+  },
+});
+
+await bulkhead.run(request, callProvider, {
+  admissionClass: 'latencySensitive',
+});
+```
+
+A request must fit both the global limits and its class limits. Omitting
+`admissionClass` selects `defaultClass`. A class may omit either ceiling, in
+which case that dimension is governed only by the global bulkhead. Zero is a
+valid fail-closed class ceiling.
+
+Class checks are deliberately fail-fast; `maxQueue` remains a global queue and
+does not create per-class waiter queues. The fixed class keys keep runtime
+state and observability cardinality bounded. Map authenticated tenants or
+applications to these policy buckets before calling the library rather than
+using arbitrary identity values as class IDs.
+
+Identity verification, weights, minimum guarantees, lending, and distributed
+coordination are outside this single-process library. They belong in the
+calling gateway/control plane. Admission classes automatically partition
+deduplication from one another, but a class may still group multiple tenants;
+use `dedupScope` for tenant-level result isolation inside each class.
+
+---
+
 ## Token Budget
 
 ```ts
@@ -914,6 +1024,13 @@ const bulkhead = createLLMBulkhead({
     budget: 200_000,
     highPriorityReserve: 25_000,
   },
+  admissionClasses: {
+    defaultClass: 'standard',
+    classes: {
+      premium: { maxConcurrent: 7, maxInFlightTokens: 140_000 },
+      standard: { maxConcurrent: 3, maxInFlightTokens: 60_000 },
+    },
+  },
 });
 
 const update = bulkhead.applyLimits({
@@ -942,9 +1059,11 @@ Semantics:
 * **Budget reserve may exceed a shrunken budget.** The normal-priority ceiling
   is clamped to 0 while high-priority traffic is checked against the full
   budget, preserving the existing degraded-priority behavior.
-* **Budget feature shape is fixed at construction.** A bulkhead created with
+* **Feature shapes are fixed at construction.** A bulkhead created with
   `tokenBudget` requires `tokenBudget` in every update. A bulkhead created
-  without it must omit that field; estimator policy is not hot-swapped.
+  without it must omit that field; estimator policy is not hot-swapped. The
+  same rule applies to `admissionClasses`, whose complete fixed key set must be
+  present in every update.
 * **Admission provenance is immutable.** `acquire()` results, tokens,
   `LLMRunContext`, usage reports, and lifecycle events retain the revision
   captured when the slot and token reservation were successfully acquired.
@@ -952,7 +1071,7 @@ Semantics:
 
 ```ts
 const current = bulkhead.limits();
-// { revision, maxConcurrent, maxQueue, tokenBudget? }
+// { revision, maxConcurrent, maxQueue, tokenBudget?, admissionClasses? }
 
 bulkhead.on('reconfigure', ({ previous, current }) => {
   publishAppliedRevision(previous.revision, current.revision);
@@ -1150,6 +1269,7 @@ s.limits.maxConcurrent
 s.limits.maxQueue
 s.limits.tokenBudget?.budget
 s.limits.tokenBudget?.highPriorityReserve
+s.limits.admissionClasses?.premium?.maxConcurrent
 
 s.bulkhead.inFlight
 s.bulkhead.pending
@@ -1175,6 +1295,11 @@ s.tokenBudget?.available
 s.tokenBudget?.totalReserved        // v3.1: cumulative tokens reserved at admission
 s.tokenBudget?.totalConsumed        // v3.1: cumulative actual tokens consumed (usage required)
 s.tokenBudget?.totalRefunded         // v2: cumulative refunded tokens
+
+s.admissionClasses?.defaultClass
+s.admissionClasses?.classes.premium?.inFlight
+s.admissionClasses?.classes.premium?.inFlightTokens
+s.admissionClasses?.classes.premium?.rejectedByReason
 
 s.deduplication?.active
 s.deduplication?.hits
@@ -1209,6 +1334,10 @@ type LLMStats = {
     totalInputTokens: number;
     totalOutputTokens: number;
   };
+  admissionClasses?: {
+    defaultClass: string;
+    classes: Record<string, LLMAdmissionClassStats>;
+  };
   deduplication?: {
     active: number;
     hits: number;
@@ -1232,13 +1361,13 @@ off();
 
 | Event     | Payload |
 |-----------|---------|
-| `admit`   | `{ request, admissionId, limitRevision, priority, reservedTokens }` |
-| `reject`  | `{ request, reason, limitRevision, detail? }` |
-| `usage`   | `{ request, admissionId, limitRevision, priority, sequence, reservedTokens, previousHeldTokens, heldTokens, deltaTokens, usage, outputCap, outputRemaining, overReservation }` |
-| `release` | `{ request, admissionId, limitRevision, priority, reservedTokens, heldTokens, refundedTokens, usageSequence, usage? }` |
-| `bypass` | `{ request, admissionId, limitRevision, priority, reason, detail?, reservation, raced }` |
-| `bypassUsage` | `{ request, admissionId, limitRevision, priority, reason, sequence, reservation, usage, outputCap, outputRemaining, overReservation }` |
-| `bypassRelease` | `{ request, admissionId, limitRevision, priority, reason, reservation, usageSequence, usage? }` |
+| `admit`   | `{ request, admissionId, limitRevision, priority, admissionClass?, reservedTokens }` |
+| `reject`  | `{ request, reason, limitRevision, admissionClass?, detail? }` |
+| `usage`   | `{ request, admissionId, limitRevision, priority, admissionClass?, sequence, reservedTokens, previousHeldTokens, heldTokens, deltaTokens, usage, outputCap, outputRemaining, overReservation }` |
+| `release` | `{ request, admissionId, limitRevision, priority, admissionClass?, reservedTokens, heldTokens, refundedTokens, usageSequence, usage? }` |
+| `bypass` | `{ request, admissionId, limitRevision, priority, admissionClass?, reason, detail?, reservation, raced }` |
+| `bypassUsage` | `{ request, admissionId, limitRevision, priority, admissionClass?, reason, sequence, reservation, usage, outputCap, outputRemaining, overReservation }` |
+| `bypassRelease` | `{ request, admissionId, limitRevision, priority, admissionClass?, reason, reservation, usageSequence, usage? }` |
 | `reconfigure` | `{ previous, current }` |
 | `dedup`   | `{ request }` |
 
@@ -1277,6 +1406,13 @@ type LLMBulkheadOptions = {
     outputCap?:           number; // integer >= 0
     highPriorityReserve?: number; // integer >= 0 and <= initial budget
   };
+  admissionClasses?: {
+    defaultClass: string;
+    classes: Record<string, {
+      maxConcurrent?: number;
+      maxInFlightTokens?: number; // requires tokenBudget
+    }>;
+  };
   deduplication?: boolean | DeduplicationOptions;
 };
 
@@ -1296,6 +1432,7 @@ run<T>(
     signal?:     AbortSignal;
     timeoutMs?:  number; // integer >= 0
     priority?:   'normal' | 'high';
+    admissionClass?: string; // fixed configured policy-class ID
     getUsage?:   (result: T) => TokenUsage | undefined;
     mode?:       'enforce' | 'observe'; // default: 'enforce' (v3.9)
     shadowReasons?: readonly (
@@ -1312,7 +1449,8 @@ run<T>(
 
 `ctx.admissionId` is the stable execution identifier and
 `ctx.limitRevision` is the immutable revision associated with the admission
-or bypass decision. In observe-mode
+or bypass decision, and `ctx.admissionClass` identifies the selected bounded
+policy class when configured. In observe-mode
 bypasses it uses a `shadow-` prefix. `ctx.reservation` is the exact evaluated
 reservation (or `null` when token budgeting is disabled),
 `ctx.admission` distinguishes `"admitted"` from `"bypassed"`, and
@@ -1344,6 +1482,7 @@ acquire(
     signal?: AbortSignal;
     timeoutMs?: number; // integer >= 0
     priority?: 'normal' | 'high';
+    admissionClass?: string;
   },
 ): Promise<LLMAcquireResult>
 
@@ -1352,6 +1491,7 @@ type LLMAcquireResult =
       ok: true;
       admissionId: string;
       limitRevision: number;
+      admissionClass?: string;
       reservation: LLMReservationEstimate | null;
       token: LLMToken;
     }
@@ -1360,6 +1500,7 @@ type LLMAcquireResult =
 type LLMToken = {
   readonly admissionId: string;
   readonly limitRevision: number;
+  readonly admissionClass?: string;
   readonly reservation: LLMReservationEstimate | null;
   reportUsage(
     usage: TokenUsage,
@@ -1395,6 +1536,10 @@ type LLMAdmissionLimits = {
     readonly budget: number;
     readonly highPriorityReserve: number;
   };
+  readonly admissionClasses?: Readonly<Record<string, {
+    readonly maxConcurrent?: number;
+    readonly maxInFlightTokens?: number;
+  }>>;
 };
 ```
 
@@ -1457,6 +1602,7 @@ type TokenUsage     = { input: number; output: number };
 type UsageReport = {
   admissionId: string;
   limitRevision: number;
+  admissionClass?: string;
   sequence: number;
   reserved: number;
   held: number;
@@ -1479,6 +1625,17 @@ type LLMRejectReason =
 ---
 
 ## Migration
+
+### v3.13 → v3.14
+
+No existing call-site changes are required. `admissionClasses` is opt-in and
+all new lifecycle fields are optional when the feature is disabled. Code that
+exhaustively asserts event, stats, limit-snapshot, token, run-context, usage,
+or rejection-detail shapes should account for the additive class fields.
+Gateways should pass only trusted, bounded policy-class IDs. Admission class
+automatically partitions in-flight deduplication, while `dedupScope` remains
+required for tenant-level isolation inside a shared class.
+
 
 ### v3.11.0 → v3.11.1
 

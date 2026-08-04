@@ -7,6 +7,51 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.14.0] - 2026-08-04
+
+### Added
+
+* **Bounded admission classes.** `admissionClasses` configures a fixed table of
+  policy-class IDs with optional hard `maxConcurrent` and
+  `maxInFlightTokens` ceilings. Calls select a class with `admissionClass` or
+  fall back to `defaultClass`; unknown IDs throw instead of creating
+  unbounded runtime state.
+
+* **Hierarchical capacity decisions.** Successful admission must fit both the
+  enclosing global limits and the selected class limits. Class ceilings are
+  fail-fast, use shrink-by-attrition under reconfiguration, and remain atomic
+  with global concurrency and token accounting.
+
+* **Class-aware progressive accounting.** Reservations, progressive usage
+  refunds, output overruns, and final release settlement update global and
+  class token holds together.
+
+* **Class-aware telemetry.** Successful results, tokens, run contexts, usage
+  reports, lifecycle events, capacity details, and observe-mode bypasses carry
+  `admissionClass` when configured. Capacity details identify the binding
+  `constraint` as `global` or `admission_class`, and
+  `stats().admissionClasses` reports bounded per-class counters.
+
+* **Class-safe deduplication.** Admission class is an automatic deduplication
+  partition when classes are configured, preventing one class from inheriting
+  another class's admission decision or queue position. Class IDs are validated
+  before the dedup follower fast path, and dedup/rejection events retain class
+  attribution.
+
+* **Atomic class-limit updates.** `LLMAdmissionLimits.admissionClasses` updates
+  every construction-time class in the same versioned snapshot as global
+  concurrency, queue, token budget, and priority reserve. Runtime updates may
+  change numeric ceilings but cannot add or remove class keys.
+
+### Compatibility
+
+* This is an additive minor release. Existing behavior and object shapes remain
+  unchanged when `admissionClasses` is omitted.
+* Admission classes are bounded policy buckets, not an authentication layer or
+  a replacement for tenant-scoped deduplication. Identity mapping, weighted
+  fairness, protected-floor lending, and distributed coordination remain the
+  responsibility of the gateway/control plane.
+
 ## [3.13.0] - 2026-08-01
 
 ### Added

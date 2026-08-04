@@ -205,6 +205,34 @@ export type LLMRejectReason =
 export type LLMPriority = "high" | "normal";
 
 /**
+ * Hard capacity ceilings for one statically configured admission class.
+ *
+ * Admission classes are intentionally bounded at construction time. A
+ * gateway should map trusted tenant/application identity to one of these
+ * policy-class IDs rather than using arbitrary tenant IDs directly.
+ *
+ * Omitted fields inherit the enclosing bulkhead's global ceiling. Class
+ * limits are always fail-fast; they do not create a separate per-class queue.
+ */
+export type LLMAdmissionClassLimits = {
+  /** Maximum requests from this class that may be in flight. */
+  readonly maxConcurrent?: number;
+  /** Maximum tokens from this class that may be held in flight. */
+  readonly maxInFlightTokens?: number;
+};
+
+/** Construction-time configuration for bounded admission classes. */
+export type LLMAdmissionClassesOptions = {
+  /** Class used when a call omits `admissionClass`. */
+  readonly defaultClass: string;
+  /** Fixed class table. Runtime reconfiguration may change limits, not keys. */
+  readonly classes: Readonly<Record<string, LLMAdmissionClassLimits>>;
+};
+
+/** Capacity layer that produced a rejection. */
+export type LLMCapacityConstraint = "global" | "admission_class";
+
+/**
  * Admission behavior for `run()`.
  *
  * - `"enforce"` (default) preserves normal fail-fast behavior.
@@ -238,6 +266,8 @@ export type LLMRunAdmission = "admitted" | "bypassed";
 export type LLMRejectDetail = {
   /** Limit revision captured with this capacity decision. */
   limitRevision: number;
+  /** Present for capacity decisions when admission classes are configured. */
+  constraint?: LLMCapacityConstraint;
   inFlight: number;
   maxConcurrent: number;
   pending: number;
@@ -254,11 +284,37 @@ export type LLMRejectDetail = {
     /** Tokens this request needed. */
     requested: number;
   };
+  /** Bounded policy-class snapshot used for this decision. */
+  admissionClass?: {
+    id: string;
+    inFlight: number;
+    /** `null` means no class-specific concurrency ceiling. */
+    maxConcurrent: number | null;
+    /** `null` means availability is governed only by the global ceiling. */
+    availableConcurrent: number | null;
+    tokenBudget?: {
+      inFlightTokens: number;
+      /** `null` means no class-specific token ceiling. */
+      maxInFlightTokens: number | null;
+      /** `null` means availability is governed only by the global budget. */
+      available: number | null;
+      requested: number;
+    };
+  };
 };
 
 /** Options accepted by `acquire()` / `run()` (base options + priority). */
 export type LLMAcquireOptions = AcquireOptions & {
   priority?: LLMPriority;
+
+  /**
+   * Bounded policy-class ID used for hierarchical admission.
+   *
+   * Omit to use `admissionClasses.defaultClass`. Passing this option without
+   * configuring `admissionClasses`, or passing an unknown class, throws a
+   * configuration error rather than creating unbounded runtime state.
+   */
+  admissionClass?: string;
 
   /**
    * Per-call token reservation override (v3.7).
@@ -303,6 +359,14 @@ export type LLMAdmissionLimits = {
     readonly budget: number;
     readonly highPriorityReserve: number;
   };
+  /**
+   * Complete limits for the fixed construction-time admission-class table.
+   * Required on updates when classes are configured; forbidden otherwise.
+   * Keys cannot be added or removed at runtime.
+   */
+  readonly admissionClasses?: Readonly<
+    Record<string, LLMAdmissionClassLimits>
+  >;
 };
 
 /** Result of applying a versioned admission-limit snapshot. */
@@ -346,6 +410,20 @@ export type LLMObserveStats = {
   totalInputTokens: number;
   /** Cumulative final output usage from bypassed callbacks. */
   totalOutputTokens: number;
+};
+
+export type LLMAdmissionClassStats = {
+  limits: LLMAdmissionClassLimits;
+  inFlight: number;
+  inFlightTokens: number;
+  admitted: number;
+  released: number;
+  rejected: number;
+  rejectedByReason: Partial<Record<LLMRejectReason, number>>;
+  totalReserved: number;
+  totalConsumed: number;
+  totalRefunded: number;
+  totalOverrun: number;
 };
 
 export type LLMStats = {
@@ -397,6 +475,11 @@ export type LLMStats = {
     /** Cumulative requests that shared an existing in-flight call. */
     hits: number;
   };
+  /** Present only when bounded admission classes are configured. */
+  admissionClasses?: {
+    defaultClass: string;
+    classes: Record<string, LLMAdmissionClassStats>;
+  };
 };
 
 // ────────────────────────────────────────────
@@ -410,6 +493,7 @@ export type LLMEventMap = {
     admissionId: string;
     limitRevision: number;
     priority: LLMPriority;
+    admissionClass?: string;
     reservedTokens: number;
   };
   /** Fired when a request is rejected at any stage. */
@@ -420,6 +504,7 @@ export type LLMEventMap = {
     limitRevision: number;
     /** Capacity snapshot; absent for dedup-wait rejections. */
     detail?: LLMRejectDetail;
+    admissionClass?: string;
   };
   /**
    * Fired when a slot is released.
@@ -442,6 +527,7 @@ export type LLMEventMap = {
     admissionId: string;
     limitRevision: number;
     priority: LLMPriority;
+    admissionClass?: string;
     reservedTokens: number;
     /** Tokens held immediately before release returned them. */
     heldTokens: number;
@@ -463,6 +549,7 @@ export type LLMEventMap = {
     admissionId: string;
     limitRevision: number;
     priority: LLMPriority;
+    admissionClass?: string;
     sequence: number;
     reservedTokens: number;
     previousHeldTokens: number;
@@ -486,6 +573,7 @@ export type LLMEventMap = {
     admissionId: string;
     limitRevision: number;
     priority: LLMPriority;
+    admissionClass?: string;
     reason: LLMShadowableRejectReason;
     detail?: LLMRejectDetail;
     reservation: LLMReservationEstimate | null;
@@ -498,6 +586,7 @@ export type LLMEventMap = {
     admissionId: string;
     limitRevision: number;
     priority: LLMPriority;
+    admissionClass?: string;
     reason: LLMShadowableRejectReason;
     sequence: number;
     reservation: LLMReservationEstimate | null;
@@ -515,6 +604,7 @@ export type LLMEventMap = {
     admissionId: string;
     limitRevision: number;
     priority: LLMPriority;
+    admissionClass?: string;
     reason: LLMShadowableRejectReason;
     reservation: LLMReservationEstimate | null;
     usageSequence: number;
@@ -526,7 +616,11 @@ export type LLMEventMap = {
     current: LLMAdmissionLimits;
   };
   /** Fired when a request joins an existing in-flight call via dedup. */
-  dedup: { request: LLMRequest };
+  dedup: {
+    request: LLMRequest;
+    /** Deduplication is automatically partitioned by class when configured. */
+    admissionClass?: string;
+  };
 };
 
 export type LLMEventType = keyof LLMEventMap;
@@ -607,6 +701,9 @@ export type DeduplicationOptions = {
    * Two tenants sending byte-identical requests would share one
    * response. Pass `dedupScope` (per-call, on `run()` options) or bake
    * the tenant into a custom `keyFn` to prevent cross-tenant sharing.
+   * When bounded admission classes are configured, the selected class is
+   * automatically included as a separate deduplication partition;
+   * `dedupScope` is still required to isolate tenants within one class.
    *
    * Return an empty string to opt a specific request out of deduplication.
    */
@@ -706,6 +803,16 @@ export type LLMBulkheadOptions = {
   tokenBudget?: TokenBudgetOptions;
 
   /**
+   * Optional bounded policy-class table for tenant/application isolation.
+   *
+   * The library enforces hard class ceilings. Identity mapping, weights,
+   * protected floors, and lending policy belong in the gateway/control plane.
+   * Class keys are fixed at construction to keep state and metric cardinality
+   * bounded; `applyLimits()` may change only their numeric ceilings.
+   */
+  admissionClasses?: LLMAdmissionClassesOptions;
+
+  /**
    * Enable in-flight request deduplication.
    *
    * - `true` — use the default key function
@@ -744,6 +851,8 @@ export type UsageReport = {
   admissionId: string;
   /** Immutable limit revision captured when this work was admitted or bypassed. */
   limitRevision: number;
+  /** Bounded policy class used for this admission, when configured. */
+  admissionClass?: string;
   /**
    * Last effective usage-update sequence for this admission.
    * Starts at 0 before any effective report, increments when cumulative usage increases or the effective held-token
@@ -770,6 +879,8 @@ export type LLMRunContext = {
   readonly admissionId: string;
   /** Immutable limit revision associated with this admission or bypass decision. */
   readonly limitRevision: number;
+  /** Bounded policy class used for this execution, when configured. */
+  readonly admissionClass?: string;
   /** Exact reservation evaluated for this call, or `null` without a budget. */
   readonly reservation: LLMReservationEstimate | null;
   /** Whether the callback holds real bulkhead capacity. */
@@ -799,8 +910,9 @@ export type LLMRunOptions<T> = LLMAcquireOptions & {
    */
   shadowReasons?: readonly LLMShadowableRejectReason[];
   /**
-   * Deduplication scope. Requests deduplicate only within the same scope.
-   * Ignored when deduplication is disabled. Default: `""`.
+   * Deduplication scope. Requests deduplicate only within the same scope and,
+   * when configured, the same admission class. Ignored when deduplication is
+   * disabled. Default: `""`.
    */
   dedupScope?: string;
   /** Per-call deduplication opt-out. */
@@ -832,6 +944,8 @@ export type LLMToken = {
   readonly admissionId: string;
   /** Immutable limit revision captured at successful admission. */
   readonly limitRevision: number;
+  /** Bounded policy class used for this admission, when configured. */
+  readonly admissionClass?: string;
   /** Exact reservation used at admission, or `null` without a token budget. */
   readonly reservation: LLMReservationEstimate | null;
   release(usage?: TokenUsage): void;
@@ -846,6 +960,7 @@ export type LLMAcquireResult =
       ok: true;
       admissionId: string;
       limitRevision: number;
+      admissionClass?: string;
       reservation: LLMReservationEstimate | null;
       token: LLMToken;
     }
