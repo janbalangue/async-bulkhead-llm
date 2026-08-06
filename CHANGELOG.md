@@ -7,6 +7,14 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.15.1] - 2026-08-06
+
+### Fixed
+
+* **npm package documentation.** The publish manifest now explicitly includes
+  `README.md`, `LICENSE`, and `CHANGELOG.md` so the npm registry package page
+  and downloaded package consistently contain the release documentation.
+
 ## [3.15.0] - 2026-08-06
 
 ### Added
