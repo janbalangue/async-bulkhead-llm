@@ -60,6 +60,19 @@ describe("bounded admission classes", () => {
       }),
     ).toThrow(/requires tokenBudget/);
 
+    expect(() =>
+      createLLMBulkhead({
+        model: "gpt-4o",
+        maxConcurrent: 1,
+        admissionClasses: {
+          defaultClass: "standard",
+          classes: {
+            standard: { protectedInFlightTokens: 100 },
+          },
+        },
+      }),
+    ).toThrow(/protectedInFlightTokens requires tokenBudget/);
+
     const plain = createLLMBulkhead({ model: "gpt-4o", maxConcurrent: 1 });
     await expect(
       plain.acquire(request, { admissionClass: "standard" }),
@@ -301,6 +314,30 @@ describe("bounded admission classes", () => {
     ).toThrow(/maxConcurrent/);
     expect(b.limits()).toEqual(beforeInvalidUpdate);
 
+    expect(() =>
+      b.applyLimits({
+        revision: 1,
+        maxConcurrent: 4,
+        maxQueue: 0,
+        tokenBudget: { budget: 2_000, highPriorityReserve: 0 },
+        admissionClasses: {
+          premium: {
+            protectedConcurrent: 3,
+            maxConcurrent: 3,
+            protectedInFlightTokens: 1_200,
+            maxInFlightTokens: 1_200,
+          },
+          standard: {
+            protectedConcurrent: 2,
+            maxConcurrent: 2,
+            protectedInFlightTokens: 900,
+            maxInFlightTokens: 900,
+          },
+        },
+      }),
+    ).toThrow(/protectedConcurrent sum/);
+    expect(b.limits()).toEqual(beforeInvalidUpdate);
+
     const first = await b.acquire(request, { admissionClass: "premium" });
     expect(first.ok).toBe(true);
     if (!first.ok) return;
@@ -491,4 +528,245 @@ describe("bounded admission classes", () => {
 
     held.token.release();
   });
+
+  it("validates protected floors against class and global limits", () => {
+    expect(() =>
+      createLLMBulkhead({
+        model: "gpt-4o",
+        maxConcurrent: 2,
+        admissionClasses: {
+          defaultClass: "premium",
+          classes: {
+            premium: { protectedConcurrent: 2, maxConcurrent: 1 },
+          },
+        },
+      }),
+    ).toThrow(/protectedConcurrent must be <=/);
+
+    expect(() =>
+      createLLMBulkhead({
+        model: "gpt-4o",
+        maxConcurrent: 2,
+        admissionClasses: {
+          defaultClass: "premium",
+          classes: {
+            premium: { protectedConcurrent: 2 },
+            standard: { protectedConcurrent: 1 },
+          },
+        },
+      }),
+    ).toThrow(/protectedConcurrent sum/);
+
+    expect(() =>
+      createLLMBulkhead({
+        model: "gpt-4o",
+        maxConcurrent: 4,
+        tokenBudget: { budget: 1_000, estimator: fixedEstimator },
+        admissionClasses: {
+          defaultClass: "premium",
+          classes: {
+            premium: { protectedInFlightTokens: 700 },
+            standard: { protectedInFlightTokens: 400 },
+          },
+        },
+      }),
+    ).toThrow(/protectedInFlightTokens sum/);
+  });
+
+  it("protects class concurrency floors and accounts shared borrowing", async () => {
+    const b = createLLMBulkhead({
+      model: "gpt-4o",
+      maxConcurrent: 4,
+      admissionClasses: {
+        defaultClass: "standard",
+        classes: {
+          premium: { protectedConcurrent: 2, maxConcurrent: 4 },
+          standard: { protectedConcurrent: 1, maxConcurrent: 4 },
+        },
+      },
+    });
+
+    const premium: Array<Awaited<ReturnType<typeof b.acquire>>> = [];
+    for (let i = 0; i < 3; i++) {
+      const result = await b.acquire(request, { admissionClass: "premium" });
+      expect(result.ok).toBe(true);
+      premium.push(result);
+    }
+
+    const blocked = await b.acquire(request, { admissionClass: "premium" });
+    expect(blocked).toMatchObject({
+      ok: false,
+      reason: "concurrency_limit",
+      detail: {
+        constraint: "admission_class_protection",
+        sharedCapacity: {
+          concurrency: {
+            capacity: 1,
+            inUse: 1,
+            available: 0,
+            requestedBorrowed: 1,
+          },
+        },
+      },
+    });
+
+    const standard = await b.acquire(request, { admissionClass: "standard" });
+    expect(standard.ok).toBe(true);
+
+    const stats = b.stats().admissionClasses!;
+    expect(stats.shared).toMatchObject({
+      maxConcurrent: 1,
+      inFlight: 1,
+      availableConcurrent: 0,
+    });
+    expect(stats.classes.premium).toMatchObject({
+      protectedConcurrentInUse: 2,
+      borrowedConcurrent: 1,
+      totalBorrowedAdmissions: 1,
+    });
+    expect(stats.classes.standard).toMatchObject({
+      protectedConcurrentInUse: 1,
+      borrowedConcurrent: 0,
+    });
+
+    for (const result of premium) {
+      if (result.ok) result.token.release();
+    }
+    if (standard.ok) standard.token.release();
+  });
+
+  it("protects token floors and reports borrowed token reservations", async () => {
+    const b = createLLMBulkhead({
+      model: "gpt-4o",
+      maxConcurrent: 10,
+      tokenBudget: { budget: 2_000, estimator: fixedEstimator },
+      admissionClasses: {
+        defaultClass: "standard",
+        classes: {
+          premium: {
+            protectedInFlightTokens: 400,
+            maxInFlightTokens: 2_000,
+          },
+          standard: {
+            protectedInFlightTokens: 800,
+            maxInFlightTokens: 2_000,
+          },
+        },
+      },
+    });
+
+    const premium: Array<Awaited<ReturnType<typeof b.acquire>>> = [];
+    for (let i = 0; i < 3; i++) {
+      const result = await b.acquire(request, { admissionClass: "premium" });
+      expect(result.ok).toBe(true);
+      premium.push(result);
+    }
+
+    const blocked = b.wouldAdmit(request, {
+      admissionClass: "premium",
+      detail: true,
+    });
+    expect(blocked).toMatchObject({
+      admit: false,
+      reason: "budget_limit",
+      detail: {
+        constraint: "admission_class_protection",
+        sharedCapacity: {
+          tokenBudget: {
+            capacity: 800,
+            inUse: 800,
+            available: 0,
+            requestedBorrowed: 400,
+          },
+        },
+      },
+    });
+
+    const standard1 = await b.acquire(request, { admissionClass: "standard" });
+    const standard2 = await b.acquire(request, { admissionClass: "standard" });
+    expect(standard1.ok).toBe(true);
+    expect(standard2.ok).toBe(true);
+
+    expect(b.stats().admissionClasses!.classes.premium).toMatchObject({
+      protectedTokensInUse: 400,
+      borrowedInFlightTokens: 800,
+      totalBorrowedTokensReserved: 800,
+    });
+    expect(b.stats().admissionClasses!.classes.standard).toMatchObject({
+      protectedTokensInUse: 800,
+      borrowedInFlightTokens: 0,
+    });
+
+    for (const result of [...premium, standard1, standard2]) {
+      if (result.ok) result.token.release();
+    }
+  });
+
+  it("restores raised floors by attrition without revoking active work", async () => {
+    const b = createLLMBulkhead({
+      model: "gpt-4o",
+      maxConcurrent: 4,
+      admissionClasses: {
+        defaultClass: "standard",
+        classes: {
+          premium: { maxConcurrent: 4 },
+          standard: { maxConcurrent: 4 },
+        },
+      },
+    });
+
+    const premium = await Promise.all(
+      Array.from({ length: 3 }, () =>
+        b.acquire(request, { admissionClass: "premium" }),
+      ),
+    );
+    expect(premium.every((result) => result.ok)).toBe(true);
+
+    b.applyLimits({
+      revision: 1,
+      maxConcurrent: 4,
+      maxQueue: 0,
+      admissionClasses: {
+        premium: { protectedConcurrent: 1, maxConcurrent: 4 },
+        standard: { protectedConcurrent: 2, maxConcurrent: 4 },
+      },
+    });
+
+    expect(b.stats().admissionClasses!.classes.premium).toMatchObject({
+      inFlight: 3,
+      protectedConcurrentInUse: 1,
+      borrowedConcurrent: 2,
+    });
+
+    await expect(
+      b.acquire(request, { admissionClass: "premium" }),
+    ).resolves.toMatchObject({
+      ok: false,
+      reason: "concurrency_limit",
+      detail: { constraint: "admission_class_protection" },
+    });
+
+    const standard1 = await b.acquire(request, { admissionClass: "standard" });
+    expect(standard1.ok).toBe(true);
+    const standardBlocked = await b.acquire(request, {
+      admissionClass: "standard",
+    });
+    expect(standardBlocked).toMatchObject({
+      ok: false,
+      reason: "concurrency_limit",
+      detail: { constraint: "global" },
+    });
+
+    const firstPremium = premium.find((result) => result.ok);
+    if (firstPremium?.ok) firstPremium.token.release();
+    const standard2 = await b.acquire(request, { admissionClass: "standard" });
+    expect(standard2.ok).toBe(true);
+
+    for (const result of premium) {
+      if (result.ok && result !== firstPremium) result.token.release();
+    }
+    if (standard1.ok) standard1.token.release();
+    if (standard2.ok) standard2.token.release();
+  });
+
 });

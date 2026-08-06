@@ -9,7 +9,8 @@ Designed for services that need to enforce **cost ceilings, concurrency limits, 
 ## Features
 
 - ✅ Hard **max in-flight** concurrency (`maxConcurrent`)
-- ✅ **Atomic versioned limit updates** — apply concurrency, queue, token budget, priority reserve, and admission-class ceilings as one revisioned snapshot
+- ✅ **Atomic versioned limit updates** — apply concurrency, queue, token budget, priority reserve, and admission-class floors/ceilings as one revisioned snapshot
+- ✅ **Protected admission-class floors** — reserve per-class concurrency and token capacity before requests borrow from the shared remainder
 - ✅ **Bounded admission classes** — isolate policy classes with hard per-class concurrency and in-flight token ceilings
 - ✅ **Admission-linearized revisions** — every admitted or bypassed lifecycle retains the exact limit revision that made the decision
 - ✅ **Token-aware admission** — reserves against estimated input + max output tokens
@@ -133,6 +134,57 @@ const result = await bulkhead.run(request, async () => {
   return callYourLLMProvider(request);
 });
 ```
+
+---
+
+## What's New in v3.15 — Protected admission-class floors
+
+v3.15 lets each statically configured admission class reserve a strict local
+concurrency floor and, when token admission is enabled, a strict in-flight
+token floor. Capacity above all floors forms a shared remainder that any class
+may borrow, subject to its hard class ceilings and the enclosing global limits.
+
+```ts
+const bulkhead = createLLMBulkhead({
+  model: "gpt-4o",
+  maxConcurrent: 12,
+  tokenBudget: { budget: 24_000 },
+  admissionClasses: {
+    defaultClass: "standard",
+    classes: {
+      premium: {
+        protectedConcurrent: 6,
+        maxConcurrent: 10,
+        protectedInFlightTokens: 12_000,
+        maxInFlightTokens: 20_000,
+      },
+      standard: {
+        protectedConcurrent: 2,
+        maxConcurrent: 6,
+        protectedInFlightTokens: 4_000,
+        maxInFlightTokens: 10_000,
+      },
+    },
+  },
+});
+```
+
+In this example, eight concurrency slots and 16,000 tokens are protected. The
+remaining four slots and 8,000 tokens are shared. Premium may exceed its floor
+by borrowing from that shared remainder, but it cannot consume the two slots
+or 4,000 tokens protected for standard.
+
+Floors are strict reservations, not idle-capacity lending. Unused protected
+capacity remains available only to its owning class. Cross-class lending of an
+idle floor requires a gateway or control plane to install a higher-revision
+snapshot. Increasing a floor never revokes active work: new borrowing pauses
+until completions restore the guarantee by attrition.
+
+`stats().admissionClasses` now reports the shared remainder plus each class's
+protected and borrowed usage. Rejections caused by preserving another class's
+floor use `constraint: "admission_class_protection"` and include the shared
+capacity snapshot. Omitting both floor fields preserves v3.14 admission
+behavior.
 
 ---
 
@@ -873,11 +925,12 @@ const bulkhead = createLLMBulkhead({
 
 ---
 
-## Bounded Admission Classes
+## Protected and Bounded Admission Classes
 
-Admission classes add a second, bounded capacity layer beneath the global
-bulkhead. They are useful when several trusted workload classes share one
-provider/model pool but need hard limits on each class's share.
+Admission classes add a statically bounded policy layer beneath the global
+bulkhead. Each class may define strict protected floors, hard ceilings, or both.
+A request must satisfy its class policy as well as the enclosing global
+concurrency and token limits.
 
 ```ts
 const bulkhead = createLLMBulkhead({
@@ -888,16 +941,20 @@ const bulkhead = createLLMBulkhead({
     defaultClass: 'standard',
     classes: {
       latencySensitive: {
-        maxConcurrent: 12,
-        maxInFlightTokens: 32_000,
+        protectedConcurrent: 8,
+        maxConcurrent: 14,
+        protectedInFlightTokens: 20_000,
+        maxInFlightTokens: 36_000,
       },
       standard: {
-        maxConcurrent: 6,
-        maxInFlightTokens: 14_000,
+        protectedConcurrent: 3,
+        maxConcurrent: 8,
+        protectedInFlightTokens: 8_000,
+        maxInFlightTokens: 20_000,
       },
       background: {
-        maxConcurrent: 2,
-        maxInFlightTokens: 4_000,
+        maxConcurrent: 4,
+        maxInFlightTokens: 10_000,
       },
     },
   },
@@ -908,22 +965,46 @@ await bulkhead.run(request, callProvider, {
 });
 ```
 
-A request must fit both the global limits and its class limits. Omitting
-`admissionClass` selects `defaultClass`. A class may omit either ceiling, in
-which case that dimension is governed only by the global bulkhead. Zero is a
-valid fail-closed class ceiling.
+`protectedConcurrent` and `protectedInFlightTokens` reserve capacity for the
+owning class. The sum of concurrency floors must not exceed
+`maxConcurrent`; the sum of token floors must not exceed
+`tokenBudget.budget`. A floor may not exceed the same class's hard ceiling.
+Invalid construction or reconfiguration snapshots throw before any limit is
+installed.
 
-Class checks are deliberately fail-fast; `maxQueue` remains a global queue and
-does not create per-class waiter queues. The fixed class keys keep runtime
-state and observability cardinality bounded. Map authenticated tenants or
-applications to these policy buckets before calling the library rather than
-using arbitrary identity values as class IDs.
+After all floors are subtracted, the remaining capacity is shared. A class
+uses its protected capacity first, then borrows from the shared remainder.
+Borrowing remains subject to `maxConcurrent`, `maxInFlightTokens`, the global
+limits, and the priority-adjusted token budget. A rejection required to keep
+another class's floor available reports
+`constraint: 'admission_class_protection'`.
 
-Identity verification, weights, minimum guarantees, lending, and distributed
-coordination are outside this single-process library. They belong in the
-calling gateway/control plane. Admission classes automatically partition
-deduplication from one another, but a class may still group multiple tenants;
-use `dedupScope` for tenant-level result isolation inside each class.
+Floors are deliberately strict: an idle class's protected capacity is not
+automatically lent to another class. A gateway or control plane may implement
+demand-aware lending by atomically applying a newer snapshot with adjusted
+floors. Raising a floor does not cancel work that is already active. Existing
+borrowers drain normally, while new shared-capacity admissions pause until the
+new floor is restored by attrition.
+
+Omitting a floor is equivalent to zero. Omitting a hard ceiling means that
+dimension is governed only by the global bulkhead. Zero is valid for either a
+floor or ceiling. Class checks remain fail-fast; `maxQueue` is still one global
+queue and does not create per-class waiter queues.
+
+The class table is fixed at construction, which bounds runtime state and metric
+cardinality. Map authenticated tenants or applications to these trusted policy
+buckets instead of using arbitrary identity values as class IDs. Identity
+verification and distributed coordination remain outside this single-process
+library. Admission classes partition deduplication automatically, but use
+`dedupScope` when tenants inside the same class must not share results.
+
+Telemetry includes:
+
+- `stats().admissionClasses.shared` for the shared concurrency/token remainder.
+- Per-class protected and borrowed in-flight usage.
+- Cumulative admissions whose concurrency came from shared capacity.
+- Cumulative reservation tokens placed in shared capacity at admission.
+- Rejection details showing protected, borrowed, and available shared capacity.
 
 ---
 
@@ -1336,6 +1417,16 @@ type LLMStats = {
   };
   admissionClasses?: {
     defaultClass: string;
+    shared: {
+      maxConcurrent: number;
+      inFlight: number;
+      availableConcurrent: number;
+      tokenBudget?: {
+        budget: number;
+        inFlightTokens: number;
+        available: number;
+      };
+    };
     classes: Record<string, LLMAdmissionClassStats>;
   };
   deduplication?: {
@@ -1409,8 +1500,10 @@ type LLMBulkheadOptions = {
   admissionClasses?: {
     defaultClass: string;
     classes: Record<string, {
+      protectedConcurrent?: number;
       maxConcurrent?: number;
-      maxInFlightTokens?: number; // requires tokenBudget
+      protectedInFlightTokens?: number; // requires tokenBudget
+      maxInFlightTokens?: number;       // requires tokenBudget
     }>;
   };
   deduplication?: boolean | DeduplicationOptions;
@@ -1537,7 +1630,9 @@ type LLMAdmissionLimits = {
     readonly highPriorityReserve: number;
   };
   readonly admissionClasses?: Readonly<Record<string, {
+    readonly protectedConcurrent?: number;
     readonly maxConcurrent?: number;
+    readonly protectedInFlightTokens?: number;
     readonly maxInFlightTokens?: number;
   }>>;
 };
@@ -1625,6 +1720,21 @@ type LLMRejectReason =
 ---
 
 ## Migration
+
+### v3.14 → v3.15
+
+No admission call-site changes are required. Configure
+`protectedConcurrent` and/or `protectedInFlightTokens` only when a class needs
+a strict local guarantee. The sum of floors must fit inside the corresponding
+global limit. Floors are not automatically lent while idle; a control plane
+must adjust them with `applyLimits()` to implement demand-aware lending.
+
+`stats().admissionClasses` gains `shared`, protected/borrowed usage fields, and
+cumulative borrowing counters. Rejection capacity details may now use
+`constraint: 'admission_class_protection'` and include `sharedCapacity`. Code
+that exhaustively asserts these additive object or union shapes must be
+updated. Omitting both floor fields preserves v3.14 admission behavior.
+
 
 ### v3.13 → v3.14
 

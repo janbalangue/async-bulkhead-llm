@@ -23,6 +23,7 @@ export type {
   LLMAdmissionClassLimits,
   LLMAdmissionClassesOptions,
   LLMAdmissionClassStats,
+  LLMAdmissionClassSharedStats,
   LLMAdmissionLimits,
   LLMApplyLimitsResult,
   LLMAcquireOptions,

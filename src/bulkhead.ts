@@ -73,7 +73,9 @@ function resolvePreset(
 
 type AdmissionClassState = {
   readonly id: string;
+  protectedConcurrent: number;
   maxConcurrent: number | undefined;
+  protectedInFlightTokens: number;
   maxInFlightTokens: number | undefined;
   inFlight: number;
   inFlightTokens: number;
@@ -85,6 +87,8 @@ type AdmissionClassState = {
   totalConsumed: number;
   totalRefunded: number;
   totalOverrun: number;
+  totalBorrowedAdmissions: number;
+  totalBorrowedTokensReserved: number;
 };
 
 type CapacityFailure = {
@@ -108,25 +112,86 @@ function readAdmissionClassLimits(
     throw new Error(`${label} must be an object`);
   }
   const source = value as LLMAdmissionClassLimits;
+  const protectedConcurrent = source.protectedConcurrent;
   const maxConcurrent = source.maxConcurrent;
+  const protectedInFlightTokens = source.protectedInFlightTokens;
   const maxInFlightTokens = source.maxInFlightTokens;
+  assertOptionalNonNegativeInteger(
+    protectedConcurrent,
+    `${label}.protectedConcurrent`,
+  );
   assertOptionalNonNegativeInteger(
     maxConcurrent,
     `${label}.maxConcurrent`,
   );
   assertOptionalNonNegativeInteger(
+    protectedInFlightTokens,
+    `${label}.protectedInFlightTokens`,
+  );
+  assertOptionalNonNegativeInteger(
     maxInFlightTokens,
     `${label}.maxInFlightTokens`,
   );
-  if (!tokenBudgetEnabled && maxInFlightTokens !== undefined) {
+  if (
+    maxConcurrent !== undefined &&
+    (protectedConcurrent ?? 0) > maxConcurrent
+  ) {
     throw new Error(
-      `${label}.maxInFlightTokens requires tokenBudget to be configured`,
+      `${label}.protectedConcurrent must be <= ${label}.maxConcurrent`,
     );
   }
+  if (
+    maxInFlightTokens !== undefined &&
+    (protectedInFlightTokens ?? 0) > maxInFlightTokens
+  ) {
+    throw new Error(
+      `${label}.protectedInFlightTokens must be <= ${label}.maxInFlightTokens`,
+    );
+  }
+  if (!tokenBudgetEnabled) {
+    if (protectedInFlightTokens !== undefined) {
+      throw new Error(
+        `${label}.protectedInFlightTokens requires tokenBudget to be configured`,
+      );
+    }
+    if (maxInFlightTokens !== undefined) {
+      throw new Error(
+        `${label}.maxInFlightTokens requires tokenBudget to be configured`,
+      );
+    }
+  }
   return Object.freeze({
+    ...(protectedConcurrent !== undefined && { protectedConcurrent }),
     ...(maxConcurrent !== undefined && { maxConcurrent }),
+    ...(protectedInFlightTokens !== undefined && {
+      protectedInFlightTokens,
+    }),
     ...(maxInFlightTokens !== undefined && { maxInFlightTokens }),
   });
+}
+
+function validateProtectedCapacity(
+  limits: Iterable<LLMAdmissionClassLimits>,
+  maxConcurrent: number,
+  tokenBudget: number | undefined,
+  label: string,
+): void {
+  let protectedConcurrent = 0;
+  let protectedTokens = 0;
+  for (const classLimits of limits) {
+    protectedConcurrent += classLimits.protectedConcurrent ?? 0;
+    protectedTokens += classLimits.protectedInFlightTokens ?? 0;
+  }
+  if (protectedConcurrent > maxConcurrent) {
+    throw new Error(
+      `${label} protectedConcurrent sum must be <= maxConcurrent`,
+    );
+  }
+  if (tokenBudget !== undefined && protectedTokens > tokenBudget) {
+    throw new Error(
+      `${label} protectedInFlightTokens sum must be <= tokenBudget.budget`,
+    );
+  }
 }
 
 // ────────────────────────────────────────────
@@ -185,6 +250,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       throw new Error("admissionClasses.classes must be an object");
     }
     const entries = Object.entries(classes);
+    const validatedClassLimits: LLMAdmissionClassLimits[] = [];
     if (entries.length === 0) {
       throw new Error("admissionClasses.classes must contain at least one class");
     }
@@ -195,9 +261,12 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         `admissionClasses.classes[${JSON.stringify(id)}]`,
         opts.tokenBudget !== undefined,
       );
+      validatedClassLimits.push(limits);
       admissionClassStates.set(id, {
         id,
+        protectedConcurrent: limits.protectedConcurrent ?? 0,
         maxConcurrent: limits.maxConcurrent,
+        protectedInFlightTokens: limits.protectedInFlightTokens ?? 0,
         maxInFlightTokens: limits.maxInFlightTokens,
         inFlight: 0,
         inFlightTokens: 0,
@@ -209,6 +278,8 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         totalConsumed: 0,
         totalRefunded: 0,
         totalOverrun: 0,
+        totalBorrowedAdmissions: 0,
+        totalBorrowedTokensReserved: 0,
       });
     }
     if (!admissionClassStates.has(defaultAdmissionClass)) {
@@ -217,6 +288,12 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
           `must name a configured class`,
       );
     }
+    validateProtectedCapacity(
+      validatedClassLimits,
+      opts.maxConcurrent,
+      opts.tokenBudget?.budget,
+      "admissionClasses",
+    );
   }
 
   // ---- Internal reconfigurable concurrency bulkhead ----
@@ -345,8 +422,14 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       entries.push([
         id,
         Object.freeze({
+          ...(state.protectedConcurrent > 0 && {
+            protectedConcurrent: state.protectedConcurrent,
+          }),
           ...(state.maxConcurrent !== undefined && {
             maxConcurrent: state.maxConcurrent,
+          }),
+          ...(state.protectedInFlightTokens > 0 && {
+            protectedInFlightTokens: state.protectedInFlightTokens,
           }),
           ...(state.maxInFlightTokens !== undefined && {
             maxInFlightTokens: state.maxInFlightTokens,
@@ -531,10 +614,70 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       : Math.max(0, currentBudget! - currentHighPriorityReserve);
   }
 
+  function protectedConcurrentTotal(): number {
+    let total = 0;
+    for (const state of admissionClassStates.values()) {
+      total += state.protectedConcurrent;
+    }
+    return total;
+  }
+
+  function protectedTokensTotal(): number {
+    let total = 0;
+    for (const state of admissionClassStates.values()) {
+      total += state.protectedInFlightTokens;
+    }
+    return total;
+  }
+
+  function protectedConcurrentInUse(state: AdmissionClassState): number {
+    return Math.min(state.inFlight, state.protectedConcurrent);
+  }
+
+  function protectedTokensInUse(state: AdmissionClassState): number {
+    return Math.min(state.inFlightTokens, state.protectedInFlightTokens);
+  }
+
+  function sharedConcurrentInUse(): number {
+    let protectedInUse = 0;
+    for (const state of admissionClassStates.values()) {
+      protectedInUse += protectedConcurrentInUse(state);
+    }
+    return Math.max(0, bulkhead.stats().inFlight - protectedInUse);
+  }
+
+  function sharedTokensInUse(): number {
+    let protectedInUse = 0;
+    for (const state of admissionClassStates.values()) {
+      protectedInUse += protectedTokensInUse(state);
+    }
+    return Math.max(0, inFlightTokens - protectedInUse);
+  }
+
+  function requestedBorrowedConcurrent(
+    admissionClass: AdmissionClassState | undefined,
+  ): number {
+    if (admissionClass === undefined) return 0;
+    return admissionClass.inFlight < admissionClass.protectedConcurrent ? 0 : 1;
+  }
+
+  function requestedBorrowedTokens(
+    admissionClass: AdmissionClassState | undefined,
+    reserved: number,
+  ): number {
+    if (admissionClass === undefined || reserved === 0) return 0;
+    const protectedAvailable = Math.max(
+      0,
+      admissionClass.protectedInFlightTokens - admissionClass.inFlightTokens,
+    );
+    return Math.max(0, reserved - protectedAvailable);
+  }
+
   function checkAdmissionCapacity(
     reserved: number,
     priority: LLMPriority,
     admissionClass: AdmissionClassState | undefined,
+    globalSlotHeld = false,
   ): CapacityFailure | undefined {
     if (budget && inFlightTokens + reserved > effectiveBudget(priority)) {
       return { reason: "budget_limit", constraint: "global" };
@@ -552,6 +695,62 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     ) {
       return { reason: "concurrency_limit", constraint: "admission_class" };
     }
+
+    if (admissionClass !== undefined) {
+      const totalProtectedConcurrent = protectedConcurrentTotal();
+      if (totalProtectedConcurrent > 0) {
+        const sharedConcurrentCapacity = Math.max(
+          0,
+          bulkhead.stats().maxConcurrent - totalProtectedConcurrent,
+        );
+        const globalInFlightBefore = Math.max(
+          0,
+          bulkhead.stats().inFlight - (globalSlotHeld ? 1 : 0),
+        );
+        let protectedConcurrentUsed = 0;
+        for (const state of admissionClassStates.values()) {
+          protectedConcurrentUsed += protectedConcurrentInUse(state);
+        }
+        const sharedConcurrentBefore = Math.max(
+          0,
+          globalInFlightBefore - protectedConcurrentUsed,
+        );
+        const borrowedConcurrentRequested =
+          requestedBorrowedConcurrent(admissionClass);
+        if (
+          borrowedConcurrentRequested > 0 &&
+          sharedConcurrentBefore + borrowedConcurrentRequested >
+            sharedConcurrentCapacity
+        ) {
+          return {
+            reason: "concurrency_limit",
+            constraint: "admission_class_protection",
+          };
+        }
+      }
+
+      const totalProtectedTokens = protectedTokensTotal();
+      if (budget && totalProtectedTokens > 0) {
+        const sharedTokenCapacity = Math.max(
+          0,
+          effectiveBudget(priority) - totalProtectedTokens,
+        );
+        const borrowedTokensRequested = requestedBorrowedTokens(
+          admissionClass,
+          reserved,
+        );
+        if (
+          borrowedTokensRequested > 0 &&
+          sharedTokensInUse() + borrowedTokensRequested >
+            sharedTokenCapacity
+        ) {
+          return {
+            reason: "budget_limit",
+            constraint: "admission_class_protection",
+          };
+        }
+      }
+    }
     return undefined;
   }
 
@@ -568,6 +767,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       reserved,
       priority,
       admissionClass,
+      true,
     );
     if (failure !== undefined) return failure;
 
@@ -576,8 +776,12 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       totalReserved += reserved;
     }
     if (admissionClass !== undefined) {
+      const borrowedConcurrent = requestedBorrowedConcurrent(admissionClass);
+      const borrowedTokens = requestedBorrowedTokens(admissionClass, reserved);
       admissionClass.inFlight++;
       admissionClass.admitted++;
+      admissionClass.totalBorrowedAdmissions += borrowedConcurrent;
+      admissionClass.totalBorrowedTokensReserved += borrowedTokens;
       if (budget) {
         admissionClass.inFlightTokens += reserved;
         admissionClass.totalReserved += reserved;
@@ -647,9 +851,60 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       };
     }
     if (admissionClass !== undefined) {
+      const classProtectedConcurrentInUse =
+        protectedConcurrentInUse(admissionClass);
+      const classProtectedTokensInUse = protectedTokensInUse(admissionClass);
+      const sharedConcurrentCapacity = Math.max(
+        0,
+        base.maxConcurrent - protectedConcurrentTotal(),
+      );
+      const sharedConcurrentUsed = sharedConcurrentInUse();
+      detail.sharedCapacity = {
+        concurrency: {
+          capacity: sharedConcurrentCapacity,
+          inUse: sharedConcurrentUsed,
+          available: Math.max(
+            0,
+            sharedConcurrentCapacity - sharedConcurrentUsed,
+          ),
+          requestedBorrowed: requestedBorrowedConcurrent(admissionClass),
+        },
+        ...(budget
+          ? {
+              tokenBudget: {
+                capacity: Math.max(
+                  0,
+                  effectiveBudget(priority) - protectedTokensTotal(),
+                ),
+                inUse: sharedTokensInUse(),
+                available: Math.max(
+                  0,
+                  Math.max(
+                    0,
+                    effectiveBudget(priority) - protectedTokensTotal(),
+                  ) - sharedTokensInUse(),
+                ),
+                requestedBorrowed: requestedBorrowedTokens(
+                  admissionClass,
+                  requested,
+                ),
+              },
+            }
+          : {}),
+      };
       detail.admissionClass = {
         id: admissionClass.id,
         inFlight: admissionClass.inFlight,
+        protectedConcurrent: admissionClass.protectedConcurrent,
+        protectedConcurrentInUse: classProtectedConcurrentInUse,
+        borrowedConcurrent: Math.max(
+          0,
+          admissionClass.inFlight - classProtectedConcurrentInUse,
+        ),
+        availableProtectedConcurrent: Math.max(
+          0,
+          admissionClass.protectedConcurrent - admissionClass.inFlight,
+        ),
         maxConcurrent: admissionClass.maxConcurrent ?? null,
         availableConcurrent:
           admissionClass.maxConcurrent === undefined
@@ -662,6 +917,18 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
           ? {
               tokenBudget: {
                 inFlightTokens: admissionClass.inFlightTokens,
+                protectedInFlightTokens:
+                  admissionClass.protectedInFlightTokens,
+                protectedTokensInUse: classProtectedTokensInUse,
+                borrowedInFlightTokens: Math.max(
+                  0,
+                  admissionClass.inFlightTokens - classProtectedTokensInUse,
+                ),
+                availableProtectedTokens: Math.max(
+                  0,
+                  admissionClass.protectedInFlightTokens -
+                    admissionClass.inFlightTokens,
+                ),
                 maxInFlightTokens:
                   admissionClass.maxInFlightTokens ?? null,
                 available:
@@ -865,6 +1132,15 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       );
     }
 
+    if (preparedAdmissionClassLimits !== undefined) {
+      validateProtectedCapacity(
+        preparedAdmissionClassLimits.values(),
+        maxConcurrent,
+        nextBudget,
+        "limits.admissionClasses",
+      );
+    }
+
     const previous = limits();
 
     // Install every LLM-layer value before pumping the concurrency queue.
@@ -878,7 +1154,10 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     if (preparedAdmissionClassLimits !== undefined) {
       for (const [id, nextLimits] of preparedAdmissionClassLimits) {
         const state = admissionClassStates.get(id)!;
+        state.protectedConcurrent = nextLimits.protectedConcurrent ?? 0;
         state.maxConcurrent = nextLimits.maxConcurrent;
+        state.protectedInFlightTokens =
+          nextLimits.protectedInFlightTokens ?? 0;
         state.maxInFlightTokens = nextLimits.maxInFlightTokens;
       }
     }
@@ -1976,32 +2255,82 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     }
 
     if (defaultAdmissionClass !== undefined) {
+      const sharedConcurrentCapacity = Math.max(
+        0,
+        base.maxConcurrent - protectedConcurrentTotal(),
+      );
+      const sharedConcurrentUsed = sharedConcurrentInUse();
+      const shared = {
+        maxConcurrent: sharedConcurrentCapacity,
+        inFlight: sharedConcurrentUsed,
+        availableConcurrent: Math.max(
+          0,
+          sharedConcurrentCapacity - sharedConcurrentUsed,
+        ),
+        ...(budget
+          ? {
+              tokenBudget: {
+                budget: Math.max(0, currentBudget! - protectedTokensTotal()),
+                inFlightTokens: sharedTokensInUse(),
+                available: Math.max(
+                  0,
+                  Math.max(0, currentBudget! - protectedTokensTotal()) -
+                    sharedTokensInUse(),
+                ),
+              },
+            }
+          : {}),
+      };
       result.admissionClasses = {
         defaultClass: defaultAdmissionClass,
+        shared,
         classes: Object.fromEntries(
-          Array.from(admissionClassStates, ([id, state]) => [
-            id,
-            {
-              limits: {
-                ...(state.maxConcurrent !== undefined && {
-                  maxConcurrent: state.maxConcurrent,
-                }),
-                ...(state.maxInFlightTokens !== undefined && {
-                  maxInFlightTokens: state.maxInFlightTokens,
-                }),
+          Array.from(admissionClassStates, ([id, state]) => {
+            const protectedConcurrency = protectedConcurrentInUse(state);
+            const protectedTokens = protectedTokensInUse(state);
+            return [
+              id,
+              {
+                limits: {
+                  ...(state.protectedConcurrent > 0 && {
+                    protectedConcurrent: state.protectedConcurrent,
+                  }),
+                  ...(state.maxConcurrent !== undefined && {
+                    maxConcurrent: state.maxConcurrent,
+                  }),
+                  ...(state.protectedInFlightTokens > 0 && {
+                    protectedInFlightTokens: state.protectedInFlightTokens,
+                  }),
+                  ...(state.maxInFlightTokens !== undefined && {
+                    maxInFlightTokens: state.maxInFlightTokens,
+                  }),
+                },
+                inFlight: state.inFlight,
+                protectedConcurrentInUse: protectedConcurrency,
+                borrowedConcurrent: Math.max(
+                  0,
+                  state.inFlight - protectedConcurrency,
+                ),
+                inFlightTokens: state.inFlightTokens,
+                protectedTokensInUse: protectedTokens,
+                borrowedInFlightTokens: Math.max(
+                  0,
+                  state.inFlightTokens - protectedTokens,
+                ),
+                admitted: state.admitted,
+                released: state.released,
+                rejected: state.rejected,
+                rejectedByReason: { ...state.rejectedByReason },
+                totalReserved: state.totalReserved,
+                totalConsumed: state.totalConsumed,
+                totalRefunded: state.totalRefunded,
+                totalOverrun: state.totalOverrun,
+                totalBorrowedAdmissions: state.totalBorrowedAdmissions,
+                totalBorrowedTokensReserved:
+                  state.totalBorrowedTokensReserved,
               },
-              inFlight: state.inFlight,
-              inFlightTokens: state.inFlightTokens,
-              admitted: state.admitted,
-              released: state.released,
-              rejected: state.rejected,
-              rejectedByReason: { ...state.rejectedByReason },
-              totalReserved: state.totalReserved,
-              totalConsumed: state.totalConsumed,
-              totalRefunded: state.totalRefunded,
-              totalOverrun: state.totalOverrun,
-            },
-          ]),
+            ];
+          }),
         ),
       };
     }

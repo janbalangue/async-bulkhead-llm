@@ -205,18 +205,26 @@ export type LLMRejectReason =
 export type LLMPriority = "high" | "normal";
 
 /**
- * Hard capacity ceilings for one statically configured admission class.
+ * Protected floors and hard ceilings for one statically configured admission
+ * class.
  *
- * Admission classes are intentionally bounded at construction time. A
- * gateway should map trusted tenant/application identity to one of these
- * policy-class IDs rather than using arbitrary tenant IDs directly.
+ * Admission classes are intentionally bounded at construction time. A gateway
+ * should map trusted tenant/application identity to one of these policy-class
+ * IDs rather than using arbitrary tenant IDs directly.
  *
- * Omitted fields inherit the enclosing bulkhead's global ceiling. Class
- * limits are always fail-fast; they do not create a separate per-class queue.
+ * Protected capacity is reserved before shared capacity is lent to requests
+ * above their class floor. Existing work is never revoked when a floor grows;
+ * new borrowing pauses until attrition restores the protected capacity.
+ * Omitted ceilings inherit the enclosing bulkhead's global ceiling. Class
+ * limits are fail-fast and do not create a separate per-class queue.
  */
 export type LLMAdmissionClassLimits = {
+  /** Requests reserved for this class before shared concurrency is lent. */
+  readonly protectedConcurrent?: number;
   /** Maximum requests from this class that may be in flight. */
   readonly maxConcurrent?: number;
+  /** Tokens reserved for this class before shared token capacity is lent. */
+  readonly protectedInFlightTokens?: number;
   /** Maximum tokens from this class that may be held in flight. */
   readonly maxInFlightTokens?: number;
 };
@@ -230,7 +238,10 @@ export type LLMAdmissionClassesOptions = {
 };
 
 /** Capacity layer that produced a rejection. */
-export type LLMCapacityConstraint = "global" | "admission_class";
+export type LLMCapacityConstraint =
+  | "global"
+  | "admission_class"
+  | "admission_class_protection";
 
 /**
  * Admission behavior for `run()`.
@@ -284,16 +295,39 @@ export type LLMRejectDetail = {
     /** Tokens this request needed. */
     requested: number;
   };
+  /** Shared capacity remaining after every configured class floor. */
+  sharedCapacity?: {
+    concurrency: {
+      capacity: number;
+      inUse: number;
+      available: number;
+      requestedBorrowed: number;
+    };
+    tokenBudget?: {
+      capacity: number;
+      inUse: number;
+      available: number;
+      requestedBorrowed: number;
+    };
+  };
   /** Bounded policy-class snapshot used for this decision. */
   admissionClass?: {
     id: string;
     inFlight: number;
+    protectedConcurrent: number;
+    protectedConcurrentInUse: number;
+    borrowedConcurrent: number;
+    availableProtectedConcurrent: number;
     /** `null` means no class-specific concurrency ceiling. */
     maxConcurrent: number | null;
     /** `null` means availability is governed only by the global ceiling. */
     availableConcurrent: number | null;
     tokenBudget?: {
       inFlightTokens: number;
+      protectedInFlightTokens: number;
+      protectedTokensInUse: number;
+      borrowedInFlightTokens: number;
+      availableProtectedTokens: number;
       /** `null` means no class-specific token ceiling. */
       maxInFlightTokens: number | null;
       /** `null` means availability is governed only by the global budget. */
@@ -415,7 +449,11 @@ export type LLMObserveStats = {
 export type LLMAdmissionClassStats = {
   limits: LLMAdmissionClassLimits;
   inFlight: number;
+  protectedConcurrentInUse: number;
+  borrowedConcurrent: number;
   inFlightTokens: number;
+  protectedTokensInUse: number;
+  borrowedInFlightTokens: number;
   admitted: number;
   released: number;
   rejected: number;
@@ -424,6 +462,21 @@ export type LLMAdmissionClassStats = {
   totalConsumed: number;
   totalRefunded: number;
   totalOverrun: number;
+  /** Admissions whose concurrency slot came from shared capacity. */
+  totalBorrowedAdmissions: number;
+  /** Reservation tokens placed in shared capacity at admission time. */
+  totalBorrowedTokensReserved: number;
+};
+
+export type LLMAdmissionClassSharedStats = {
+  maxConcurrent: number;
+  inFlight: number;
+  availableConcurrent: number;
+  tokenBudget?: {
+    budget: number;
+    inFlightTokens: number;
+    available: number;
+  };
 };
 
 export type LLMStats = {
@@ -478,6 +531,7 @@ export type LLMStats = {
   /** Present only when bounded admission classes are configured. */
   admissionClasses?: {
     defaultClass: string;
+    shared: LLMAdmissionClassSharedStats;
     classes: Record<string, LLMAdmissionClassStats>;
   };
 };
@@ -805,10 +859,12 @@ export type LLMBulkheadOptions = {
   /**
    * Optional bounded policy-class table for tenant/application isolation.
    *
-   * The library enforces hard class ceilings. Identity mapping, weights,
-   * protected floors, and lending policy belong in the gateway/control plane.
-   * Class keys are fixed at construction to keep state and metric cardinality
-   * bounded; `applyLimits()` may change only their numeric ceilings.
+   * The library enforces protected floors plus hard class ceilings. Capacity
+   * above a class floor is accounted as borrowed from the shared remainder.
+   * Identity mapping, weights, and distributed lending policy remain gateway /
+   * control-plane responsibilities. Class keys are fixed at construction to
+   * keep state and metric cardinality bounded; `applyLimits()` may change only
+   * their numeric limits.
    */
   admissionClasses?: LLMAdmissionClassesOptions;
 

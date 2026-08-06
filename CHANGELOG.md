@@ -7,6 +7,46 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.15.0] - 2026-08-06
+
+### Added
+
+* **Protected admission-class floors.** Admission classes may reserve strict
+  local concurrency with `protectedConcurrent` and strict in-flight token
+  capacity with `protectedInFlightTokens`. The sum of configured floors must
+  fit inside the corresponding global limit, and a class floor may not exceed
+  its hard class ceiling.
+
+* **Shared-capacity borrowing.** Capacity remaining after all protected floors
+  forms a shared pool. A class consumes its floor first and may then borrow from
+  the shared remainder, subject to its class ceilings, global limits, and the
+  priority-adjusted token budget.
+
+* **Protection-aware rejection detail.** Requests rejected to preserve another
+  class's floor report `constraint: "admission_class_protection"` and include
+  shared concurrency/token capacity plus protected and borrowed class usage.
+
+* **Borrowing telemetry.** `stats().admissionClasses.shared` exposes the shared
+  remainder. Per-class stats expose current protected and borrowed usage,
+  cumulative admissions using shared concurrency, and cumulative reservation
+  tokens placed in shared capacity.
+
+### Changed
+
+* **Non-revoking floor reconfiguration.** Floor changes are installed atomically
+  with the existing versioned admission snapshot. Increasing a floor never
+  revokes active work; new borrowing pauses until normal completion restores
+  the protected capacity by attrition.
+
+### Compatibility
+
+* This is an additive minor release. Omitting both protected-floor fields
+  preserves v3.14 admission behavior. Exact object-shape assertions must allow
+  the new stats, rejection-detail, limit, and capacity-constraint fields.
+* Protected floors are strict reservations and are not automatically lent while
+  idle. Demand-aware cross-class lending remains a gateway/control-plane policy
+  implemented by applying a newer limit snapshot.
+
 ## [3.14.0] - 2026-08-04
 
 ### Added
