@@ -7,6 +7,34 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.15.3] - 2026-08-18
+
+Documentation and package-metadata patch. No runtime code, public API, or
+dependency behavior changed.
+
+### Changed
+
+* **Removed the `rate-limiting` npm keyword.** `async-bulkhead-llm` provides
+  concurrency and in-flight token admission control; it does not implement a
+  conventional request/token rate limiter such as a fixed window, sliding
+  window, or token bucket. Removing the keyword avoids implying functionality
+  the library intentionally does not provide.
+
+### Fixed
+
+* **Updated the security support matrix.** `SECURITY.md` now identifies 3.15.3
+  as the only supported release, consistent with the policy that only the
+  latest release receives security fixes.
+
+* **Corrected stale cost-ceiling language in the security policy.** The token
+  under-reservation threat now describes exceeding the intended in-flight token
+  commitment bound rather than undermining a cumulative cost ceiling. This
+  matches the token-budget semantics documented in 3.15.2.
+
+### Compatibility
+
+* No API, runtime behavior, or dependency changes for consumers.
+
 ## [3.15.2] - 2026-08-17
 
 Documentation-only release. No runtime code changed and the public API is

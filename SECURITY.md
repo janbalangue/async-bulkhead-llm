@@ -6,10 +6,8 @@ Only the latest release receives security fixes.
 
 | Version | Supported |
 |---------|-----------|
-| 3.12.0  | ✅        |
-| 3.11.x  | ❌        |
-| 3.0–3.10 | ❌       |
-| < 3.0   | ❌        |
+| 3.15.3  | ✅        |
+| < 3.15.3 | ❌       |
 
 ---
 
@@ -42,8 +40,9 @@ exposure is narrow:
 - Admission bypass: a request is granted a slot despite `maxConcurrent` or
   `tokenBudget.budget` being exceeded, allowing resource exhaustion
 - Token budget under-reservation: the estimator systematically reserves far
-  fewer tokens than a request consumes, undermining the cost ceiling in a
-  way an attacker could exploit deliberately (e.g. via crafted input)
+  fewer tokens than a request consumes, allowing actual in-flight token usage
+  to exceed the intended commitment bound in a way an attacker could exploit
+  deliberately (e.g. via crafted input)
 - Denial-of-service via the queue: a caller can cause unbounded memory growth
   or starvation of legitimate requests despite `maxQueue` being set
 - Incorrect settle behaviour: a waiter is resolved more than once (ghost
