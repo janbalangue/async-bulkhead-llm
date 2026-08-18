@@ -1,0 +1,78 @@
+name: Docs
+
+# Builds the TypeDoc site and publishes it to GitHub Pages.
+#
+# One-time setup required in the repository:
+#   Settings -> Pages -> Build and deployment -> Source: "GitHub Actions"
+# Without that, the deploy job fails with a Pages-not-enabled error.
+#
+# Published at: https://janbalangue.github.io/async-bulkhead-llm/
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build docs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build docs
+        run: npm run docs
+
+      - name: Verify docs output
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f docs/index.html || { echo "docs/index.html missing"; exit 1; }
+          test -f docs/.nojekyll || { echo "docs/.nojekyll missing"; exit 1; }
+          test -d docs/documents || { echo "docs/documents missing — guides did not render"; exit 1; }
+          echo "Generated $(find docs -type f | wc -l) files"
+
+      # Only package the artifact for real deploys; PRs just prove the build works.
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    permissions:
+      pages: write
+      id-token: write
+
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

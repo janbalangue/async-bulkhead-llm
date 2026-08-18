@@ -15,6 +15,11 @@ dist/
 *.tsbuildinfo
 
 # =========================
+# Generated documentation (TypeDoc -> GitHub Pages)
+# =========================
+docs/
+
+# =========================
 # Test / coverage
 # =========================
 coverage/

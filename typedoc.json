@@ -1,0 +1,42 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+
+  "entryPoints": ["src/index.ts"],
+  "tsconfig": "tsconfig.types.json",
+  "out": "docs",
+
+  "name": "async-bulkhead-llm",
+  "includeVersion": true,
+  "readme": "README.md",
+  "hostedBaseUrl": "https://janbalangue.github.io/async-bulkhead-llm/",
+
+  "projectDocuments": [
+    "guides/concepts.md",
+    "guides/token-budget.md",
+    "guides/streaming.md",
+    "guides/admission-classes.md",
+    "guides/runtime-limits.md",
+    "guides/observe-mode.md",
+    "guides/deduplication.md",
+    "guides/gateway-integration.md",
+    "guides/telemetry.md",
+    "guides/comparison.md",
+    "guides/migration.md",
+    "CHANGELOG.md"
+  ],
+
+  "excludePrivate": true,
+  "excludeInternal": true,
+  "categorizeByGroup": true,
+
+  "navigationLinks": {
+    "GitHub": "https://github.com/janbalangue/async-bulkhead-llm",
+    "npm": "https://www.npmjs.com/package/async-bulkhead-llm"
+  },
+
+  "validation": {
+    "notExported": true,
+    "invalidLink": true,
+    "notDocumented": false
+  }
+}

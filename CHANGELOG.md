@@ -7,6 +7,73 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.15.2] - 2026-08-17
+
+Documentation-only release. No runtime code changed and the public API is
+identical to 3.15.1; no upgrade action is required.
+
+### Changed
+
+* **README rewritten for first-time readers.** The README is now a short
+  landing page (what the library does, install, quick start, token limits,
+  handling rejections, shutdown) instead of a 1,850-line reference. The
+  thirteen stacked "What's New in vX" sections have been removed from it;
+  per-release detail lives in this changelog, and the topical content moved
+  into `guides/`.
+
+* **Long-form documentation moved to `guides/`.** Eleven guides now carry the
+  material previously inlined in the README: how admission works, token budget
+  and estimation, streaming and reconciliation, admission classes, runtime
+  limits and reconfiguration, observe mode, deduplication, gateway
+  integration, stats and events, comparison, and migration. Content was moved
+  rather than rewritten.
+
+* **Hand-maintained API reference retired.** The `## API Reference` section is
+  replaced by the generated TypeDoc reference, which is derived from the
+  source types and therefore cannot drift from the code.
+
+### Added
+
+* **TypeDoc documentation site.** `npm run docs` generates a static site into
+  `docs/` from `src/index.ts`, with the README as the landing page and the
+  `guides/` files and this changelog rendered as site pages. Added
+  `docs:watch` for local iteration and `docs:coverage` to report symbols
+  missing TSDoc comments.
+
+* **GitHub Pages publishing.** `.github/workflows/docs.yml` builds the site on
+  every pull request and deploys it from `main`. Publishing requires the
+  repository Pages source to be set to "GitHub Actions". Generated output is
+  git-ignored and built in CI rather than committed.
+
+### Fixed
+
+* **`npm run lint` no longer fails after a docs build.** `eslint .` linted
+  TypeDoc's generated browser assets under `docs/`, producing 367 errors on
+  any working tree where documentation had been generated. `docs/**` and
+  `coverage/**` are now ignored by ESLint.
+
+* **Removed the cost-ceiling claim.** Earlier documentation described
+  `tokenBudget` as enforcing a "cost ceiling" that stops requests "before you
+  pay for them." That was wrong. The budget is a ceiling on tokens reserved
+  concurrently: admission compares `inFlightTokens + reserved` against the
+  budget, and the entire reservation is released when the request completes.
+  It bounds in-flight commitment, not cumulative spend, and a given budget
+  places no limit on total tokens consumed over time. The documentation now
+  states this explicitly, consistent with the library's long-standing
+  no-cost-accounting non-goal. No behavior changed — only the description of
+  it.
+
+* **Broken documentation links.** The README's `./LICENSE` and `./SECURITY.md`
+  links resolved correctly on GitHub but not in the generated site; both now
+  use absolute repository URLs so they work from GitHub, npm, and the
+  documentation site.
+
+### Compatibility
+
+* No API, behavior, or dependency changes for consumers. The published tarball
+  contents are unchanged apart from the rewritten `README.md`. `guides/` and
+  the documentation tooling are development-only and are not published.
+
 ## [3.15.1] - 2026-08-06
 
 ### Fixed
