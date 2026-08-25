@@ -7,6 +7,46 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.16.0] - 2026-08-25
+
+### Added
+
+* **Admission-decision timing on lifecycle events.** Instrumented `admit` and
+  admission-decision `reject` events now carry additive optional integer
+  nanosecond fields: `decisionDurationNs` and `queueWaitNs`. Timing uses
+  Node's monotonic `process.hrtime.bigint()` clock.
+
+* **Decision time is separated from queue wait.** `queueWaitNs` measures the
+  complete awaited `bulkhead.acquire()` span. `decisionDurationNs` excludes
+  that await and measures only synchronous admission work, so queue contention
+  cannot be misreported as local decision cost. Precheck rejects report
+  `queueWaitNs === 0` exactly.
+
+* **Admission timing coverage tests and clock-overhead microbenchmark.** Tests
+  cover precheck rejection, immediate and queued admission, acquire timeout,
+  queue-limit rejection, postcheck rejection after a limits race, and both
+  observe-mode bypass shapes. The suite also records the cost of the four
+  `process.hrtime.bigint()` reads required on paths that cross the acquire
+  await; it is diagnostic rather than a timing-sensitive CI gate.
+
+### Behavior
+
+* Observe-mode calls that are actually bypassed do not expose admission timing.
+  The advisory bypass path never enters admission. When a race causes
+  `_acquire()` to reject and observe mode converts that result to a bypass, the
+  existing `reject` event remains for backward compatibility but its timing
+  fields are absent.
+
+* Deduplication-follower rejections remain untimed because they are waits on an
+  existing admission rather than new admission decisions.
+
+### Compatibility
+
+* Additive minor release. Existing event fields and event names are unchanged.
+  Consumers that use exact event-object equality should account for the new
+  optional timing fields on instrumented `admit` / `reject` events.
+* No runtime dependency changes.
+
 ## [3.15.3] - 2026-08-18
 
 Documentation and package-metadata patch. No runtime code, public API, or

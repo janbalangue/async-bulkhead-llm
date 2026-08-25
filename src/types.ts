@@ -541,7 +541,20 @@ export type LLMStats = {
 // ────────────────────────────────────────────
 
 export type LLMEventMap = {
-  /** Fired after a request is admitted (slot + budget acquired). */
+  /**
+   * Fired after a request is admitted (slot + budget acquired).
+   *
+   * Admission timing fields are present for normal admission decisions and
+   * absent for lifecycle events that are not admission decisions. Both values
+   * are integer nanoseconds measured with Node's monotonic
+   * `process.hrtime.bigint()` clock.
+   *
+   * `queueWaitNs` is the complete span spent awaiting the underlying
+   * concurrency acquire. `decisionDurationNs` excludes that await and measures
+   * synchronous admission work, including acquire-option normalization,
+   * precheck, postcheck, revision capture, admission id creation, and token
+   * wrapping.
+   */
   admit: {
     request: LLMRequest;
     admissionId: string;
@@ -549,8 +562,27 @@ export type LLMEventMap = {
     priority: LLMPriority;
     admissionClass?: string;
     reservedTokens: number;
+    /** Synchronous admission-decision time, excluding `queueWaitNs`. */
+    decisionDurationNs?: number;
+    /** Time spent awaiting the underlying concurrency acquire. */
+    queueWaitNs?: number;
   };
-  /** Fired when a request is rejected at any stage. */
+  /**
+   * Fired when a request is rejected at any stage.
+   *
+   * Timing is attached only when the event represents an admission decision.
+   * Deduplication-follower failures and observe-mode bypasses are deliberately
+   * left uninstrumented because they are not admission decisions.
+   *
+   * Boundaries for instrumented rejection paths:
+   *
+   * - precheck reject: `queueWaitNs === 0`; decision time is the precheck span
+   * - acquire reject / timeout: full acquire await + synchronous precheck,
+   *   acquire-option normalization, and reject-detail work
+   * - postcheck reject: full acquire await + synchronous precheck,
+   *   acquire-option normalization, postcheck, acquired-slot cleanup, and
+   *   reject-detail work
+   */
   reject: {
     request: LLMRequest;
     reason: LLMRejectReason;
@@ -559,6 +591,10 @@ export type LLMEventMap = {
     /** Capacity snapshot; absent for dedup-wait rejections. */
     detail?: LLMRejectDetail;
     admissionClass?: string;
+    /** Synchronous admission-decision time, excluding `queueWaitNs`. */
+    decisionDurationNs?: number;
+    /** Time spent awaiting the underlying concurrency acquire. */
+    queueWaitNs?: number;
   };
   /**
    * Fired when a slot is released.

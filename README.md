@@ -156,6 +156,11 @@ s.tokenBudget?.available;         // budget headroom
 bulkhead.on('reject', ({ reason, detail }) => metrics.increment(reason));
 ```
 
+`admit` and admission-decision `reject` events also expose optional
+`decisionDurationNs` and `queueWaitNs` fields. Decision time excludes the
+underlying concurrency wait, so local admission cost and queue contention stay
+separate.
+
 → [Stats and events](guides/telemetry.md)
 
 ## Shutting down cleanly

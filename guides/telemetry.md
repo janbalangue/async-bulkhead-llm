@@ -118,8 +118,8 @@ off();
 
 | Event     | Payload |
 |-----------|---------|
-| `admit`   | `{ request, admissionId, limitRevision, priority, admissionClass?, reservedTokens }` |
-| `reject`  | `{ request, reason, limitRevision, admissionClass?, detail? }` |
+| `admit`   | `{ request, admissionId, limitRevision, priority, admissionClass?, reservedTokens, decisionDurationNs?, queueWaitNs? }` |
+| `reject`  | `{ request, reason, limitRevision, admissionClass?, detail?, decisionDurationNs?, queueWaitNs? }` |
 | `usage`   | `{ request, admissionId, limitRevision, priority, admissionClass?, sequence, reservedTokens, previousHeldTokens, heldTokens, deltaTokens, usage, outputCap, outputRemaining, overReservation }` |
 | `release` | `{ request, admissionId, limitRevision, priority, admissionClass?, reservedTokens, heldTokens, refundedTokens, usageSequence, usage? }` |
 | `bypass` | `{ request, admissionId, limitRevision, priority, admissionClass?, reason, detail?, reservation, raced }` |
@@ -131,6 +131,33 @@ off();
 Listeners are synchronous and fire-and-forget. Exceptions are silently caught.
 Do not perform blocking network I/O in a listener; enqueue telemetry or lease
 updates for asynchronous delivery.
+
+### Admission-decision timing
+
+`decisionDurationNs` and `queueWaitNs` are integer nanoseconds measured with
+Node's monotonic `process.hrtime.bigint()` clock. They are optional because
+some `reject` events represent deduplication-follower failures rather than a
+new admission decision, and observe-mode calls that become bypasses are not
+timed as admissions.
+
+The public timing boundary is:
+
+| Path | `queueWaitNs` | `decisionDurationNs` |
+|---|---:|---|
+| precheck reject | exactly `0` | precheck span |
+| acquire reject / timeout | full awaited span | precheck + acquire-option normalization + reject-detail build |
+| postcheck reject | full awaited span | precheck + acquire-option normalization + postcheck + acquired-slot cleanup + detail build |
+| admit (unqueued or queued) | full awaited span | precheck + acquire-option normalization + postcheck + revision capture + uuid + `wrapToken` |
+
+`decisionDurationNs` excludes the awaited `bulkhead.acquire()` in every case.
+Use it for local admission-decision cost. Use `queueWaitNs` separately for
+contention / intentional waiting; do not add queue wait to the decision number
+and call the sum admission overhead.
+
+The second observe-mode bypass path is a compatibility wrinkle: if an advisory
+decision is positive but `_acquire()` later loses a race with a shadowable
+limit, the existing `reject` event still fires before `run()` converts the
+result into `bypass`. That reject event deliberately omits both timing fields.
 
 ```ts
 const off = bulkhead.on('release', ({ reservedTokens, refundedTokens, usage }) => {

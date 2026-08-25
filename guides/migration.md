@@ -10,6 +10,18 @@ cover what changes if you assert exact object shapes.
 For the full per-release record, see the
 [changelog](../CHANGELOG.md).
 
+## v3.15 → v3.16
+
+No admission call-site changes are required. Instrumented `admit` and
+admission-decision `reject` events gain two optional integer nanosecond fields:
+`decisionDurationNs` and `queueWaitNs`. Code that asserts exact event object
+shapes should allow these additive fields.
+
+`queueWaitNs` is exactly `0` for precheck rejection and otherwise measures the
+complete awaited concurrency-acquire span. `decisionDurationNs` excludes that
+await. Deduplication-follower rejections and observe-mode bypasses are not
+admission decisions and therefore do not carry admission timing.
+
 ## v3.14 → v3.15
 
 No admission call-site changes are required. Configure `protectedConcurrent`

@@ -1587,12 +1587,23 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     request: LLMRequest,
     ao: LLMAcquireOptions,
     resolved: ResolvedAdmission = resolveAdmission(request, ao),
+    untimedRejectReasons?: ReadonlySet<LLMShadowableRejectReason>,
   ): Promise<LLMAcquireResult> {
     const { priority, admissionClass, parts, reserved } = resolved;
+
+    // Admission timing deliberately separates synchronous decision work from
+    // the awaited concurrency acquire. Exact accounting requires four
+    // monotonic clock reads on paths that reach the acquire: decision start,
+    // wait start, wait end, and decision end. Precheck rejects use two reads.
+    const decisionStartedNs = process.hrtime.bigint();
+    let waitStartedNs = 0n;
+    let waitEndedNs = 0n;
+    let queueWaitNs = 0;
 
     const rejectWith = (
       reason: LLMRejectReason,
       constraint?: LLMCapacityConstraint,
+      precheckDecisionDurationNs?: number,
     ): LLMAcquireResult => {
       const detail = buildRejectDetail(
         reserved,
@@ -1600,9 +1611,20 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         admissionClass,
         constraint,
       );
+      const includeTiming =
+        untimedRejectReasons === undefined ||
+        !untimedRejectReasons.has(reason as LLMShadowableRejectReason);
+      const decisionDurationNs = includeTiming
+        ? precheckDecisionDurationNs ??
+          Number(
+            waitStartedNs -
+              decisionStartedNs +
+              (process.hrtime.bigint() - waitEndedNs),
+          )
+        : undefined;
       noteLLMReject(reason);
       noteAdmissionClassReject(admissionClass, reason);
-      emit("reject", {
+      const event: LLMEventMap["reject"] = {
         request,
         reason,
         limitRevision: detail.limitRevision,
@@ -1610,7 +1632,12 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         ...(admissionClass !== undefined
           ? { admissionClass: admissionClass.id }
           : {}),
-      });
+      };
+      if (decisionDurationNs !== undefined) {
+        event.decisionDurationNs = decisionDurationNs;
+        event.queueWaitNs = queueWaitNs;
+      }
+      emit("reject", event);
       return { ok: false, reason, detail };
     };
 
@@ -1622,12 +1649,27 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       admissionClass,
     );
     if (precheck !== undefined) {
-      return rejectWith(precheck.reason, precheck.constraint);
+      const includeTiming =
+        untimedRejectReasons === undefined ||
+        !untimedRejectReasons.has(
+          precheck.reason as LLMShadowableRejectReason,
+        );
+      const precheckDecisionDurationNs = includeTiming
+        ? Number(process.hrtime.bigint() - decisionStartedNs)
+        : undefined;
+      return rejectWith(
+        precheck.reason,
+        precheck.constraint,
+        precheckDecisionDurationNs,
+      );
     }
 
     const mergedOptions = normalizeAcquireOptions(ao);
 
+    waitStartedNs = process.hrtime.bigint();
     const r = await bulkhead.acquire(mergedOptions);
+    waitEndedNs = process.hrtime.bigint();
+    queueWaitNs = Number(waitEndedNs - waitStartedNs);
 
     if (!r.ok) {
       const constraint: LLMCapacityConstraint | undefined =
@@ -1665,6 +1707,11 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       priority,
       admissionClass,
     );
+    const decisionDurationNs = Number(
+      waitStartedNs -
+        decisionStartedNs +
+        (process.hrtime.bigint() - waitEndedNs),
+    );
     noteLLMAdmit();
     emit("admit", {
       request,
@@ -1675,6 +1722,8 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         ? { admissionClass: admissionClass.id }
         : {}),
       reservedTokens: reserved,
+      decisionDurationNs,
+      queueWaitNs,
     });
     return {
       ok: true,
@@ -2136,6 +2185,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         acquireOpts,
         resolved ??
           resolveAdmission(request, acquireOpts, selectedAdmissionClass),
+        mode === "observe" ? shadowReasons : undefined,
       );
       if (!r.ok) {
         if (mode === "observe" && shouldBypass(r.reason, shadowReasons)) {
