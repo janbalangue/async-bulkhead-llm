@@ -77,8 +77,9 @@ dependency behavior changed.
 
 ## [3.15.2] - 2026-08-17
 
-Documentation-only release. No runtime code changed and the public API is
-identical to 3.15.1; no upgrade action is required.
+Documentation release, with one development-only dependency update. No runtime
+code changed and the public API is identical to 3.15.1; no upgrade action is
+required.
 
 ### Changed
 
@@ -136,9 +137,22 @@ identical to 3.15.1; no upgrade action is required.
   use absolute repository URLs so they work from GitHub, npm, and the
   documentation site.
 
+### Security
+
+* **Resolved GHSA-2v37-7h3g-55p8 in `nanoid` (development-only).** `npm audit`
+  reported this high-severity advisory -- custom generators can loop
+  indefinitely when `size` is zero -- against every `nanoid` before 3.3.18. The
+  lockfile now resolves 3.3.18, which carries the fix. `nanoid` reaches this
+  repository only as a development-time transitive dependency (`vitest` ->
+  `vite` -> `postcss` -> `nanoid`); it has never been a runtime dependency and
+  is not part of the published tarball, so consumers of `async-bulkhead-llm`
+  were never exposed. `npm audit` now reports no known vulnerabilities at any
+  severity.
+
 ### Compatibility
 
-* No API, behavior, or dependency changes for consumers. The published tarball
+* No API, behavior, or runtime dependency changes for consumers; the `nanoid`
+  bump is confined to development-only tooling. The published tarball
   contents are unchanged apart from the rewritten `README.md`. `guides/` and
   the documentation tooling are development-only and are not published.
 

@@ -64,11 +64,32 @@ exposure is narrow:
 ## Dependencies
 
 `async-bulkhead-llm` has one runtime dependency: `async-bulkhead-ts`.
-Both libraries are zero-dependency relative to the broader npm ecosystem.
+Both libraries are zero-dependency relative to the broader npm ecosystem, so
+the installed runtime tree is exactly these two packages and nothing else.
+
+Development dependencies (test, lint, and documentation tooling) are excluded
+from the published tarball and are never installed by consumers. A
+vulnerability confined to that tooling therefore does not reach consumers of
+this library, though we still update it promptly.
 
 If a vulnerability is found in `async-bulkhead-ts`, please report it to that
 project directly. If the vulnerability affects `async-bulkhead-llm` consumers
 and requires a coordinated release, report it here as well.
+
+### Resolved advisories
+
+* **[GHSA-2v37-7h3g-55p8](https://github.com/advisories/GHSA-2v37-7h3g-55p8) —
+  `nanoid`, high severity, development-only.** Custom generators can loop
+  indefinitely when `size` is zero, in any `nanoid` before 3.3.18. Resolved by
+  moving the lockfile to `nanoid` 3.3.18 in 3.15.2, and current in every
+  supported release since. `nanoid` is reached only through test tooling
+  (`vitest` -> `vite` -> `postcss` -> `nanoid`), never as a runtime dependency,
+  and is not part of the published tarball, so no consumer of
+  `async-bulkhead-llm` was exposed.
+
+`npm audit` reports no known vulnerabilities at any severity, in either the
+runtime or the development tree. Future advisories will be recorded here and in
+the CHANGELOG, with their consumer impact stated explicitly.
 
 ---
 
