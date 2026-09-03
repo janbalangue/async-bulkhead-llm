@@ -64,6 +64,62 @@ floors. Raising a floor does not cancel work that is already active. Existing
 borrowers drain normally, while new shared-capacity admissions pause until the
 new floor is restored by attrition.
 
+## Resource-specific restoration
+
+Borrowing can consume more than one constrained resource, and one restoration
+mechanism must not be presented as stronger than it is. Every successful
+admission exposes immutable `resources` attribution on its result, token, run
+context, and lifecycle events:
+
+```ts
+const result = await bulkhead.acquire(request, {
+  admissionClass: "background",
+});
+
+if (result.ok && result.resources.borrowedConcurrency) {
+  result.token.abandonBorrowedConcurrency();
+}
+```
+
+`abandonBorrowedConcurrency()` is idempotent and succeeds only for an admission
+whose local concurrency came from shared capacity. It returns that slot
+immediately but retains the token reservation until `release()`. The separate
+`borrowedConcurrencyAbandon` event and counters make that state visible.
+
+The event carries a `cause` of `manual` or `deadline`, and
+`llm.borrowedConcurrencyAbandonedByCause` counts each separately. The split
+matters operationally: deliberate shedding by the application and a lease that
+is configured too tight produce identical slot returns, and only the second is
+a signal to raise `borrowedConcurrencyDeadlineMs`.
+
+For automatic wall-clock enforcement, pass a deadline to `run()`:
+
+```ts
+await bulkhead.run(request, callProvider, {
+  admissionClass: "background",
+  borrowedConcurrencyDeadlineMs: 30_000,
+});
+```
+
+The deadline starts only after successful admission and only when the local
+slot is borrowed. Expiry aborts the callback signal, returns the local slot,
+and rejects the caller with `LLMBorrowedConcurrencyDeadlineError`. The
+underlying callback remains responsible for final token settlement; `drain()`
+continues to count it until that happens.
+
+The same rule applies to manual `acquire()`: after abandoning borrowed
+concurrency, the caller must eventually call `token.release()`. Otherwise
+`drain()` without a timeout remains pending because the admission still owns a
+token hold. Use bounded drain when shutdown must proceed despite an unsettled
+caller.
+
+This is an enforceable restoration bound for the in-process admission slot.
+It is not evidence that an upstream provider stopped generating. If remote
+cancellation is best-effort, token accounting after the local callback settles
+is still only an accounting view. A hard upstream guarantee requires capacity
+that is never lent for that resource (an unlent floor) or an authoritative
+provider-side cancellation/partition mechanism.
+
 Omitting a floor is equivalent to zero. Omitting a hard ceiling means that
 dimension is governed only by the global bulkhead. Zero is valid for either a
 floor or ceiling. Class checks remain fail-fast; `maxQueue` is still one
@@ -152,6 +208,10 @@ for tenant-level isolation inside a class.
 - Per-class protected and borrowed in-flight usage.
 - Cumulative admissions whose concurrency came from shared capacity.
 - Cumulative reservation tokens placed in shared capacity at admission.
+- Cumulative borrowed concurrency abandonments globally and per class, split
+  globally by `manual` versus `deadline` cause.
+- `resources.borrowedConcurrency` and `resources.borrowedTokens` attribution
+  on admission, final release, tokens, and run contexts.
 - Rejection details showing protected, borrowed, and available shared
   capacity, and whether the binding constraint was `global` or
   `admission_class`.

@@ -24,6 +24,9 @@ s.bulkhead.closed                    // true after close()
 
 s.llm.admitted
 s.llm.released
+s.llm.inFlight
+s.llm.borrowedConcurrencyAbandoned
+s.llm.borrowedConcurrencyAbandonedByCause?.deadline
 s.llm.rejected
 s.llm.rejectedByReason?.budget_limit
 
@@ -59,8 +62,13 @@ type LLMStats = {
   limits: LLMAdmissionLimits;
   bulkhead: Stats;
   llm: {
+    inFlight: number;
     admitted: number;
     released: number;
+    borrowedConcurrencyAbandoned: number;
+    borrowedConcurrencyAbandonedByCause: Partial<
+      Record<LLMBorrowedConcurrencyAbandonCause, number>
+    >;
     rejected: number;
     rejectedByReason: Partial<Record<LLMRejectReason, number>>;
   };
@@ -118,10 +126,11 @@ off();
 
 | Event     | Payload |
 |-----------|---------|
-| `admit`   | `{ request, admissionId, limitRevision, priority, admissionClass?, reservedTokens, decisionDurationNs?, queueWaitNs? }` |
+| `admit`   | `{ request, admissionId, limitRevision, priority, admissionClass?, reservedTokens, resources, decisionDurationNs?, queueWaitNs? }` |
+| `borrowedConcurrencyAbandon` | `{ request, admissionId, limitRevision, priority, admissionClass?, resources, cause, heldTokens }` |
 | `reject`  | `{ request, reason, limitRevision, admissionClass?, detail?, decisionDurationNs?, queueWaitNs? }` |
 | `usage`   | `{ request, admissionId, limitRevision, priority, admissionClass?, sequence, reservedTokens, previousHeldTokens, heldTokens, deltaTokens, usage, outputCap, outputRemaining, overReservation }` |
-| `release` | `{ request, admissionId, limitRevision, priority, admissionClass?, reservedTokens, heldTokens, refundedTokens, usageSequence, usage? }` |
+| `release` | `{ request, admissionId, limitRevision, priority, admissionClass?, reservedTokens, resources, heldTokens, refundedTokens, usageSequence, usage? }` |
 | `bypass` | `{ request, admissionId, limitRevision, priority, admissionClass?, reason, detail?, reservation, raced }` |
 | `bypassUsage` | `{ request, admissionId, limitRevision, priority, admissionClass?, reason, sequence, reservation, usage, outputCap, outputRemaining, overReservation }` |
 | `bypassRelease` | `{ request, admissionId, limitRevision, priority, admissionClass?, reason, reservation, usageSequence, usage? }` |

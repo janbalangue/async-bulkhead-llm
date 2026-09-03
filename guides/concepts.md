@@ -174,7 +174,10 @@ await bulkhead.drain();  // wait for in-flight work to finish
 ```
 
 `close()` is synchronous, idempotent, and irreversible. `drain()` resolves
-when `inFlight` and `pending` both reach zero.
+when base concurrency, pending waiters, and LLM token settlement all reach
+zero. Returning a borrowed local slot with `abandonBorrowedConcurrency()` does
+not settle the admission. If a manual `acquire()` caller abandons that slot but
+never calls `release()`, no-timeout `drain()` intentionally keeps waiting.
 
 With a deadline, `drain()` always *resolves* — never rejects — with what
 happened:

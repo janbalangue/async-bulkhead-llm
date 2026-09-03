@@ -8,6 +8,8 @@ import { randomUUID } from "node:crypto";
 import type {
   Listener,
   LLMAdmissionClassLimits,
+  LLMAdmissionResources,
+  LLMBorrowedConcurrencyAbandonCause,
   LLMAdmissionLimits,
   LLMApplyLimitsResult,
   LLMAcquireOptions,
@@ -34,7 +36,10 @@ import type {
   UsageReport,
   ProgressiveReconciliationOptions,
 } from "./types.js";
-import { LLMBulkheadRejectedError } from "./errors.js";
+import {
+  LLMBorrowedConcurrencyDeadlineError,
+  LLMBulkheadRejectedError,
+} from "./errors.js";
 import { PROFILES, type LLMBulkheadPreset } from "./profiles.js";
 import { createModelAwareTokenEstimator } from "./estimators.js";
 import {
@@ -81,6 +86,7 @@ type AdmissionClassState = {
   inFlightTokens: number;
   admitted: number;
   released: number;
+  borrowedConcurrencyAbandoned: number;
   rejected: number;
   rejectedByReason: Partial<Record<LLMRejectReason, number>>;
   totalReserved: number;
@@ -95,6 +101,32 @@ type CapacityFailure = {
   reason: Extract<LLMRejectReason, "budget_limit" | "concurrency_limit">;
   constraint: LLMCapacityConstraint;
 };
+
+type CapacityReservationResult =
+  | { readonly ok: false; readonly failure: CapacityFailure }
+  | { readonly ok: true; readonly resources: LLMAdmissionResources };
+
+const NO_ADMISSION_RESOURCES: LLMAdmissionResources = Object.freeze({
+  borrowedConcurrency: false,
+  borrowedTokens: 0,
+});
+
+/**
+ * Internal view of a wrapped token. `run()` must attribute a lease expiry
+ * distinctly from an application's own abandonment without widening the
+ * public `LLMToken` surface, where a caller-supplied cause would be
+ * unverifiable telemetry. The key is a module-private symbol so the
+ * capability is unreachable from a published token.
+ */
+const ABANDON_WITH_CAUSE = Symbol("abandonBorrowedConcurrencyWithCause");
+
+type WrappedLLMToken = LLMToken & {
+  [ABANDON_WITH_CAUSE](cause: LLMBorrowedConcurrencyAbandonCause): boolean;
+};
+
+type InternalAcquireResult =
+  | (Extract<LLMAcquireResult, { ok: true }> & { token: WrappedLLMToken })
+  | Extract<LLMAcquireResult, { ok: false }>;
 
 function validateAdmissionClassId(value: unknown, label: string): string {
   if (typeof value !== "string" || value.trim() === "") {
@@ -272,6 +304,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         inFlightTokens: 0,
         admitted: 0,
         released: 0,
+        borrowedConcurrencyAbandoned: 0,
         rejected: 0,
         rejectedByReason: {},
         totalReserved: 0,
@@ -324,8 +357,13 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
   let totalOverrun = 0;
   let llmAdmitted = 0;
   let llmReleased = 0;
+  let llmBorrowedConcurrencyAbandoned = 0;
+  const llmBorrowedConcurrencyAbandonedByCause: Partial<
+    Record<LLMBorrowedConcurrencyAbandonCause, number>
+  > = {};
   let llmRejected = 0;
   const llmRejectedByReason: Partial<Record<LLMRejectReason, number>> = {};
+  const llmDrainWaiters = new Set<() => void>();
   let observeBypassed = 0;
   let observeRaceBypassed = 0;
   const observeBypassedByReason: Partial<
@@ -344,6 +382,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
   // ---- Event emitter state ----
   const listeners: { [K in LLMEventType]: Set<Listener<K>> } = {
     admit: new Set(),
+    borrowedConcurrencyAbandon: new Set(),
     reject: new Set(),
     release: new Set(),
     usage: new Set(),
@@ -373,6 +412,24 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
 
   function noteLLMRelease(): void {
     llmReleased++;
+    settleLLMDrainWaiters();
+  }
+
+  function llmInFlight(): number {
+    return Math.max(0, llmAdmitted - llmReleased);
+  }
+
+  function settleLLMDrainWaiters(): void {
+    if (llmInFlight() !== 0) return;
+    for (const resolve of llmDrainWaiters) resolve();
+    llmDrainWaiters.clear();
+  }
+
+  function waitForLLMDrain(): Promise<void> {
+    if (llmInFlight() === 0) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      llmDrainWaiters.add(resolve);
+    });
   }
 
   function noteLLMReject(reason: LLMRejectReason): void {
@@ -762,35 +819,54 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     reserved: number,
     priority: LLMPriority,
     admissionClass: AdmissionClassState | undefined,
-  ): CapacityFailure | undefined {
+  ): CapacityReservationResult {
     const failure = checkAdmissionCapacity(
       reserved,
       priority,
       admissionClass,
       true,
     );
-    if (failure !== undefined) return failure;
+    if (failure !== undefined) return { ok: false, failure };
+
+    const resources: LLMAdmissionResources = Object.freeze({
+      borrowedConcurrency:
+        admissionClass === undefined
+          ? false
+          : requestedBorrowedConcurrent(admissionClass) > 0,
+      borrowedTokens:
+        admissionClass === undefined
+          ? 0
+          : requestedBorrowedTokens(admissionClass, reserved),
+    });
 
     if (budget) {
       inFlightTokens += reserved;
       totalReserved += reserved;
     }
     if (admissionClass !== undefined) {
-      const borrowedConcurrent = requestedBorrowedConcurrent(admissionClass);
-      const borrowedTokens = requestedBorrowedTokens(admissionClass, reserved);
       admissionClass.inFlight++;
       admissionClass.admitted++;
-      admissionClass.totalBorrowedAdmissions += borrowedConcurrent;
-      admissionClass.totalBorrowedTokensReserved += borrowedTokens;
+      admissionClass.totalBorrowedAdmissions += resources.borrowedConcurrency
+        ? 1
+        : 0;
+      admissionClass.totalBorrowedTokensReserved += resources.borrowedTokens;
       if (budget) {
         admissionClass.inFlightTokens += reserved;
         admissionClass.totalReserved += reserved;
       }
     }
-    return undefined;
+    return { ok: true, resources };
   }
 
-  function releaseCapacity(
+  function releaseConcurrency(
+    admissionClass: AdmissionClassState | undefined,
+  ): void {
+    if (admissionClass !== undefined) {
+      admissionClass.inFlight = Math.max(0, admissionClass.inFlight - 1);
+    }
+  }
+
+  function settleTokenCapacity(
     held: number,
     usage: TokenUsage | undefined,
     admissionClass: AdmissionClassState | undefined,
@@ -816,7 +892,6 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         0,
         admissionClass.inFlightTokens - held,
       );
-      admissionClass.inFlight = Math.max(0, admissionClass.inFlight - 1);
       admissionClass.released++;
     }
     return refunded;
@@ -1368,8 +1443,10 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     limitRevision: number,
     priority: LLMPriority,
     admissionClass: AdmissionClassState | undefined,
-  ): LLMToken {
+    resources: LLMAdmissionResources,
+  ): WrappedLLMToken {
     let released = false;
+    let concurrencyReleased = false;
     /** Tokens currently held against the budget for this request. */
     let held = parts?.reserved ?? 0;
     /** Last reported cumulative usage (monotonically clamped). */
@@ -1518,6 +1595,39 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       return report;
     };
 
+    const abandonBorrowedConcurrency = (
+      cause: LLMBorrowedConcurrencyAbandonCause,
+    ): boolean => {
+      if (released || concurrencyReleased || !resources.borrowedConcurrency) {
+        return false;
+      }
+      concurrencyReleased = true;
+      try {
+        base.release();
+      } finally {
+        releaseConcurrency(admissionClass);
+      }
+      llmBorrowedConcurrencyAbandoned++;
+      llmBorrowedConcurrencyAbandonedByCause[cause] =
+        (llmBorrowedConcurrencyAbandonedByCause[cause] ?? 0) + 1;
+      if (admissionClass !== undefined) {
+        admissionClass.borrowedConcurrencyAbandoned++;
+      }
+      emit("borrowedConcurrencyAbandon", {
+        request,
+        admissionId,
+        limitRevision,
+        priority,
+        ...(admissionClass !== undefined
+          ? { admissionClass: admissionClass.id }
+          : {}),
+        resources,
+        cause,
+        heldTokens: held,
+      });
+      return true;
+    };
+
     return {
       admissionId,
       limitRevision,
@@ -1525,7 +1635,10 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         ? { admissionClass: admissionClass.id }
         : {}),
       reservation,
+      resources,
       reportUsage,
+      abandonBorrowedConcurrency: () => abandonBorrowedConcurrency("manual"),
+      [ABANDON_WITH_CAUSE]: abandonBorrowedConcurrency,
       release(usage?: TokenUsage) {
         if (released) return;
         released = true;
@@ -1546,7 +1659,14 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         }
 
         try {
-          base.release();
+          if (!concurrencyReleased) {
+            concurrencyReleased = true;
+            try {
+              base.release();
+            } finally {
+              releaseConcurrency(admissionClass);
+            }
+          }
         } finally {
           // Zero `held` before returning tokens: nothing is held against
           // the budget after release, and post-release `reportUsage()`
@@ -1554,7 +1674,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
           // stale pre-release hold).
           const heldAtRelease = held;
           held = 0;
-          const refunded = releaseCapacity(
+          const refunded = settleTokenCapacity(
             heldAtRelease,
             validUsage,
             admissionClass,
@@ -1569,6 +1689,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
               ? { admissionClass: admissionClass.id }
               : {}),
             reservedTokens: parts?.reserved ?? 0,
+            resources,
             heldTokens: heldAtRelease,
             refundedTokens: refunded,
             usageSequence,
@@ -1588,7 +1709,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     ao: LLMAcquireOptions,
     resolved: ResolvedAdmission = resolveAdmission(request, ao),
     untimedRejectReasons?: ReadonlySet<LLMShadowableRejectReason>,
-  ): Promise<LLMAcquireResult> {
+  ): Promise<InternalAcquireResult> {
     const { priority, admissionClass, parts, reserved } = resolved;
 
     // Admission timing deliberately separates synchronous decision work from
@@ -1604,7 +1725,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       reason: LLMRejectReason,
       constraint?: LLMCapacityConstraint,
       precheckDecisionDurationNs?: number,
-    ): LLMAcquireResult => {
+    ): Extract<LLMAcquireResult, { ok: false }> => {
       const detail = buildRejectDetail(
         reserved,
         priority,
@@ -1687,9 +1808,9 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       priority,
       admissionClass,
     );
-    if (postcheck !== undefined) {
+    if (!postcheck.ok) {
       r.token.release();
-      return rejectWith(postcheck.reason, postcheck.constraint);
+      return rejectWith(postcheck.failure.reason, postcheck.failure.constraint);
     }
 
     // Capture the revision at the admission linearization point: both the
@@ -1706,6 +1827,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       limitRevision,
       priority,
       admissionClass,
+      postcheck.resources,
     );
     const decisionDurationNs = Number(
       waitStartedNs -
@@ -1722,6 +1844,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         ? { admissionClass: admissionClass.id }
         : {}),
       reservedTokens: reserved,
+      resources: postcheck.resources,
       decisionDurationNs,
       queueWaitNs,
     });
@@ -1733,6 +1856,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         ? { admissionClass: admissionClass.id }
         : {}),
       reservation: token.reservation,
+      resources: token.resources,
       token,
     };
   }
@@ -1959,10 +2083,12 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         ? { admissionClass: admission.admissionClass.id }
         : {}),
       reservation,
+      resources: NO_ADMISSION_RESOURCES,
       admission: "bypassed",
       bypassReason: reason,
       ...(detail !== undefined && { bypassDetail: detail }),
       reportUsage,
+      abandonBorrowedConcurrency: () => false,
     };
 
     const finish = (usage: TokenUsage | undefined): void => {
@@ -2035,8 +2161,19 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       shadowReasons: requestedShadowReasons,
       dedupScope,
       dedup: perCallDedup,
+      borrowedConcurrencyDeadlineMs,
       ...acquireOpts
     } = ao;
+    if (
+      borrowedConcurrencyDeadlineMs !== undefined &&
+      (!Number.isSafeInteger(borrowedConcurrencyDeadlineMs) ||
+        borrowedConcurrencyDeadlineMs < 1 ||
+        borrowedConcurrencyDeadlineMs > 2_147_483_647)
+    ) {
+      throw new Error(
+        "borrowedConcurrencyDeadlineMs must be a safe integer from 1 through 2147483647",
+      );
+    }
     const mode = resolveAdmissionMode(requestedMode);
     const shadowReasons = resolveShadowReasons(requestedShadowReasons);
     // Resolve before the dedup fast path so unknown class IDs cannot join an
@@ -2220,15 +2357,37 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
           ? { admissionClass: r.admissionClass }
           : {}),
         reservation: r.reservation,
+        resources: r.resources,
         admission: "admitted",
         reportUsage: (usage, reconciliation) =>
           r.token.reportUsage(usage, reconciliation),
+        abandonBorrowedConcurrency: () =>
+          r.token.abandonBorrowedConcurrency(),
       };
+
+      const deadlineApplies =
+        borrowedConcurrencyDeadlineMs !== undefined &&
+        r.resources.borrowedConcurrency;
+      const callbackAbort = deadlineApplies
+        ? new AbortController()
+        : undefined;
+      const sourceSignal = ao.signal;
+      let removeSourceAbortListener: (() => void) | undefined;
+      if (callbackAbort !== undefined && sourceSignal !== undefined) {
+        const forwardAbort = () => callbackAbort.abort(sourceSignal.reason);
+        if (sourceSignal.aborted) {
+          forwardAbort();
+        } else {
+          sourceSignal.addEventListener("abort", forwardAbort, { once: true });
+          removeSourceAbortListener = () =>
+            sourceSignal.removeEventListener("abort", forwardAbort);
+        }
+      }
 
       const work = (async () => {
         let result: T;
         try {
-          result = await fn(ao.signal, ctx);
+          result = await fn(callbackAbort?.signal ?? ao.signal, ctx);
         } catch (err) {
           r.token.release(); // no usage on error
           throw err;
@@ -2249,7 +2408,38 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         return result;
       })();
 
-      return publish(work);
+      if (!deadlineApplies) return publish(work);
+
+      const deadlineMs = borrowedConcurrencyDeadlineMs;
+      const publicWork = new Promise<T>((resolve, reject) => {
+        let publicSettled = false;
+        const settle = (fn: () => void): void => {
+          if (publicSettled) return;
+          publicSettled = true;
+          fn();
+        };
+        const deadline = setTimeout(() => {
+          const error = new LLMBorrowedConcurrencyDeadlineError(
+            deadlineMs,
+            r.admissionId,
+            r.resources,
+            r.admissionClass,
+          );
+          if (!r.token[ABANDON_WITH_CAUSE]("deadline")) return;
+          callbackAbort!.abort(error);
+          settle(() => reject(error));
+        }, deadlineMs);
+
+        void work.then(
+          (value) => settle(() => resolve(value)),
+          (error) => settle(() => reject(error)),
+        ).finally(() => {
+          clearTimeout(deadline);
+          removeSourceAbortListener?.();
+        });
+      });
+
+      return publish(publicWork);
     } catch (err) {
       if (deferred) {
         deferred.reject(err);
@@ -2266,8 +2456,13 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
       limits: limits(),
       bulkhead: base,
       llm: {
+        inFlight: llmInFlight(),
         admitted: llmAdmitted,
         released: llmReleased,
+        borrowedConcurrencyAbandoned: llmBorrowedConcurrencyAbandoned,
+        borrowedConcurrencyAbandonedByCause: {
+          ...llmBorrowedConcurrencyAbandonedByCause,
+        },
         rejected: llmRejected,
         rejectedByReason: { ...llmRejectedByReason },
       },
@@ -2369,6 +2564,8 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
                 ),
                 admitted: state.admitted,
                 released: state.released,
+                borrowedConcurrencyAbandoned:
+                  state.borrowedConcurrencyAbandoned,
                 rejected: state.rejected,
                 rejectedByReason: { ...state.rejectedByReason },
                 totalReserved: state.totalReserved,
@@ -2402,6 +2599,12 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
    * pending waiters have completed. Works with or without `close()`.
    * Compose as `close()` → `drain()` for graceful shutdown.
    *
+   * v3.17: an admission remains in-flight here until final token
+   * settlement, even if `abandonBorrowedConcurrency()` already returned
+   * its local slot. A manual `acquire()` caller must eventually call
+   * `release()`; otherwise an unbounded `drain()` intentionally remains
+   * pending. Use `{ timeoutMs }` when shutdown itself must be bounded.
+   *
    * v3.8: pass `{ timeoutMs }` to bound the wait. The returned promise
    * then always *resolves* (never rejects) with an `LLMDrainResult`:
    * `{ drained: true, inFlight: 0, pending: 0 }` if everything
@@ -2423,8 +2626,11 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     timeoutMs?: number;
   }): Promise<void> | Promise<LLMDrainResult> {
     const timeoutMs = opts?.timeoutMs;
+    const completeDrain = async (): Promise<void> => {
+      await Promise.all([bulkhead.drain(), waitForLLMDrain()]);
+    };
     if (timeoutMs === undefined) {
-      return bulkhead.drain();
+      return completeDrain();
     }
     assertNonNegativeInteger(timeoutMs, "timeoutMs");
     return new Promise<LLMDrainResult>((resolve) => {
@@ -2435,11 +2641,11 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
         const base = bulkhead.stats();
         resolve({
           drained: false,
-          inFlight: base.inFlight,
+          inFlight: Math.max(base.inFlight, llmInFlight()),
           pending: base.pending,
         });
       }, timeoutMs);
-      void bulkhead.drain().then(() => {
+      void completeDrain().then(() => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);

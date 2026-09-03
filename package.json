@@ -1,9 +1,9 @@
 {
   "name": "async-bulkhead-llm",
-  "version": "3.16.0",
+  "version": "3.17.0",
   "description": "Fail-fast admission control for LLM workloads built on async-bulkhead-ts.",
   "license": "Apache-2.0",
-  "author": "",
+  "author": "Jan Balangue",
   "homepage": "https://github.com/janbalangue/async-bulkhead-llm",
   "repository": {
     "type": "git",

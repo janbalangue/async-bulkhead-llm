@@ -7,6 +7,62 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.17.0] - 2026-09-03
+
+### Added
+
+* **Resource attribution for admitted work.** Successful acquire results,
+  tokens, run contexts, and admission/release events now expose immutable
+  `resources` with exact borrowed-concurrency and borrowed-token attribution.
+
+* **Borrowed local-slot abandonment.** `LLMToken` and admitted run contexts add
+  idempotent `abandonBorrowedConcurrency()`. It returns only a concurrency slot
+  that came from shared class capacity; token holds remain charged until final
+  release. New global and per-class counters plus the
+  `borrowedConcurrencyAbandon` event expose the split lifecycle. The event
+  carries a `cause` of `manual` or `deadline`, and
+  `llm.borrowedConcurrencyAbandonedByCause` counts each separately, so
+  deliberate shedding is distinguishable from a lease configured too tight.
+
+* **Wall-clock borrowed-slot deadline.** `run()` accepts
+  `borrowedConcurrencyDeadlineMs`. The post-admission timer applies only to a
+  borrowed local slot. Expiry returns that slot, aborts the callback signal,
+  and rejects the caller with `LLMBorrowedConcurrencyDeadlineError` while the
+  underlying callback retains responsibility for token settlement.
+
+### Fixed
+
+* `drain()` now waits for final LLM settlement even after local concurrency was
+  abandoned. Timed drain results report outstanding token-holding admissions
+  instead of incorrectly declaring the bulkhead drained when only the local
+  slot has returned.
+
+### Contract
+
+* A client-side deadline is an enforceable restoration bound for the local
+  admission slot only. It does not prove that a provider account, model queue,
+  or accelerator stopped work. Consumers needing a hard upstream guarantee
+  must keep an unlent floor or use authoritative provider-side reclamation.
+
+### Compatibility
+
+* Existing methods and event names remain available. Exact object-equality
+  consumers should account for new resource fields and counters. Callers that
+  do not use borrowed-slot abandonment retain their previous lifecycle.
+
+* After `abandonBorrowedConcurrency()`, `drain()` without `timeoutMs` waits for
+  the matching token settlement even though the local slot is already free.
+  Manual `acquire()` callers must eventually call `release()` or an unbounded
+  drain remains pending; bounded drain reports the admission as outstanding.
+  This split lifecycle is new in 3.17 and prevents shutdown from reporting
+  false completion.
+
+* `Listener` and `LLMBorrowedConcurrencyAbandonCause` are new entry-point type
+  exports. `Listener` was previously reachable only through `on()` without
+  being nameable by consumers.
+
+* The runtime dependency remains `async-bulkhead-ts@^1.0.1`.
+
 ## [3.16.0] - 2026-08-25
 
 ### Added

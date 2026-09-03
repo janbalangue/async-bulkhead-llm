@@ -10,6 +10,30 @@ cover what changes if you assert exact object shapes.
 For the full per-release record, see the
 [changelog](../CHANGELOG.md).
 
+## v3.16 → v3.17
+
+No existing admission call-site changes are required. Successful admission
+results, tokens, run contexts, and `admit` / `release` events gain immutable
+`resources`. Stats gain active-LLM and borrowed-concurrency-abandon counters
+(including a `borrowedConcurrencyAbandonedByCause` split), and `LLMEventType`
+gains `borrowedConcurrencyAbandon`; exhaustive shape and event switches should
+account for these additive fields. `Listener` and
+`LLMBorrowedConcurrencyAbandonCause` are new entry-point type exports.
+
+Use `borrowedConcurrencyDeadlineMs` only for a wall-clock lease on class
+concurrency borrowed from shared capacity. Expiry now has its own
+`LLMBorrowedConcurrencyDeadlineError`; it is not an admission rejection. The
+local slot returns immediately, while the token hold and `drain()` remain live
+until the callback settles. This does not prove remote provider reclamation.
+
+That split lifecycle is observable in shutdown behavior. After
+`abandonBorrowedConcurrency()`, `drain()` without `timeoutMs` waits for the
+matching token settlement even though base concurrency is already available.
+A manual `acquire()` caller must still call `release()`; omitting it leaves an
+unbounded drain pending. A bounded drain instead resolves with
+`drained: false` and the unsettled admission in `inFlight`. Existing callers
+that do not use the new abandonment API retain their previous lifecycle.
+
 ## v3.15 → v3.16
 
 No admission call-site changes are required. Instrumented `admit` and

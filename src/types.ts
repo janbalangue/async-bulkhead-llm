@@ -154,7 +154,9 @@ export type LLMWouldAdmitResult = {
  * `drained: true` means all in-flight work and pending waiters
  * completed within the deadline (`inFlight`/`pending` are then 0).
  * `drained: false` means the deadline elapsed first; `inFlight` and
- * `pending` report what was still outstanding at that moment.
+ * `pending` report what was still outstanding at that moment. `inFlight`
+ * includes token-holding LLM admissions whose borrowed local concurrency
+ * slot has already been abandoned but whose token has not been released.
  */
 export type LLMDrainResult = {
   drained: boolean;
@@ -421,10 +423,18 @@ export type LLMApplyLimitsResult =
 // ────────────────────────────────────────────
 
 export type LLMRequestStats = {
+  /** Capacity-holding LLM admissions that have not reached final settlement. */
+  inFlight: number;
   /** Successful LLM admissions (slot + budget acquired). */
   admitted: number;
   /** Successful LLM releases via the wrapped LLM token. */
   released: number;
+  /** Borrowed concurrency slots returned before upstream work settled. */
+  borrowedConcurrencyAbandoned: number;
+  /** Borrowed concurrency abandonments split by cause. */
+  borrowedConcurrencyAbandonedByCause: Partial<
+    Record<LLMBorrowedConcurrencyAbandonCause, number>
+  >;
   /** Total LLM-layer rejections. */
   rejected: number;
   /** LLM-layer rejections by reason. */
@@ -456,6 +466,8 @@ export type LLMAdmissionClassStats = {
   borrowedInFlightTokens: number;
   admitted: number;
   released: number;
+  /** Borrowed class concurrency slots returned before final settlement. */
+  borrowedConcurrencyAbandoned: number;
   rejected: number;
   rejectedByReason: Partial<Record<LLMRejectReason, number>>;
   totalReserved: number;
@@ -562,10 +574,31 @@ export type LLMEventMap = {
     priority: LLMPriority;
     admissionClass?: string;
     reservedTokens: number;
+    /** Exact protected/shared resource attribution at admission time. */
+    resources: LLMAdmissionResources;
     /** Synchronous admission-decision time, excluding `queueWaitNs`. */
     decisionDurationNs?: number;
     /** Time spent awaiting the underlying concurrency acquire. */
     queueWaitNs?: number;
+  };
+  /**
+   * Fired when a borrowed local concurrency slot is deliberately returned
+   * before the admitted work reaches final settlement.
+   *
+   * This event does not mean the provider stopped work. `heldTokens` remain
+   * charged until the eventual `release` event so upstream capacity is never
+   * presented as reclaimed based only on client-side abandonment.
+   */
+  borrowedConcurrencyAbandon: {
+    request: LLMRequest;
+    admissionId: string;
+    limitRevision: number;
+    priority: LLMPriority;
+    admissionClass?: string;
+    resources: LLMAdmissionResources;
+    /** Whether an explicit call or a lease expiry returned the slot. */
+    cause: LLMBorrowedConcurrencyAbandonCause;
+    heldTokens: number;
   };
   /**
    * Fired when a request is rejected at any stage.
@@ -619,6 +652,8 @@ export type LLMEventMap = {
     priority: LLMPriority;
     admissionClass?: string;
     reservedTokens: number;
+    /** Exact protected/shared resource attribution captured at admission. */
+    resources: LLMAdmissionResources;
     /** Tokens held immediately before release returned them. */
     heldTokens: number;
     refundedTokens: number;
@@ -965,6 +1000,24 @@ export type UsageReport = {
   overReservation: boolean;
 };
 
+/**
+ * Why a borrowed local concurrency slot was returned before settlement.
+ *
+ * `manual` is an explicit `abandonBorrowedConcurrency()` call by the
+ * application. `deadline` is the automatic expiry of a
+ * `borrowedConcurrencyDeadlineMs` lease. Operators need the two separated:
+ * only a rising `deadline` share means the configured lease is too tight.
+ */
+export type LLMBorrowedConcurrencyAbandonCause = "manual" | "deadline";
+
+/** Exact protected/shared resource attribution captured at admission. */
+export type LLMAdmissionResources = Readonly<{
+  /** True when this admission consumed class concurrency above its floor. */
+  borrowedConcurrency: boolean;
+  /** Reservation tokens consumed above the class token floor. */
+  borrowedTokens: number;
+}>;
+
 /** Context passed to `run()` callbacks for mid-flight usage reporting. */
 export type LLMRunContext = {
   /** Stable identifier for this execution. Bypasses use a `shadow-` prefix. */
@@ -975,6 +1028,8 @@ export type LLMRunContext = {
   readonly admissionClass?: string;
   /** Exact reservation evaluated for this call, or `null` without a budget. */
   readonly reservation: LLMReservationEstimate | null;
+  /** Exact protected/shared resource attribution for this execution. */
+  readonly resources: LLMAdmissionResources;
   /** Whether the callback holds real bulkhead capacity. */
   readonly admission: LLMRunAdmission;
   /** Simulated or authoritative reason when `admission === "bypassed"`. */
@@ -985,6 +1040,11 @@ export type LLMRunContext = {
     usage: TokenUsage,
     reconciliation?: ProgressiveReconciliationOptions,
   ): UsageReport;
+  /**
+   * Return a borrowed local concurrency slot before final settlement while
+   * retaining any token hold. Returns true only for the first effective call.
+   */
+  abandonBorrowedConcurrency(): boolean;
 };
 
 /** Options accepted by `run()`. */
@@ -1009,6 +1069,15 @@ export type LLMRunOptions<T> = LLMAcquireOptions & {
   dedupScope?: string;
   /** Per-call deduplication opt-out. */
   dedup?: boolean;
+  /**
+   * Wall-clock lease for a borrowed concurrency slot. The timer starts after
+   * successful admission and applies only when `resources.borrowedConcurrency`
+   * is true. On expiry `run()` returns a
+   * `LLMBorrowedConcurrencyDeadlineError`, aborts the callback signal, and
+   * returns the local slot. Token accounting remains held until the callback
+   * actually settles. Must be a safe integer from 1 through 2,147,483,647.
+   */
+  borrowedConcurrencyDeadlineMs?: number;
 };
 
 /**
@@ -1040,6 +1109,13 @@ export type LLMToken = {
   readonly admissionClass?: string;
   /** Exact reservation used at admission, or `null` without a token budget. */
   readonly reservation: LLMReservationEstimate | null;
+  /** Exact protected/shared resource attribution captured at admission. */
+  readonly resources: LLMAdmissionResources;
+  /**
+   * Return a borrowed local concurrency slot before final settlement while
+   * retaining any token hold. Returns true only for the first effective call.
+   */
+  abandonBorrowedConcurrency(): boolean;
   release(usage?: TokenUsage): void;
   reportUsage(
     usage: TokenUsage,
@@ -1054,6 +1130,7 @@ export type LLMAcquireResult =
       limitRevision: number;
       admissionClass?: string;
       reservation: LLMReservationEstimate | null;
+      resources: LLMAdmissionResources;
       token: LLMToken;
     }
   | { ok: false; reason: LLMRejectReason; detail?: LLMRejectDetail };

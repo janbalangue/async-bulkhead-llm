@@ -161,6 +161,24 @@ bulkhead.on('reject', ({ reason, detail }) => metrics.increment(reason));
 underlying concurrency wait, so local admission cost and queue contention stay
 separate.
 
+Admissions also expose exact resource attribution through `resources`.
+For class policies that lend shared concurrency, `run()` can enforce a
+wall-clock lease on the borrowed local slot:
+
+```ts
+await bulkhead.run(request, callProvider, {
+  admissionClass: 'background',
+  borrowedConcurrencyDeadlineMs: 30_000,
+});
+```
+
+Expiry returns that local concurrency slot, aborts the callback signal, and
+rejects with `LLMBorrowedConcurrencyDeadlineError`. It deliberately retains
+the token hold until the callback settles. This is a local restoration bound,
+not proof that a provider account, accelerator queue, or remote generation was
+reclaimed. Keep an unlent floor or a real provider-side partition for upstream
+capacity that client cancellation cannot authoritatively release.
+
 → [Stats and events](guides/telemetry.md)
 
 ## Shutting down cleanly
@@ -171,8 +189,16 @@ bulkhead.close();                             // stop admitting
 await bulkhead.drain({ timeoutMs: 10_000 });  // wait, but not forever
 ```
 
-`drain()` with a deadline always resolves and tells you what it abandoned, so
-one stuck upstream stream can't hold your deploy hostage.
+`drain()` with a deadline always resolves and reports what remains outstanding;
+it does not abandon or release that work. One stuck upstream stream therefore
+cannot hold the shutdown decision open indefinitely.
+
+Without `timeoutMs`, `drain()` waits for final token settlement as well as base
+concurrency. In particular, returning a borrowed slot with
+`abandonBorrowedConcurrency()` does not complete the admission: a manual
+`acquire()` caller must still call `release()`, or the unbounded drain remains
+pending. This preserves the distinction between restoring a local slot and
+settling the resource accounting for the work behind it.
 
 ---
 

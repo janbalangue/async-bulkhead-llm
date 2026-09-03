@@ -20,7 +20,10 @@
 export type {
   ContentBlock,
   DeduplicationOptions,
+  Listener,
   LLMAdmissionClassLimits,
+  LLMAdmissionResources,
+  LLMBorrowedConcurrencyAbandonCause,
   LLMAdmissionClassesOptions,
   LLMAdmissionClassStats,
   LLMAdmissionClassSharedStats,
@@ -60,7 +63,10 @@ export type {
   UsageReport,
 } from "./types.js";
 
-export { LLMBulkheadRejectedError } from "./errors.js";
+export {
+  LLMBorrowedConcurrencyDeadlineError,
+  LLMBulkheadRejectedError,
+} from "./errors.js";
 
 export { PROFILES } from "./profiles.js";
 export type { LLMBulkheadPreset } from "./profiles.js";
