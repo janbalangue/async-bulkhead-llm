@@ -11,7 +11,15 @@
  * - `adaptive.ts`   — `createAdaptiveTokenEstimator` (v3.8)
  * - `dedup.ts`      — deduplication internals (keying, share safety)
  * - `validation.ts` — internal numeric/estimate/usage guards
- * - `bulkhead.ts`   — `createLLMBulkhead` (admission, budget, events)
+ * - `bulkhead.ts`   — `createLLMBulkhead`: validates options and wires the
+ *                     engine parts together
+ * - `reconfigurable-bulkhead.ts` — internal concurrency gate (global slot
+ *                     count and queue)
+ * - `engine/`       — the parts of the admission engine, one concern per
+ *                     file (limits, token ledger, class slots, admission
+ *                     counts, capacity checks, the admitted token, `run()`,
+ *                     observe mode, deduplication, stats, shutdown); the
+ *                     full list is in the header of `bulkhead.ts`
  *
  * Deep-importing the internal modules is not supported; the package
  * `exports` map exposes only this entry point.

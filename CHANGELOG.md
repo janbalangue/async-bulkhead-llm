@@ -7,6 +7,59 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.17.1] - 2026-11-22
+
+Internal restructuring release. No public API, runtime behavior, or
+dependency changed; no upgrade action is required.
+
+### Internal
+
+* **`createLLMBulkhead` split into focused engine modules.** The former
+  2,690-line `src/bulkhead.ts` is now a short entry point that validates
+  options and wires together 25 modules under `src/engine/`, one concern
+  each: limits, token ledger, class slots, admission counts, capacity checks,
+  the admitted token, `run()`, observe mode, deduplication, stats, events,
+  and shutdown. No file under `src/engine/` is longer than 500 lines and no
+  function is longer than 150.
+
+* **One owner per counter.** Every limit and counter is now written in
+  exactly one module, and a global counter and its per-class twin are always
+  moved by the same function. Token counters live in `token-ledger.ts`;
+  admitted, released, rejected, and abandoned counts in
+  `admission-counts.ts`; per-class slot counts in `class-slots.ts`; and the
+  revision, budget, high-priority reserve, and class limits in `limits.ts`.
+  The per-class state object that functions used to pass around is gone: a
+  class travels as its id. The global slot count stays inside
+  `reconfigurable-bulkhead.ts`, which is unchanged.
+
+* **`rename-cjs.mjs` handles nested output folders.** The CommonJS rename
+  step now walks `dist/cjs` recursively, so the `.cjs` renames, `require()`
+  rewrites, `sourceMappingURL` trailers, and source-map `file` fields are
+  also correct for `dist/cjs/engine/*`.
+
+### Added
+
+* **Class-versus-global counter tests.**
+  `test/class_counter_invariants.test.ts` takes admissions through a
+  reserve, growing and shrinking usage reports, abandonment, limit updates,
+  and release, and checks after every step that each per-class counter adds
+  up to its global counterpart. The tests read `stats()` only. Before this,
+  nothing in the suite could see a class counter drift from its global twin.
+
+### Compatibility
+
+* The package entry point exports the identical surface, and the declared
+  type of `createLLMBulkhead` and of each of its methods is unchanged.
+* Results, errors, event payloads, rejection reasons and constraints,
+  `stats()` snapshots, and the order of counter updates relative to events
+  match 3.17.0. This was checked by driving the 3.17.0 build and this build
+  with the same 30,000 seeded random scenarios, including listeners that call
+  back into the bulkhead, and comparing everything they returned and emitted.
+* `dist/` gains an `engine/` folder for ESM, CJS, and declarations. Deep
+  imports of internal modules remain unsupported; the `exports` map still
+  exposes only the entry point.
+* The runtime dependency remains `async-bulkhead-ts@^1.0.1`.
+
 ## [3.17.0] - 2026-09-03
 
 ### Added
