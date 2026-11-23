@@ -168,7 +168,14 @@ export function createRun(deps: Deps) {
       }
 
       return publish(
-        runAdmitted(r, fn, ao, getUsage, borrowedConcurrencyDeadlineMs),
+        runAdmitted(
+          r,
+          fn,
+          ao,
+          getUsage,
+          borrowedConcurrencyDeadlineMs,
+          limits.stopPolicy() !== undefined,
+        ),
       );
     } catch (err) {
       if (lead) return lead.fail(err);

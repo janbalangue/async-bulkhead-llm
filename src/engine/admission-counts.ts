@@ -1,6 +1,6 @@
 /**
- * Owner of the admission outcome counts: admitted, released, rejected, and
- * borrowed-concurrency abandoned.
+ * Owner of the admission outcome counts: admitted, released, rejected,
+ * borrowed-concurrency abandoned, and stopped.
  *
  * Each count exists once for the whole bulkhead (the `llm`-prefixed
  * variables) and once per admission class. Each function below moves the
@@ -9,6 +9,7 @@
  * id.
  */
 import type {
+  LLMAdmissionStopCause,
   LLMBorrowedConcurrencyAbandonCause,
   LLMRejectReason,
   LLMRequestStats,
@@ -20,6 +21,7 @@ type ClassCounts = {
   borrowedConcurrencyAbandoned: number;
   rejected: number;
   rejectedByReason: Partial<Record<LLMRejectReason, number>>;
+  stopped: number;
 };
 
 export function createAdmissionCounts(classIds: Iterable<string>) {
@@ -31,6 +33,9 @@ export function createAdmissionCounts(classIds: Iterable<string>) {
   > = {};
   let llmRejected = 0;
   const llmRejectedByReason: Partial<Record<LLMRejectReason, number>> = {};
+  let llmStopped = 0;
+  const llmStoppedByCause: Partial<Record<LLMAdmissionStopCause, number>> =
+    {};
   const perClass = new Map<string, ClassCounts>();
   for (const id of classIds) {
     perClass.set(id, {
@@ -39,6 +44,7 @@ export function createAdmissionCounts(classIds: Iterable<string>) {
       borrowedConcurrencyAbandoned: 0,
       rejected: 0,
       rejectedByReason: {},
+      stopped: 0,
     });
   }
 
@@ -88,6 +94,17 @@ export function createAdmissionCounts(classIds: Iterable<string>) {
     if (cls !== undefined) cls.borrowedConcurrencyAbandoned++;
   }
 
+  /** The engine stopped an admitted call. */
+  function noteStop(
+    classId: string | undefined,
+    cause: LLMAdmissionStopCause,
+  ): void {
+    const cls = countsOf(classId);
+    llmStopped++;
+    llmStoppedByCause[cause] = (llmStoppedByCause[cause] ?? 0) + 1;
+    if (cls !== undefined) cls.stopped++;
+  }
+
   /** Admitted calls that have not reached final settlement. */
   function unsettled(): number {
     return Math.max(0, llmAdmitted - llmReleased);
@@ -105,6 +122,11 @@ export function createAdmissionCounts(classIds: Iterable<string>) {
       },
       rejected: llmRejected,
       rejectedByReason: { ...llmRejectedByReason },
+      // Absent until the first stop: a bulkhead that never stops anything
+      // keeps reporting the shape it always had.
+      ...(llmStopped > 0
+        ? { stopped: llmStopped, stoppedByCause: { ...llmStoppedByCause } }
+        : {}),
     };
   }
 
@@ -119,6 +141,9 @@ export function createAdmissionCounts(classIds: Iterable<string>) {
     noteRelease,
     noteReject,
     noteAbandon,
+    noteStop,
+    /** Has any call been stopped yet? */
+    anyStopped: (): boolean => llmStopped > 0,
     unsettled,
     totals,
     classTotals,

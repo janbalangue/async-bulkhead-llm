@@ -16,6 +16,7 @@
     "guides/streaming.md",
     "guides/admission-classes.md",
     "guides/runtime-limits.md",
+    "guides/stopping-admitted-work.md",
     "guides/observe-mode.md",
     "guides/deduplication.md",
     "guides/gateway-integration.md",

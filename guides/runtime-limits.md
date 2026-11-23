@@ -50,8 +50,10 @@ if (!update.applied) {
   result and do not mutate any limit.
 * **Full validation before mutation.** Invalid higher-revision snapshots throw
   while the previous revision remains active.
-* **Shrink by attrition.** In-flight work and accepted queue waiters are never
-  revoked. New admissions obey the lower ceilings immediately.
+* **Shrink by attrition, unless you opt out.** New admissions obey the lower
+  ceilings immediately. In-flight work is left to finish by itself unless the
+  snapshot carries `stop.takeBackGraceMs` (v3.18, below). Accepted queue
+  waiters are never revoked either way.
 * **Immediate expansion.** Raising `maxConcurrent` pumps accepted waiters in
   the same synchronous update, after the complete LLM-layer snapshot is
   active.
@@ -65,6 +67,9 @@ if (!update.applied) {
   without it must omit that field; estimator policy is not hot-swapped. The
   same rule applies to `admissionClasses`, whose complete fixed key set must be
   present in every update.
+* **Nothing is inherited.** Every field describes the whole new state. That
+  includes the optional `stop` policy: a snapshot without it has no stop
+  policy, whatever the previous revision said.
 * **Admission provenance is immutable.** `acquire()` results, tokens,
   `LLMRunContext`, usage reports, and lifecycle events retain the revision
   captured when the slot and token reservation were successfully acquired.
@@ -72,7 +77,7 @@ if (!update.applied) {
 
 ```ts
 const current = bulkhead.limits();
-// { revision, maxConcurrent, maxQueue, tokenBudget?, admissionClasses? }
+// { revision, maxConcurrent, maxQueue, tokenBudget?, admissionClasses?, stop? }
 
 bulkhead.on('reconfigure', ({ previous, current }) => {
   publishAppliedRevision(previous.revision, current.revision);
@@ -150,9 +155,36 @@ The revision identifies the library limit snapshot, not an external control
 plane grant by itself. A gateway can associate that revision with its own
 immutable grant metadata to provide end-to-end admission provenance.
 
+## Taking capacity back
+
+A snapshot can state how long running work may stay above the new limits:
+
+```ts
+bulkhead.applyLimits({
+  revision: 102,
+  maxConcurrent: 4,
+  maxQueue: 20,
+  tokenBudget: { budget: 60_000, highPriorityReserve: 15_000 },
+  stop: { takeBackGraceMs: 2_000 },
+});
+```
+
+If the snapshot leaves running work above the new limits, nothing is stopped
+for two seconds, and calls that finish in that time are left alone. Then
+enough calls are stopped to fit, each rejecting with
+`LLMAdmissionStoppedError` and cause `"limits"`. This covers a lower
+`maxConcurrent`, a lower token budget, lower class ceilings, and a restored
+class floor.
+
+A later snapshot replaces a take-back that is still waiting, and starts its
+own grace period if it still leaves work above the limits. The same `stop`
+object can also carry `overrunAllowanceTokens`. Both are described in
+[Stopping admitted work](stopping-admitted-work.md).
+
 ## Compatibility: `setBudget(tokens)`
 
 `setBudget(tokens)` remains available for existing callers. It applies a
-complete budget-only update at `currentRevision + 1`. Do not mix it with an
-external revision authority; distributed integrations should use
-`applyLimits()` exclusively so a single authority owns the revision sequence.
+complete budget-only update at `currentRevision + 1`, carrying the applied
+`stop` policy along. Do not mix it with an external revision authority;
+distributed integrations should use `applyLimits()` exclusively so a single
+authority owns the revision sequence.

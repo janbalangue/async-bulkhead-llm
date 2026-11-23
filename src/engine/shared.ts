@@ -5,6 +5,7 @@
  * point re-exports only what `src/index.ts` lists.
  */
 import type { AcquireOptions } from "async-bulkhead-ts";
+import type { LLMAdmissionStoppedError } from "../errors.js";
 import type { createReconfigurableBulkhead } from "../reconfigurable-bulkhead.js";
 import type {
   LLMAcquireResult,
@@ -67,8 +68,23 @@ export const NO_ADMISSION_RESOURCES: LLMAdmissionResources = Object.freeze({
  */
 export const ABANDON_WITH_CAUSE = Symbol("abandonBorrowedConcurrencyWithCause");
 
+/**
+ * How `run()` learns that the engine stopped its call. Engine-private for
+ * the same reason as `ABANDON_WITH_CAUSE`: a published token must not let
+ * a caller intercept or fake a stop.
+ */
+export const ON_STOP = Symbol("onStop");
+
 export type WrappedLLMToken = LLMToken & {
   [ABANDON_WITH_CAUSE](cause: LLMBorrowedConcurrencyAbandonCause): boolean;
+  /**
+   * Register what to do when the engine stops this call. If the call was
+   * already stopped, the handler is not kept and the stop error is
+   * returned instead.
+   */
+  [ON_STOP](
+    handler: (error: LLMAdmissionStoppedError) => void,
+  ): LLMAdmissionStoppedError | undefined;
 };
 
 export type InternalAcquireResult =

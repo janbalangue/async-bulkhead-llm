@@ -10,6 +10,7 @@ export function createEventHub() {
   const listeners: { [K in LLMEventType]: Set<Listener<K>> } = {
     admit: new Set(),
     borrowedConcurrencyAbandon: new Set(),
+    stop: new Set(),
     reject: new Set(),
     release: new Set(),
     usage: new Set(),

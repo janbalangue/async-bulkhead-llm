@@ -199,6 +199,22 @@ normally. It exists so a shutdown path can log what it is abandoning and
 proceed, instead of parking forever behind one stuck upstream stream.
 `timeoutMs: 0` is an immediate "is it drained right now?" snapshot.
 
+To stop that work instead of only reporting it, pass `stopOnTimeout: true`
+(v3.18):
+
+```ts
+bulkhead.close();
+const result = await bulkhead.drain({ timeoutMs: 10_000, stopOnTimeout: true });
+// result.stopped: how many calls the deadline stopped
+```
+
+Each call still running at the deadline rejects with
+`LLMAdmissionStoppedError` and cause `"drain_deadline"`, and its slot returns
+at once. Its tokens stay charged until its callback settles, so it still
+counts in `inFlight` and a later `drain()` still waits for it. See
+[Stopping admitted work](stopping-admitted-work.md) for which callbacks are
+also aborted.
+
 ## Design boundaries
 
 This library enforces backpressure at the boundary of your LLM calls. It does

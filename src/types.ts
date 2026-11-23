@@ -157,11 +157,17 @@ export type LLMWouldAdmitResult = {
  * `pending` report what was still outstanding at that moment. `inFlight`
  * includes token-holding LLM admissions whose borrowed local concurrency
  * slot has already been abandoned but whose token has not been released.
+ *
+ * `stopped` (v3.18) is present only when the call passed
+ * `stopOnTimeout: true`: the number of admitted calls the deadline stopped.
+ * A stopped call still counts in `inFlight` until its callback settles or
+ * its `acquire()` token is released.
  */
 export type LLMDrainResult = {
   drained: boolean;
   inFlight: number;
   pending: number;
+  stopped?: number;
 };
 
 /**
@@ -215,8 +221,9 @@ export type LLMPriority = "high" | "normal";
  * IDs rather than using arbitrary tenant IDs directly.
  *
  * Protected capacity is reserved before shared capacity is lent to requests
- * above their class floor. Existing work is never revoked when a floor grows;
- * new borrowing pauses until attrition restores the protected capacity.
+ * above their class floor. When a floor grows, new borrowing pauses until the
+ * protected capacity is restored. Existing work is left to finish by itself
+ * unless the snapshot opts in to `stop.takeBackGraceMs` (v3.18).
  * Omitted ceilings inherit the enclosing bulkhead's global ceiling. Class
  * limits are fail-fast and do not create a separate per-class queue.
  */
@@ -376,6 +383,55 @@ export type LLMAcquireOptions = AcquireOptions & {
 
 
 /**
+ * Why the engine stopped a call it had already admitted (v3.18).
+ *
+ * - `"overrun"` — a usage report pushed the call's token hold past its
+ *   reservation plus `stop.overrunAllowanceTokens`, or left its class or the
+ *   pool above a token ceiling.
+ * - `"drain_deadline"` — `drain({ timeoutMs, stopOnTimeout: true })` reached
+ *   its deadline while the call was still running.
+ * - `"limits"` — a limits snapshot left running work above the new limits
+ *   and `stop.takeBackGraceMs` elapsed.
+ */
+export type LLMAdmissionStopCause = "overrun" | "drain_deadline" | "limits";
+
+/**
+ * Opt-in policy for stopping admitted work (v3.18). It is part of the
+ * limits snapshot: a snapshot without `stop` has no policy, and nothing is
+ * carried over from the previous revision.
+ *
+ * Stopping a call always means the same thing. The signal passed to its
+ * `run()` callback is aborted, the caller's promise rejects with
+ * `LLMAdmissionStoppedError`, and the concurrency slot returns at once. The
+ * token hold stays charged until the callback settles, because a local
+ * abort does not prove the provider stopped work.
+ *
+ * `run()` hands the callback a signal the engine can abort only while a
+ * policy is active at admission. An empty object enables neither trigger
+ * below but still makes callbacks abortable, which is what
+ * `drain({ stopOnTimeout: true })` needs.
+ */
+export type LLMAdmissionStopPolicy = {
+  /**
+   * Tokens a call's hold may grow above its reservation. One token more
+   * stops the call with cause `"overrun"`. Setting this also turns on
+   * ceiling fitting: when a usage report grows a hold and leaves a class
+   * above `maxInFlightTokens` or the pool above its budget, calls are
+   * stopped until the holds of the calls still running fit. Requires a
+   * token budget. Non-negative integer.
+   */
+  readonly overrunAllowanceTokens?: number;
+  /**
+   * Grace period, in milliseconds, before work that a limits snapshot left
+   * above the new limits is stopped with cause `"limits"`. Calls that
+   * finish inside the grace period are left alone, and a newer snapshot
+   * replaces a take-back that is still waiting. Integer from 0 through
+   * 2,147,483,647.
+   */
+  readonly takeBackGraceMs?: number;
+};
+
+/**
  * Complete, versioned snapshot of every admission limit that can change at
  * runtime. Updates are intentionally not partial: callers must provide the
  * whole snapshot so the bulkhead can validate and apply it atomically.
@@ -403,6 +459,12 @@ export type LLMAdmissionLimits = {
   readonly admissionClasses?: Readonly<
     Record<string, LLMAdmissionClassLimits>
   >;
+  /**
+   * Opt-in policy for stopping admitted work (v3.18). Omit it and nothing
+   * is ever stopped by an overrun or a limit change. Like every other
+   * field it is not inherited: a later snapshot must state it again.
+   */
+  readonly stop?: LLMAdmissionStopPolicy;
 };
 
 /** Result of applying a versioned admission-limit snapshot. */
@@ -439,6 +501,13 @@ export type LLMRequestStats = {
   rejected: number;
   /** LLM-layer rejections by reason. */
   rejectedByReason: Partial<Record<LLMRejectReason, number>>;
+  /**
+   * Admitted calls the engine stopped (v3.18). Absent until the first
+   * stop, so a bulkhead that never stops anything reports the 3.17 shape.
+   */
+  stopped?: number;
+  /** Stopped calls split by cause. Absent until the first stop. */
+  stoppedByCause?: Partial<Record<LLMAdmissionStopCause, number>>;
 };
 
 export type LLMObserveStats = {
@@ -478,6 +547,11 @@ export type LLMAdmissionClassStats = {
   totalBorrowedAdmissions: number;
   /** Reservation tokens placed in shared capacity at admission time. */
   totalBorrowedTokensReserved: number;
+  /**
+   * Calls of this class the engine stopped (v3.18). Absent on every class
+   * until the bulkhead's first stop; from then on each class reports it.
+   */
+  stopped?: number;
 };
 
 export type LLMAdmissionClassSharedStats = {
@@ -526,6 +600,7 @@ export type LLMStats = {
      * `reportUsage()` reported consumption exceeding the reserved hold.
      * Overrun expands `inFlightTokens` (possibly above `budget`), which
      * correctly blocks new admissions until the overrunning work releases.
+     * `stop.overrunAllowanceTokens` (v3.18) bounds how far it can go.
      */
     totalOverrun: number;
     /** Budget headroom reserved for `priority: "high"` requests. */
@@ -598,6 +673,24 @@ export type LLMEventMap = {
     resources: LLMAdmissionResources;
     /** Whether an explicit call or a lease expiry returned the slot. */
     cause: LLMBorrowedConcurrencyAbandonCause;
+    heldTokens: number;
+  };
+  /**
+   * Fired once when the engine stops a call it had admitted (v3.18).
+   *
+   * The concurrency slot has already been returned when this fires.
+   * `heldTokens` stay charged until the eventual `release` event: a stop
+   * asks the callback to end, it does not prove the provider did. This is
+   * also how an `acquire()` caller, which has no signal, learns of a stop.
+   */
+  stop: {
+    request: LLMRequest;
+    admissionId: string;
+    limitRevision: number;
+    priority: LLMPriority;
+    admissionClass?: string;
+    resources: LLMAdmissionResources;
+    cause: LLMAdmissionStopCause;
     heldTokens: number;
   };
   /**
@@ -998,6 +1091,12 @@ export type UsageReport = {
   outputRemaining: number | null;
   /** True once cumulative consumption exceeds the original reservation. */
   overReservation: boolean;
+  /**
+   * Present, and `true`, once the engine has stopped this admission
+   * (v3.18), including on the report that caused the stop. The token hold
+   * stays charged until release.
+   */
+  stopped?: true;
 };
 
 /**
@@ -1096,6 +1195,10 @@ export type LLMRunOptions<T> = LLMAcquireOptions & {
  *   reservation is retained).
  * - If reported consumption exceeds the hold, the hold expands (overrun),
  *   which blocks new admissions until this request releases.
+ * - Under a stop policy (v3.18) the engine may stop the admission. A token
+ *   has no signal: it learns of the stop from the `stop` event and from
+ *   `stopped: true` on its usage reports. The slot is already returned; the
+ *   token hold stays charged until `release()`.
  * - Reports are clamped to be monotonically non-decreasing per field.
  * - If `release()` is later called without usage, the last reported
  *   usage is used for the final refund.

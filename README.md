@@ -10,6 +10,17 @@
 
 ---
 
+## The problem
+
+LLM calls are slow and uneven. One finishes in two seconds on 500 tokens; the
+next runs for a minute on 100,000. A service that forwards every request it
+receives has no defense when traffic bursts: all of them reach the provider
+at once, the provider starts answering 429 or slowing down, retries add to
+the pile, and every caller waits a long time to fail.
+
+Counting requests is not enough to prevent it, because the load is the work
+in flight, and a request's size is part of that work.
+
 ## What it does
 
 You wrap your LLM calls in a bulkhead. Before each call runs, the bulkhead
@@ -181,6 +192,32 @@ capacity that client cancellation cannot authoritatively release.
 
 → [Stats and events](guides/telemetry.md)
 
+## Stopping admitted work
+
+By default an admitted call is never touched: a stream that overruns its
+reservation only widens its hold, and a lowered limit waits for running calls
+to finish. A limits snapshot can opt in to stopping them instead:
+
+```ts
+bulkhead.applyLimits({
+  ...bulkhead.limits(),
+  revision: bulkhead.limits().revision + 1,
+  stop: {
+    overrunAllowanceTokens: 500, // a hold may grow this far past its reservation
+    takeBackGraceMs: 2_000,      // then work above lowered limits is stopped
+  },
+});
+```
+
+A stopped call has its callback signal aborted, its caller rejected with
+`LLMAdmissionStoppedError` (`cause` is `"overrun"`, `"drain_deadline"`, or
+`"limits"`), and its concurrency slot returned at once. Its tokens stay
+charged until the callback settles, because a local abort does not prove the
+provider stopped. Calls on borrowed capacity are stopped first, then normal
+priority before high, newest first.
+
+→ [Stopping admitted work](guides/stopping-admitted-work.md)
+
 ## Shutting down cleanly
 
 ```ts
@@ -192,6 +229,14 @@ await bulkhead.drain({ timeoutMs: 10_000 });  // wait, but not forever
 `drain()` with a deadline always resolves and reports what remains outstanding;
 it does not abandon or release that work. One stuck upstream stream therefore
 cannot hold the shutdown decision open indefinitely.
+
+Add `stopOnTimeout: true` to stop whatever is still running at the deadline.
+The result then also reports `stopped`, the number of calls it stopped:
+
+```ts
+bulkhead.close();
+const result = await bulkhead.drain({ timeoutMs: 10_000, stopOnTimeout: true });
+```
 
 Without `timeoutMs`, `drain()` waits for final token settlement as well as base
 concurrency. In particular, returning a borrowed slot with
@@ -211,6 +256,7 @@ settling the resource accounting for the work behind it.
 | [Streaming and reconciliation](guides/streaming.md) | `reportUsage()`, progressive holds, ordered usage events |
 | [Admission classes](guides/admission-classes.md) | Per-class floors and ceilings, shared capacity, borrowing |
 | [Runtime limits and reconfiguration](guides/runtime-limits.md) | `applyLimits()`, revisions, fail-closed startup, kill switch |
+| [Stopping admitted work](guides/stopping-admitted-work.md) | Opt-in stops on overrun, at a drain deadline, and after a limit change |
 | [Observe mode](guides/observe-mode.md) | Measure a policy before you enforce it |
 | [Deduplication](guides/deduplication.md) | In-flight dedup, tenant scoping, streaming results |
 | [Gateway integration](guides/gateway-integration.md) | `wouldAdmit()`, admission IDs, external leases, control planes |

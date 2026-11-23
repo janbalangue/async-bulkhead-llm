@@ -64,6 +64,12 @@ floors. Raising a floor does not cancel work that is already active. Existing
 borrowers drain normally, while new shared-capacity admissions pause until the
 new floor is restored by attrition.
 
+To bound that wait, put `stop: { takeBackGraceMs }` in the snapshot that
+restores the floor (v3.18). When the grace period ends, borrowers are stopped
+until the floor is usable again: calls on borrowed capacity first, then normal
+priority before high, newest first. See
+[Stopping admitted work](stopping-admitted-work.md).
+
 ## Resource-specific restoration
 
 Borrowing can consume more than one constrained resource, and one restoration

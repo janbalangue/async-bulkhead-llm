@@ -7,6 +7,134 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.18.0] - 2026-11-23
+
+Adds an opt-in way to stop work the bulkhead already admitted. Nothing is
+stopped unless a limits snapshot carries a `stop` policy or a drain passes
+`stopOnTimeout`; without them this release behaves as 3.17.1.
+
+### Added
+
+* **`LLMAdmissionStoppedError` and one meaning of "stop".** Whatever the
+  trigger, stopping a call aborts the signal passed to its `run()` callback,
+  rejects the caller with `LLMAdmissionStoppedError` (`admissionId`, `cause`,
+  `resources`, `admissionClass`), and returns the concurrency slot at once.
+  The token hold stays charged until the callback settles, because a local
+  abort does not prove the provider stopped work; the borrowed-slot deadline
+  already followed this rule. `cause` is `"overrun"`, `"drain_deadline"`, or
+  `"limits"`.
+
+* **Stop policy in the limits snapshot.** `LLMAdmissionLimits` gains optional
+  `stop: { overrunAllowanceTokens?, takeBackGraceMs? }`. It is validated with
+  the rest of the snapshot and returned by `limits()`, `stats().limits`, and
+  the `reconfigure` event while it is applied. Like every other limit it is
+  not inherited: a snapshot without `stop` has no policy. `setBudget()`
+  carries the applied policy into its new revision.
+
+* **Overrun trigger.** `stop.overrunAllowanceTokens` lets a call's hold grow
+  that many tokens above its reservation; one more token stops it with cause
+  `"overrun"`. With the allowance set, a usage report that raises a hold and
+  leaves a class above `maxInFlightTokens`, or the pool above its budget,
+  also stops calls until the holds of the calls still running fit. A class
+  above its own ceiling gives up only its own calls. If a snapshot had
+  already lowered a ceiling below what is running, a report undoes only its
+  own growth. Requires a token budget.
+
+* **Drain trigger.** `drain({ timeoutMs, stopOnTimeout: true })` stops every
+  call still running at the deadline with cause `"drain_deadline"`. Its
+  result gains `stopped`, the number of calls it stopped. Stopped calls stay
+  in `inFlight` until their callbacks settle.
+
+* **Take-back trigger.** `stop.takeBackGraceMs` bounds how long running work
+  may stay above the limits of a new snapshot: a lower `maxConcurrent` or
+  token budget, lower class ceilings, or a restored class floor. Nothing is
+  stopped during the grace period and calls that finish inside it are left
+  alone; then enough calls are stopped to fit, with cause `"limits"`. Any
+  later applied snapshot replaces a take-back that is still waiting and, if
+  it still leaves work above the limits, starts its own grace period.
+
+* **A fixed stop order.** Whenever the engine picks, calls admitted on
+  borrowed capacity go first, then normal priority before high, and on a tie
+  the call admitted last. A stopped call is never counted or picked again.
+  Deduplication followers receive their leader's error and are never picked;
+  observe-mode bypasses and queue waiters are never stopped.
+
+* **`stop` event and counters.** A `stop` event fires once per stopped call
+  with `cause`, `resources`, and `heldTokens`. `stats().llm` gains `stopped`
+  and `stoppedByCause`, and each admission class gains `stopped`. All three
+  are absent until the first stop.
+
+* **`stopped: true` on usage reports.** An `acquire()` token has no signal.
+  It learns of a stop from the event and from `stopped: true` on its usage
+  reports, starting with the report that caused the stop. Its tokens stay
+  charged until `release()`.
+
+* **Tests.** Five new files cover each trigger, the stop order, what is never
+  stopped, and the default of never stopping: `test/stop_overrun.test.ts`,
+  `test/stop_drain.test.ts`, `test/stop_take_back.test.ts`,
+  `test/stop_order.test.ts`, and `test/stop_default.test.ts`.
+
+* **Guide.** [Stopping admitted work](guides/stopping-admitted-work.md), with
+  matching sections in the README and the runtime-limits, streaming,
+  admission-classes, gateway-integration, telemetry, concepts, and migration
+  guides.
+
+### Contract
+
+* A stop is a local decision. It returns the local slot and asks the callback
+  to end. It does not prove that a provider account, model queue, or
+  accelerator stopped work, and a callback that ignores its signal keeps its
+  tokens charged for as long as it runs.
+
+* `run()` gives the callback a signal the engine can abort only when a stop
+  policy was applied at the moment the call was admitted (`stop: {}` is
+  enough). A call admitted without a policy can still be stopped later, by a
+  drain or by a policy that arrives afterward: its caller is rejected and its
+  slot returns, but its callback is not aborted.
+
+* The grace period of a take-back starts again with every newer snapshot that
+  still leaves work above the limits. Revisions that arrive faster than the
+  grace period keep postponing it.
+
+### Internal
+
+* Four new engine modules. `src/engine/running-calls.ts` owns the set of
+  admitted calls still running and the stop order; the set is a linked
+  list threaded through the calls, so registering one costs a few pointer
+  writes. `src/engine/stop.ts`
+  holds the three triggers and the timer of a waiting take-back.
+  `src/engine/limit-fit.ts` answers whether running work fits the applied
+  limits and which call to stop next. `src/engine/stop-policy.ts` validates
+  the `stop` part of a snapshot. The admitted token registers its call at
+  admission and removes it at stop or final release, and the stop policy
+  itself lives with the other limits in `limits.ts`.
+
+* The promise `run()` returns for an admitted call is now built by hand
+  instead of by an `async` function, so that a stop can reject it early. It
+  settles on the same microtask as before.
+
+* Every admission now registers its call as running. The median
+  `decisionDurationNs` measured on `admit` events stayed within one clock
+  tick (42 ns) of 3.17.1.
+
+### Compatibility
+
+* Existing exports, methods, and event names are unchanged, and every new
+  field is optional. The 13 existing test files pass unedited.
+* Without a stop policy, a `run()` callback still receives exactly the signal
+  its caller passed: the same object, or `undefined`. Under a policy it
+  receives an engine-owned signal that the caller's abort is forwarded to.
+* Behavior without a stop policy was checked against 3.17.1 by driving both
+  builds with the same 1,000 seeded random scenarios, covering classes,
+  token budgets, queues, deduplication, observe mode, limit changes, and
+  listeners, and comparing every result, error, event, and stats snapshot,
+  and the microtask on which each `run()` settled.
+* Code that switches exhaustively on `LLMEventType`, or maps every error
+  other than `LLMBulkheadRejectedError` to an upstream failure, should
+  account for the `stop` event and `LLMAdmissionStoppedError` before opting
+  in.
+* The runtime dependency remains `async-bulkhead-ts@^1.0.1`.
+
 ## [3.17.1] - 2026-11-22
 
 Internal restructuring release. No public API, runtime behavior, or

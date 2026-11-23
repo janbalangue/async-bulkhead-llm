@@ -3,8 +3,8 @@
  *
  * `drain()` waits for two things: the concurrency gate to empty, and every
  * admitted call to reach final settlement. The second matters because a
- * call that abandoned its borrowed slot no longer holds one, yet still
- * holds tokens until it releases.
+ * call that abandoned its borrowed slot, or was stopped, no longer holds a
+ * slot, yet still holds tokens until it releases.
  */
 import type { LLMDrainResult } from "../types.js";
 import { assertNonNegativeInteger } from "../validation.js";
@@ -14,6 +14,8 @@ import type { ConcurrencyGate } from "./shared.js";
 export function createShutdown(
   concurrency: ConcurrencyGate,
   counts: AdmissionCounts,
+  /** Stop every running call for a drain deadline; returns how many. */
+  stopForDrain: () => number,
 ) {
   const llmDrainWaiters = new Set<() => void>();
 
@@ -37,12 +39,20 @@ export function createShutdown(
 
   function drain(opts?: {
     timeoutMs?: number;
+    stopOnTimeout?: boolean;
   }): Promise<void> | Promise<LLMDrainResult> {
     const timeoutMs = opts?.timeoutMs;
+    const stopOnTimeout = opts?.stopOnTimeout;
+    if (stopOnTimeout !== undefined && typeof stopOnTimeout !== "boolean") {
+      throw new Error("stopOnTimeout must be a boolean");
+    }
     const completeDrain = async (): Promise<void> => {
       await Promise.all([concurrency.drain(), waitForLLMDrain()]);
     };
     if (timeoutMs === undefined) {
+      if (stopOnTimeout === true) {
+        throw new Error("stopOnTimeout requires timeoutMs");
+      }
       return completeDrain();
     }
     assertNonNegativeInteger(timeoutMs, "timeoutMs");
@@ -51,18 +61,27 @@ export function createShutdown(
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
+        // Stop first, so the snapshot shows the slots that came back. The
+        // stopped calls still count as in flight until they settle.
+        const stopped = stopOnTimeout === true ? stopForDrain() : undefined;
         const base = concurrency.stats();
         resolve({
           drained: false,
           inFlight: Math.max(base.inFlight, counts.unsettled()),
           pending: base.pending,
+          ...(stopped !== undefined ? { stopped } : {}),
         });
       }, timeoutMs);
       void completeDrain().then(() => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        resolve({ drained: true, inFlight: 0, pending: 0 });
+        resolve({
+          drained: true,
+          inFlight: 0,
+          pending: 0,
+          ...(stopOnTimeout === true ? { stopped: 0 } : {}),
+        });
       });
     });
   }

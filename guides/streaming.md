@@ -12,7 +12,8 @@ yet. Streaming responses let you correct it while the call is still in flight.
 Report *cumulative* usage as stream events arrive. Input over-estimates are
 refunded to the budget immediately; output overruns expand the hold (blocking
 new admissions until the runaway stream releases). The returned snapshot lets
-a gateway decide to abort a stream:
+a gateway decide to abort a stream, and since v3.18 the bulkhead can do it for
+you (see [Stopping on overrun](#stopping-on-overrun)):
 
 ```ts
 await bulkhead.run(request, async (signal, ctx) => {
@@ -63,6 +64,30 @@ settlement remains authoritative.
 Progressive updates share the existing sequence-numbered `usage` event. Events
 include `progressive`, `remainingOutputTokens`, and `safetyMarginTokens` when
 the progressive mode is used.
+
+## Stopping on overrun
+
+By default an overrun only widens the hold. A limits snapshot with
+`stop.overrunAllowanceTokens` bounds it instead:
+
+```ts
+bulkhead.applyLimits({
+  ...bulkhead.limits(),
+  revision: bulkhead.limits().revision + 1,
+  stop: { overrunAllowanceTokens: 500 },
+});
+```
+
+A call whose hold grows more than 500 tokens above its reservation is
+stopped: its callback signal is aborted and `run()` rejects with
+`LLMAdmissionStoppedError`, cause `"overrun"`. The same setting stops calls
+when a report leaves a class above its `maxInFlightTokens` or the pool above
+its budget, until the holds of the calls still running fit.
+
+The report that causes a stop, and every later report for that admission,
+carries `stopped: true`. The tokens stay charged until the callback settles.
+Details and the order in which calls are picked are in
+[Stopping admitted work](stopping-admitted-work.md).
 
 ## Ordered usage-change events
 

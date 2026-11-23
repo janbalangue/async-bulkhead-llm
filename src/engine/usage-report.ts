@@ -136,6 +136,8 @@ export function usageSnapshot(call: {
   outputCap: number | null;
   sequence: number;
   held: number;
+  /** The engine has stopped this call. Never set for bypassed work. */
+  stopped?: boolean;
 }): UsageReport {
   const { parts, cell, consumed, outputCap } = call;
   return {
@@ -154,5 +156,6 @@ export function usageSnapshot(call: {
         ? null
         : Math.max(0, outputCap - (cell.reported?.output ?? 0)),
     overReservation: parts ? consumed > parts.reserved : false,
+    ...(call.stopped === true ? { stopped: true as const } : {}),
   };
 }

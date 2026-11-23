@@ -10,6 +10,39 @@ cover what changes if you assert exact object shapes.
 For the full per-release record, see the
 [changelog](../CHANGELOG.md).
 
+## v3.17 → v3.18
+
+No call-site changes are required, and nothing is stopped unless you opt in.
+Without a `stop` policy and without `stopOnTimeout`, results, stats, events,
+and the signal handed to a `run()` callback are what they were in 3.17.
+
+The additive surface, for code that asserts exact shapes or switches
+exhaustively:
+
+- `LLMAdmissionLimits` gains optional `stop`. `limits()`, `stats().limits`,
+  and the `reconfigure` event include it only while a policy is applied.
+- `LLMEventType` gains `stop`.
+- `stats().llm` gains `stopped` and `stoppedByCause`, and each class gains
+  `stopped`. All three are absent until the bulkhead's first stop.
+- `UsageReport` gains `stopped: true` once an admission was stopped.
+- `drain()` accepts `stopOnTimeout`, and its result gains `stopped` only when
+  that option was passed.
+- `LLMAdmissionStoppedError` is a new export. `LLMAdmissionStopCause` and
+  `LLMAdmissionStopPolicy` are new type exports.
+
+If you opt in, three things are worth knowing up front:
+
+- The policy is part of the snapshot and is not inherited. A later
+  `applyLimits()` without `stop` turns stopping off. `setBudget()` carries the
+  policy along.
+- While a policy is applied, newly admitted `run()` callbacks receive a signal
+  owned by the engine instead of the caller's own signal object (or instead of
+  `undefined`). The caller's abort is forwarded to it. Code that compares
+  signal identity inside the callback will see a different object.
+- `LLMAdmissionStoppedError` is not an `LLMBulkheadRejectedError`. A handler
+  that maps every other error to an upstream failure will misreport stops
+  until it handles the new error.
+
 ## v3.16 → v3.17
 
 No existing admission call-site changes are required. Successful admission

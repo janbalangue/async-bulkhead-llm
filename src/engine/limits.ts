@@ -1,7 +1,7 @@
 /**
  * Owner of the admission limits that change at runtime: the limit
- * revision, the token budget, the high-priority reserve, and each class's
- * floors and ceilings.
+ * revision, the token budget, the high-priority reserve, each class's
+ * floors and ceilings, and the stop policy.
  *
  * The two concurrency ceilings (`maxConcurrent`, `maxQueue`) live in the
  * concurrency gate; this module installs them there as the last step of
@@ -10,6 +10,7 @@
 import type {
   LLMAdmissionClassLimits,
   LLMAdmissionLimits,
+  LLMAdmissionStopPolicy,
   LLMApplyLimitsResult,
   LLMPriority,
   TokenBudgetOptions,
@@ -23,6 +24,7 @@ import {
 import type { EventHub } from "./events.js";
 import type { ResolvedOptions } from "./options.js";
 import type { ConcurrencyGate } from "./shared.js";
+import { readStopPolicy } from "./stop-policy.js";
 
 /** One class's limits with the protected floors defaulted to 0. */
 export type ClassLimits = {
@@ -39,6 +41,7 @@ type LimitsRead = {
   maxQueue: number;
   tokenBudget: LLMAdmissionLimits["tokenBudget"];
   admissionClasses: LLMAdmissionLimits["admissionClasses"];
+  stop: LLMAdmissionLimits["stop"];
 };
 
 /** A limits snapshot that passed validation and is ready to install. */
@@ -49,6 +52,7 @@ type PreparedLimits = {
   budget: number | undefined;
   highPriorityReserve: number | undefined;
   classLimits: Map<string, LLMAdmissionClassLimits> | undefined;
+  stop: LLMAdmissionStopPolicy | undefined;
 };
 
 /** Public shape of one class's limits: unset floors and ceilings are omitted. */
@@ -82,11 +86,19 @@ function readLimits(next: LLMAdmissionLimits): LimitsRead {
   const maxQueue = next.maxQueue;
   const tokenBudget = next.tokenBudget;
   const admissionClasses = next.admissionClasses;
+  const stop = next.stop;
 
   if (!Number.isSafeInteger(revision) || revision < 0) {
     throw new Error("limits.revision must be a non-negative safe integer");
   }
-  return { revision, maxConcurrent, maxQueue, tokenBudget, admissionClasses };
+  return {
+    revision,
+    maxConcurrent,
+    maxQueue,
+    tokenBudget,
+    admissionClasses,
+    stop,
+  };
 }
 
 /** Validate a snapshot that was already read, without changing anything. */
@@ -143,6 +155,7 @@ function validateLimits(
     budget: nextBudget,
     highPriorityReserve: nextHighPriorityReserve,
     classLimits,
+    stop: readStopPolicy(read.stop, budget !== undefined),
   };
 }
 
@@ -258,6 +271,12 @@ export function createLimits(
   let currentRevision = config.initialRevision;
   let currentBudget: number | undefined = budget?.budget;
   let currentHighPriorityReserve = budget?.highPriorityReserve ?? 0;
+  /**
+   * The stop policy of the applied snapshot. There is none until a
+   * snapshot states one, and a snapshot without `stop` clears it: like
+   * every other limit, it is never inherited from the previous revision.
+   */
+  let currentStop: LLMAdmissionStopPolicy | undefined;
 
   /**
    * Budget ceiling applicable to a request at the given priority.
@@ -308,6 +327,7 @@ export function createLimits(
           }
         : {}),
       ...(admissionClasses !== undefined ? { admissionClasses } : {}),
+      ...(currentStop !== undefined ? { stop: currentStop } : {}),
     };
     return Object.freeze({
       ...current,
@@ -355,6 +375,7 @@ export function createLimits(
     if (prepared.classLimits !== undefined) {
       classes.install(prepared.classLimits);
     }
+    currentStop = prepared.stop;
     concurrency.applyLimits({
       maxConcurrent: prepared.maxConcurrent,
       maxQueue: prepared.maxQueue,
@@ -392,6 +413,7 @@ export function createLimits(
       ...(current.admissionClasses !== undefined
         ? { admissionClasses: current.admissionClasses }
         : {}),
+      ...(current.stop !== undefined ? { stop: current.stop } : {}),
     });
   }
 
@@ -408,6 +430,8 @@ export function createLimits(
     /** Current budget ceiling; `undefined` when no token budget is configured. */
     budget: (): number | undefined => currentBudget,
     highPriorityReserve: (): number => currentHighPriorityReserve,
+    /** The applied stop policy; `undefined` when stopping is off. */
+    stopPolicy: (): LLMAdmissionStopPolicy | undefined => currentStop,
     effectiveBudget,
     protectedConcurrentTotal: classes.protectedConcurrentTotal,
     protectedTokensTotal: classes.protectedTokensTotal,

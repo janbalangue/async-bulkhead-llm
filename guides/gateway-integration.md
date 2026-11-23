@@ -78,6 +78,33 @@ try {
 }
 ```
 
+## Stopped admissions
+
+With an opt-in stop policy (v3.18), `run()` can also reject with
+`LLMAdmissionStoppedError` after the call was admitted. Treat it as its own
+outcome, not as an admission rejection and not as an upstream failure: the
+provider may already have done part of the work.
+
+```ts
+import { LLMAdmissionStoppedError } from 'async-bulkhead-llm';
+
+try {
+  await bulkhead.run(request, (signal) => callLLM(request, { signal }));
+} catch (err) {
+  if (err instanceof LLMAdmissionStoppedError) {
+    // err.cause: 'overrun' | 'drain_deadline' | 'limits'
+    return respondStopped(err.cause, err.admissionId);
+  }
+  throw err;
+}
+```
+
+Inside the callback, `signal.reason` is the same error, so a stream loop can
+tell a stop from a client disconnect. A control plane that builds every
+limits snapshot from scratch must include `stop` in each one, because the
+policy is not inherited. See
+[Stopping admitted work](stopping-admitted-work.md).
+
 ## Scope note
 
 This library is single-process by design. Distributed budget coordination

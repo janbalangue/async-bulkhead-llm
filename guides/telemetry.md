@@ -27,6 +27,8 @@ s.llm.released
 s.llm.inFlight
 s.llm.borrowedConcurrencyAbandoned
 s.llm.borrowedConcurrencyAbandonedByCause?.deadline
+s.llm.stopped                       // absent until the first stop (v3.18)
+s.llm.stoppedByCause?.overrun       // also drain_deadline, limits
 s.llm.rejected
 s.llm.rejectedByReason?.budget_limit
 
@@ -48,6 +50,7 @@ s.admissionClasses?.defaultClass
 s.admissionClasses?.classes.premium?.inFlight
 s.admissionClasses?.classes.premium?.inFlightTokens
 s.admissionClasses?.classes.premium?.rejectedByReason
+s.admissionClasses?.classes.premium?.stopped   // absent until the first stop
 
 s.deduplication?.active
 s.deduplication?.hits
@@ -71,6 +74,8 @@ type LLMStats = {
     >;
     rejected: number;
     rejectedByReason: Partial<Record<LLMRejectReason, number>>;
+    stopped?: number;
+    stoppedByCause?: Partial<Record<LLMAdmissionStopCause, number>>;
   };
   tokenBudget?: {
     budget: number;
@@ -128,6 +133,7 @@ off();
 |-----------|---------|
 | `admit`   | `{ request, admissionId, limitRevision, priority, admissionClass?, reservedTokens, resources, decisionDurationNs?, queueWaitNs? }` |
 | `borrowedConcurrencyAbandon` | `{ request, admissionId, limitRevision, priority, admissionClass?, resources, cause, heldTokens }` |
+| `stop` | `{ request, admissionId, limitRevision, priority, admissionClass?, resources, cause, heldTokens }` |
 | `reject`  | `{ request, reason, limitRevision, admissionClass?, detail?, decisionDurationNs?, queueWaitNs? }` |
 | `usage`   | `{ request, admissionId, limitRevision, priority, admissionClass?, sequence, reservedTokens, previousHeldTokens, heldTokens, deltaTokens, usage, outputCap, outputRemaining, overReservation }` |
 | `release` | `{ request, admissionId, limitRevision, priority, admissionClass?, reservedTokens, resources, heldTokens, refundedTokens, usageSequence, usage? }` |
@@ -136,6 +142,14 @@ off();
 | `bypassRelease` | `{ request, admissionId, limitRevision, priority, admissionClass?, reason, reservation, usageSequence, usage? }` |
 | `reconfigure` | `{ previous, current }` |
 | `dedup`   | `{ request }` |
+
+`stop` (v3.18) fires once when the engine stops a call it had admitted;
+`cause` is `"overrun"`, `"drain_deadline"`, or `"limits"`. The slot has already
+been returned when it fires, and `heldTokens` stay charged until the matching
+`release`. `llm.stopped`, `llm.stoppedByCause`, and the per-class `stopped`
+are absent until the first stop, so a bulkhead that never stops anything
+reports the same shape as before. See
+[Stopping admitted work](stopping-admitted-work.md).
 
 Listeners are synchronous and fire-and-forget. Exceptions are silently caught.
 Do not perform blocking network I/O in a listener; enqueue telemetry or lease

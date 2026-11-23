@@ -9,13 +9,15 @@
  * and every other part reads or changes it through that owner. An
  * admission class is always passed around as its id:
  *
- * - `limits.ts`           — revision, token budget, high-priority reserve
- *                           and the class limits
+ * - `limits.ts`           — revision, token budget, high-priority reserve,
+ *                           the class limits and the stop policy
  * - `token-ledger.ts`     — token counters, for the pool and per class
  * - `class-slots.ts`      — slot counts per class (the global slot count
  *                           stays in `reconfigurable-bulkhead.ts`)
- * - `admission-counts.ts` — admitted, released, rejected and abandoned
- *                           counts, global and per class
+ * - `admission-counts.ts` — admitted, released, rejected, abandoned and
+ *                           stopped counts, global and per class
+ * - `running-calls.ts`    — the admitted calls still running, and the
+ *                           order in which they would be stopped
  * - `observe-stats.ts`    — observe-mode counters
  * - `dedup-flow.ts`       — the in-flight deduplication map and hit count
  *
@@ -30,6 +32,8 @@
  * - `admitted-token.ts`, `usage-report.ts`   — the admitted token and its
  *                                              usage reports
  * - `run.ts`, `run-options.ts`, `admitted-run.ts`, `bypass.ts` — `run()`
+ * - `stop.ts`, `limit-fit.ts`, `stop-policy.ts` — when admitted work is
+ *                                              stopped, and which calls
  * - `stats.ts`, `events.ts`, `shutdown.ts`
  */
 import type {
@@ -66,10 +70,12 @@ import { resolveOptions } from "./engine/options.js";
 import { createRejectDetail } from "./engine/reject-detail.js";
 import { createReservations } from "./engine/reservation.js";
 import { createRun } from "./engine/run.js";
+import { createRunningCalls } from "./engine/running-calls.js";
 import type { BulkheadSignal } from "./engine/shared.js";
 import { createSharedUsage } from "./engine/shared-usage.js";
 import { createShutdown } from "./engine/shutdown.js";
 import { createStats } from "./engine/stats.js";
+import { createStopper } from "./engine/stop.js";
 import { createTokenLedger } from "./engine/token-ledger.js";
 import { createWouldAdmit } from "./engine/would-admit.js";
 
@@ -105,6 +111,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     slots: createClassSlots(classIds),
     counts: createAdmissionCounts(classIds),
     observeStats: createObserveStats(),
+    running: createRunningCalls(),
   };
   const dedup = createDedup({ ...owners, options: opts.deduplication });
 
@@ -122,10 +129,21 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     buildRejectDetail,
   });
 
-  // ---- Admission, execution, stats and shutdown ----
-  const shutdown = createShutdown(concurrency, owners.counts);
-  const wrapToken = createTokenWrapper({
+  // ---- Admission, execution, stopping, stats and shutdown ----
+  // The stopper decides which calls to stop; the token wrapper, built
+  // just below, is what stops one.
+  const stopper = createStopper({
     ...owners,
+    stop: (call, cause) => tokens.stop(call, cause),
+  });
+  const shutdown = createShutdown(
+    concurrency,
+    owners.counts,
+    stopper.stopForDrain,
+  );
+  const tokens = createTokenWrapper({
+    ...owners,
+    holdGrew: stopper.holdGrew,
     settleDrainWaiters: shutdown.settleDrainWaiters,
   });
   const admit = createAcquire({
@@ -133,7 +151,7 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
     capacity,
     buildRejectDetail,
     resolveAdmission,
-    wrapToken,
+    wrapToken: tokens.wrap,
     timeoutMs: config.timeoutMs,
   });
   const runBypassed = createBypass({ ...owners, buildRejectDetail });
@@ -258,9 +276,18 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
    * queue, or token ceilings use shrink-by-attrition: in-flight work and
    * already accepted waiters are not canceled. Raising concurrency pumps
    * accepted waiters immediately after the complete snapshot is installed.
+   *
+   * v3.18: a snapshot may carry an opt-in `stop` policy. With
+   * `stop.takeBackGraceMs`, running work the snapshot leaves above the new
+   * limits is stopped once the grace period ends, instead of being waited
+   * out. Accepted waiters are still never canceled. A snapshot without
+   * `stop` has no policy, whatever the previous revision said, and any
+   * applied snapshot replaces a take-back that is still waiting.
    */
   function applyLimits(next: LLMAdmissionLimits): LLMApplyLimitsResult {
-    return admissionLimits.apply(next);
+    const result = admissionLimits.apply(next);
+    if (result.applied) stopper.limitsApplied();
+    return result;
   }
 
   /**
@@ -269,9 +296,11 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
    * This is implemented as a complete local reconfiguration at
    * `currentRevision + 1`. Externally managed deployments should use
    * `applyLimits()` exclusively so one authority owns the revision stream.
+   * The applied stop policy, if any, is carried into the new revision.
    */
   function setBudget(tokens: number): void {
     admissionLimits.setBudget(tokens);
+    stopper.limitsApplied();
   }
 
   /**
@@ -308,11 +337,24 @@ export function createLLMBulkhead(opts: LLMBulkheadOptions) {
    * behind until the bulkhead actually drains — harmless, but poll
    * with `stats()` rather than in a tight `drain({ timeoutMs: 0 })`
    * loop.
+   *
+   * v3.18: add `stopOnTimeout: true` to stop every call still running at
+   * the deadline, with cause `"drain_deadline"`. The result then carries
+   * `stopped`, the number of calls it stopped. Their slots return at once,
+   * but they stay in `inFlight` until their callbacks settle, so a later
+   * `drain()` still waits for them. Queue waiters are never stopped; call
+   * `close()` first so the freed slots are not handed to them. A callback
+   * is aborted only if a stop policy was active when it was admitted;
+   * otherwise only its caller's promise rejects.
    */
   function drain(): Promise<void>;
-  function drain(opts: { timeoutMs: number }): Promise<LLMDrainResult>;
+  function drain(opts: {
+    timeoutMs: number;
+    stopOnTimeout?: boolean;
+  }): Promise<LLMDrainResult>;
   function drain(opts?: {
     timeoutMs?: number;
+    stopOnTimeout?: boolean;
   }): Promise<void> | Promise<LLMDrainResult> {
     return shutdown.drain(opts);
   }

@@ -95,6 +95,8 @@ function classStats(deps: Deps, classId: string): LLMAdmissionClassStats {
     totalOverrun: tokens.totalOverrun,
     totalBorrowedAdmissions: deps.slots.totalBorrowedAdmissions(classId),
     totalBorrowedTokensReserved: tokens.totalBorrowedTokensReserved,
+    // Like `llm.stopped`, absent until the bulkhead's first stop.
+    ...(deps.counts.anyStopped() ? { stopped: outcomes.stopped } : {}),
   };
 }
 

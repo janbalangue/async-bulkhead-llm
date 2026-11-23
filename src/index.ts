@@ -5,7 +5,8 @@
  * implementation lives in focused modules:
  *
  * - `types.ts`      — request/result/options/stats/event types
- * - `errors.ts`     — `LLMBulkheadRejectedError`
+ * - `errors.ts`     — `LLMBulkheadRejectedError` and the two errors for
+ *                     admitted work that ended early
  * - `profiles.ts`   — `PROFILES` presets
  * - `estimators.ts` — naive + model-aware estimators, `extractTextLength`
  * - `adaptive.ts`   — `createAdaptiveTokenEstimator` (v3.8)
@@ -18,8 +19,9 @@
  * - `engine/`       — the parts of the admission engine, one concern per
  *                     file (limits, token ledger, class slots, admission
  *                     counts, capacity checks, the admitted token, `run()`,
- *                     observe mode, deduplication, stats, shutdown); the
- *                     full list is in the header of `bulkhead.ts`
+ *                     observe mode, deduplication, stats, shutdown, the
+ *                     running calls and the stop triggers); the full list
+ *                     is in the header of `bulkhead.ts`
  *
  * Deep-importing the internal modules is not supported; the package
  * `exports` map exposes only this entry point.
@@ -36,6 +38,8 @@ export type {
   LLMAdmissionClassStats,
   LLMAdmissionClassSharedStats,
   LLMAdmissionLimits,
+  LLMAdmissionStopCause,
+  LLMAdmissionStopPolicy,
   LLMApplyLimitsResult,
   LLMAcquireOptions,
   LLMAcquireResult,
@@ -72,6 +76,7 @@ export type {
 } from "./types.js";
 
 export {
+  LLMAdmissionStoppedError,
   LLMBorrowedConcurrencyDeadlineError,
   LLMBulkheadRejectedError,
 } from "./errors.js";
