@@ -7,6 +7,63 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.18.1] - 2026-11-24
+
+Documentation release. No runtime code, public API, or dependency changed; no
+upgrade action is required.
+
+### Changed
+
+* **"How it compares" rewritten against current alternatives.**
+  `guides/comparison.md` compared the library with LangChain and LlamaIndex,
+  the raw OpenAI SDK, p-limit and Bottleneck, and cockatiel and polly. It now
+  covers the tools a reader is more likely to be choosing between:
+  concurrency limiters (p-limit, p-queue, Bottleneck, cockatiel), LLM rate
+  limiters (ai-sdk-rate-limiter, `@aid-on/llm-throttle`), AI gateways
+  (LiteLLM, Kong, Azure API Management, Agent Router, Portkey, Telnyx,
+  Gravitee), self-hosted inference schedulers (llm-d, GKE Inference Gateway,
+  vLLM), and provider service tiers. Each description is taken from that
+  project's own documentation as of November 2026 and links to its source
+  page.
+
+* **Per-minute limits and in-flight limits explained as separate controls.**
+  The guide now says that a tokens-per-minute window does not bound work in
+  flight when a provider slows down, and that an in-flight ceiling does not
+  enforce a provider quota or a spend cap, so a service may want both.
+
+* **The guide says where other tools do more.** Gateways share limits across
+  replicas and attach them to keys and teams, inference schedulers see
+  model-server queue and KV-cache pressure, and rate limiters enforce
+  provider quotas. Readers are pointed to them for those jobs.
+
+* **Positioning sections replaced.** The "Quick positioning" list, the rule
+  of thumb, and the "Key differentiator" quote give way to an at-a-glance
+  table and a rule of thumb that maps four needs to four kinds of tool.
+
+* **README guide index.** The "How it compares" row describes the rewritten
+  guide.
+
+### Fixed
+
+* **Two inaccurate cells in the old comparison table.** It listed
+  cockatiel's concurrency limit and bounded queue as "indirect"; cockatiel
+  has a `bulkhead(limit, queue)` policy that provides both and rejects when
+  they are full. It listed the OpenAI SDK as having no retries; the OpenAI
+  Node SDK retries rate-limit, timeout, and server errors twice by default.
+
+* **Absence is no longer asserted without a source.** The old table marked
+  features as missing from other tools with ❌. The new tables use "—" to
+  mean "not described in that project's documentation".
+
+* **Updated the security support matrix.** `SECURITY.md` now identifies
+  3.18.1 as the only supported release.
+
+### Compatibility
+
+* No API, runtime behavior, or dependency changes for consumers. The
+  published tarball differs from 3.18.0 only in `README.md`, `CHANGELOG.md`,
+  and the version in `package.json`; `guides/` is not published.
+
 ## [3.18.0] - 2026-11-23
 
 Adds an opt-in way to stop work the bulkhead already admitted. Nothing is

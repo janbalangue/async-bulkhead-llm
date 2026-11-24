@@ -261,7 +261,7 @@ settling the resource accounting for the work behind it.
 | [Deduplication](guides/deduplication.md) | In-flight dedup, tenant scoping, streaming results |
 | [Gateway integration](guides/gateway-integration.md) | `wouldAdmit()`, admission IDs, external leases, control planes |
 | [Stats and events](guides/telemetry.md) | Every counter and every event payload |
-| [How it compares](guides/comparison.md) | Against LangChain, p-limit, cockatiel, and raw SDKs |
+| [How it compares](guides/comparison.md) | Against concurrency limiters, LLM rate limiters, AI gateways, inference schedulers, and provider tiers |
 | [Migration](guides/migration.md) | Upgrade notes for every release since v2 |
 
 The **[full API reference](https://janbalangue.github.io/async-bulkhead-llm/)**
