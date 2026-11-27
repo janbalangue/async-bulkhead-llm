@@ -7,6 +7,71 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.18.2] - 2026-11-26
+
+Bug-fix release for admission classes. No public API or dependency changed.
+Calls that start in the same tick now get the answers the same calls get
+when made one at a time.
+
+### Fixed
+
+* **Same-tick calls were rejected under class concurrency floors.** With a
+  `protectedConcurrent` floor configured, calls started in the same tick
+  could be rejected with `concurrency_limit` and
+  `constraint: 'admission_class_protection'` although capacity covered all
+  of them. On a bulkhead with 4 slots, 2 of them protected for `premium`,
+  two premium and two standard calls in one `Promise.all` admitted only the
+  premium calls; a burst of standard calls followed by premium calls
+  admitted no standard call at all. Awaited one by one, the same calls were
+  all admitted. The bug only rejected work that fit. It never admitted past
+  a limit, and token floors were not affected.
+
+  The cause was a gap in the admission sequence. A call took its global
+  concurrency slot, and its class was credited only after an `await`. In
+  between, the slot counted globally but belonged to no class, so a call
+  inside its own floor was briefly counted as a borrower of shared capacity.
+  The class credit and the token reservation are now made in the same
+  synchronous step that grants the slot, for immediate grants and for
+  queued waiters alike, and a slot whose reservation fails is given back in
+  that step.
+
+* **`stats()` and `wouldAdmit()` were wrong in the same window.** Right
+  after an un-awaited `acquire()`, `stats().admissionClasses.shared.inFlight`
+  counted a floor-covered call as shared, the class showed no slot in use,
+  and `wouldAdmit()` could answer no for a call that would be admitted. All
+  three are now correct as soon as `acquire()` returns its promise.
+
+### Changed
+
+* **An immediately granted call is decided when it is made.** `acquire()`
+  and `run()` now reserve tokens and class capacity before they return their
+  promise whenever a slot is free. A second call in the same tick therefore
+  sees the first call's reservation and can fail the token precheck without
+  taking a concurrency slot, so `stats().bulkhead.totalAdmitted` no longer
+  counts it. An `applyLimits()` made after an un-awaited `acquire()` no
+  longer changes that call's outcome or its `limitRevision`; the call was
+  admitted under the limits in force when it was made. Queued calls are
+  still decided, and stamped with the revision, when their slot is granted.
+
+* **`queueWaitNs` ends when the slot is granted.** The postcheck now runs
+  inside the grant, so on `admit` events and postcheck `reject` events the
+  microtask hop after the grant counts toward `decisionDurationNs` and no
+  longer toward `queueWaitNs`. The telemetry guide's timing table says so.
+
+### Added
+
+* **Same-tick admission tests.** `test/same_tick_admission.test.ts` covers
+  mixed bursts in several arrival orders through `acquire()` and `run()`,
+  a floor that stays free when borrowers arrive first, the advisory reads
+  before the acquire is awaited, and queued waiters that are granted
+  together by `applyLimits()`. All seven tests fail on 3.18.1. Two existing
+  tests that relied on the old gap were updated.
+
+* **Updated the security support matrix.** `SECURITY.md` now identifies
+  3.18.2 as the only supported release.
+
+---
+
 ## [3.18.1] - 2026-11-24
 
 Documentation release. No runtime code, public API, or dependency changed; no

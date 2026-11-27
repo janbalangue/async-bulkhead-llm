@@ -169,10 +169,13 @@ The public timing boundary is:
 |---|---:|---|
 | precheck reject | exactly `0` | precheck span |
 | acquire reject / timeout | full awaited span | precheck + acquire-option normalization + reject-detail build |
-| postcheck reject | full awaited span | precheck + acquire-option normalization + postcheck + acquired-slot cleanup + detail build |
-| admit (unqueued or queued) | full awaited span | precheck + acquire-option normalization + postcheck + revision capture + uuid + `wrapToken` |
+| postcheck reject | wait until the slot is granted | precheck + acquire-option normalization + postcheck + detail build |
+| admit (unqueued or queued) | wait until the slot is granted | precheck + acquire-option normalization + postcheck + revision capture + uuid + `wrapToken` |
 
-`decisionDurationNs` excludes the awaited `bulkhead.acquire()` in every case.
+The postcheck and the revision capture run in the same synchronous step that
+grants the concurrency slot, so the wait ends at the grant and everything
+after it is decision time. `decisionDurationNs` excludes the wait for a slot
+in every case.
 Use it for local admission-decision cost. Use `queueWaitNs` separately for
 contention / intentional waiting; do not add queue wait to the decision number
 and call the sum admission overhead.

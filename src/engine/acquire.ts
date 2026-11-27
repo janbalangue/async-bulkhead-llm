@@ -3,9 +3,14 @@
  *
  *   1. fail-fast precheck against every class ceiling and the budget
  *   2. wait for a global concurrency slot (the only step that can queue)
- *   3. reserve every other capacity layer atomically, now that the slot
- *      is held; give the slot back if that fails
+ *   3. reserve every other capacity layer in the same synchronous step
+ *      that grants the slot; the slot goes straight back if that fails
  *   4. hand out the wrapped token
+ *
+ * Step 3 runs inside the gate's grant, not after the `await`. A granted
+ * slot therefore never exists without its class credit and its token
+ * reservation, so calls that start in the same tick see each other
+ * exactly as calls made one at a time do.
  *
  * It also measures the admission decision, keeping queue wait separate
  * from the synchronous decision work.
@@ -30,6 +35,7 @@ import type { EventHub } from "./events.js";
 import type { Limits } from "./limits.js";
 import type { BuildRejectDetail } from "./reject-detail.js";
 import type {
+  CapacityReservationResult,
   ConcurrencyGate,
   InternalAcquireResult,
   ResolvedAdmission,
@@ -67,6 +73,8 @@ function normalizeAcquireOptions(
  * the awaited concurrency acquire. Exact accounting requires four
  * monotonic clock reads on paths that reach the acquire: decision start,
  * wait start, wait end, and decision end. Precheck rejects use two reads.
+ * The wait ends when the slot is granted, so the reservation made in that
+ * same step counts as decision work.
  */
 function startDecisionClock() {
   const decisionStartedNs = process.hrtime.bigint();
@@ -146,7 +154,7 @@ export function createAcquire(deps: Deps) {
     };
 
     // Every class ceiling is fail-fast and checked before entering the global
-    // queue. A second atomic check runs after the global slot is acquired.
+    // queue. A second atomic check runs as the global slot is granted.
     const precheck = capacity.check(reserved, priority, admissionClass);
     if (precheck !== undefined) {
       const precheckDecisionDurationNs = isTimed(precheck.reason)
@@ -161,11 +169,27 @@ export function createAcquire(deps: Deps) {
 
     const mergedOptions = normalizeAcquireOptions(ao, deps.timeoutMs);
 
+    // Filled in by the grant hook. The revision is captured at the
+    // admission linearization point: the concurrency slot and the token
+    // reservation are both held, and no listener or callback has run yet.
+    // Later reconfiguration must not rewrite the provenance of this
+    // admitted work.
+    const granted: {
+      reservation?: CapacityReservationResult;
+      limitRevision: number;
+    } = { limitRevision: 0 };
+
     clock.startWait();
-    const r = await concurrency.acquire(mergedOptions);
-    clock.endWait();
+    const r = await concurrency.acquire(mergedOptions, () => {
+      clock.endWait();
+      const reservation = capacity.tryReserve(reserved, priority, admissionClass);
+      granted.reservation = reservation;
+      granted.limitRevision = limits.revision();
+      return reservation.ok;
+    });
 
     if (!r.ok) {
+      clock.endWait();
       const constraint: LLMCapacityConstraint | undefined =
         r.reason === "concurrency_limit" ||
         r.reason === "queue_limit" ||
@@ -175,18 +199,13 @@ export function createAcquire(deps: Deps) {
       return rejectWith(r.reason, constraint);
     }
 
-    // Post-admission: atomically reserve global token and class capacity.
-    const postcheck = capacity.tryReserve(reserved, priority, admissionClass);
+    // The gate already took the slot back if the reservation failed.
+    const postcheck = granted.reservation!;
     if (!postcheck.ok) {
-      r.token.release();
       return rejectWith(postcheck.failure.reason, postcheck.failure.constraint);
     }
 
-    // Capture the revision at the admission linearization point: both the
-    // concurrency slot and token reservation are held, and no listener or
-    // callback has run yet. Later reconfiguration must not rewrite the
-    // provenance of this admitted work.
-    const limitRevision = limits.revision();
+    const limitRevision = granted.limitRevision;
     const admissionId = randomUUID();
     const token = deps.wrapToken({
       base: r.token,

@@ -6,8 +6,8 @@ Only the latest release receives security fixes.
 
 | Version | Supported |
 |---------|-----------|
-| 3.18.1  | ✅        |
-| < 3.18.1 | ❌       |
+| 3.18.2  | ✅        |
+| < 3.18.2 | ❌       |
 
 ---
 

@@ -134,7 +134,7 @@ describe("admission-decision timing", () => {
     const b = createLLMBulkhead({
       model: "gpt-4o",
       maxConcurrent: 1,
-      maxQueue: 0,
+      maxQueue: 1,
       initialRevision: 1,
       tokenBudget: {
         budget: 1_000,
@@ -144,13 +144,18 @@ describe("admission-decision timing", () => {
     const rejects: LLMEventMap["reject"][] = [];
     b.on("reject", (event) => rejects.push(event));
 
+    // A call that is granted its slot at once is decided under the limits
+    // in force when it was made, so the race needs a queued call: it
+    // passes the precheck, waits, and no longer fits when its slot comes.
+    const running = await b.acquire(request);
     const pending = b.acquire(request);
     b.applyLimits({
       revision: 2,
       maxConcurrent: 1,
-      maxQueue: 0,
+      maxQueue: 1,
       tokenBudget: { budget: 50, highPriorityReserve: 0 },
     });
+    if (running.ok) running.token.release();
     const result = await pending;
 
     expect(result).toMatchObject({ ok: false, reason: "budget_limit" });

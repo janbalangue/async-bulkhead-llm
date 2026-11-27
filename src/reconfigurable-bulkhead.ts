@@ -23,8 +23,17 @@ export type ConcurrencyLimits = {
   maxQueue: number;
 };
 
+/**
+ * Runs synchronously at the moment a slot is granted, before anything else
+ * can observe the slot as held. Returning `false` gives the slot straight
+ * back: the acquire still resolves `ok`, with a token that is already
+ * released.
+ */
+export type GrantHook = () => boolean;
+
 type Waiter = {
   resolve: (result: AcquireResult) => void;
+  onGrant: GrantHook | undefined;
   cancelled: boolean;
   settled: boolean;
   abortListener: (() => void) | undefined;
@@ -165,6 +174,29 @@ export function createReconfigurableBulkhead(initial: ConcurrencyLimits) {
     };
   };
 
+  /**
+   * What a grant resolves with when its hook declined the slot. The slot
+   * was never left held, so releasing this token again is a double release.
+   */
+  const declinedToken: Token = {
+    release(): void {
+      doubleRelease++;
+    },
+  };
+
+  /**
+   * Grant one slot. `inFlight` already counts it when the hook runs, so
+   * the hook sees the state the grant produces. A declined slot is counted
+   * as admitted and released, as it was when the caller released it.
+   */
+  const grant = (onGrant: GrantHook | undefined): Token => {
+    inFlight++;
+    if (onGrant === undefined || onGrant()) return makeToken();
+    inFlight--;
+    totalReleased++;
+    return declinedToken;
+  };
+
   const pump = (): void => {
     pruneCancelledFront();
     while (inFlight < limits.maxConcurrent && queue.length > 0) {
@@ -174,8 +206,7 @@ export function createReconfigurableBulkhead(initial: ConcurrencyLimits) {
         pruneCancelledFront();
         continue;
       }
-      inFlight++;
-      settle(waiter, { ok: true, token: makeToken() });
+      settle(waiter, { ok: true, token: grant(waiter.onGrant) });
     }
   };
 
@@ -193,15 +224,17 @@ export function createReconfigurableBulkhead(initial: ConcurrencyLimits) {
     return { ok: false, reason: "concurrency_limit" };
   };
 
-  const acquire = (options: AcquireOptions = {}): Promise<AcquireResult> => {
+  const acquire = (
+    options: AcquireOptions = {},
+    onGrant?: GrantHook,
+  ): Promise<AcquireResult> => {
     if (closed) {
       bumpRejectReason("shutdown");
       return Promise.resolve({ ok: false, reason: "shutdown" });
     }
     if (inFlight < limits.maxConcurrent) {
-      inFlight++;
       totalAdmitted++;
-      return Promise.resolve({ ok: true, token: makeToken() });
+      return Promise.resolve({ ok: true, token: grant(onGrant) });
     }
 
     // A zero concurrency grant is a fail-fast kill switch. Existing queued
@@ -219,6 +252,7 @@ export function createReconfigurableBulkhead(initial: ConcurrencyLimits) {
     return new Promise<AcquireResult>((resolve) => {
       const waiter: Waiter = {
         resolve,
+        onGrant,
         cancelled: false,
         settled: false,
         abortListener: undefined,
@@ -300,6 +334,9 @@ export function createReconfigurableBulkhead(initial: ConcurrencyLimits) {
     validateLimits(next);
     limits = { ...next };
     pump();
+    // A waiter whose hook declined its slot leaves nothing to release, so
+    // a drain that was waiting only on the queue is settled here.
+    notifyDrainWaiters();
   };
 
   return { tryAcquire, acquire, stats, applyLimits, close, drain };

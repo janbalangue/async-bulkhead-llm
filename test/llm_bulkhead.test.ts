@@ -1819,8 +1819,12 @@ describe("stats()", () => {
     expect(rejected.ok).toBe(false);
     if (!rejected.ok) expect(rejected.reason).toBe("budget_limit");
 
+    // The second call fails the token precheck, because the first call's
+    // reservation is made in the same step that grants its slot. It never
+    // takes a concurrency slot, so the base bulkhead does not count it.
     const s = b.stats();
-    expect(s.bulkhead.totalAdmitted).toBe(2);
+    expect(s.bulkhead.totalAdmitted).toBe(1);
+    expect(s.bulkhead.rejected).toBe(0);
     expect(s.llm.admitted).toBe(1);
     expect(s.llm.rejected).toBe(1);
     expect(s.llm.rejectedByReason.budget_limit).toBe(1);

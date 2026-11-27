@@ -636,11 +636,12 @@ export type LLMEventMap = {
    * are integer nanoseconds measured with Node's monotonic
    * `process.hrtime.bigint()` clock.
    *
-   * `queueWaitNs` is the complete span spent awaiting the underlying
-   * concurrency acquire. `decisionDurationNs` excludes that await and measures
-   * synchronous admission work, including acquire-option normalization,
-   * precheck, postcheck, revision capture, admission id creation, and token
-   * wrapping.
+   * `queueWaitNs` is the span spent waiting for the underlying concurrency
+   * slot, and ends when the slot is granted. `decisionDurationNs` excludes
+   * that wait and measures admission work, including acquire-option
+   * normalization, precheck, postcheck, revision capture, admission id
+   * creation, and token wrapping. The postcheck and revision capture run in
+   * the same synchronous step that grants the slot.
    */
   admit: {
     request: LLMRequest;
@@ -705,9 +706,8 @@ export type LLMEventMap = {
    * - precheck reject: `queueWaitNs === 0`; decision time is the precheck span
    * - acquire reject / timeout: full acquire await + synchronous precheck,
    *   acquire-option normalization, and reject-detail work
-   * - postcheck reject: full acquire await + synchronous precheck,
-   *   acquire-option normalization, postcheck, acquired-slot cleanup, and
-   *   reject-detail work
+   * - postcheck reject: wait until the slot is granted + precheck,
+   *   acquire-option normalization, postcheck, and reject-detail work
    */
   reject: {
     request: LLMRequest;
