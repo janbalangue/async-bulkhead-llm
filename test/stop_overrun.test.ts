@@ -144,6 +144,43 @@ describe("stop on overrun: the allowance of one call", () => {
     await expect(call.promise).resolves.toBe("done");
   });
 
+  it("does not stop a call for a safety margin larger than its reservation", async () => {
+    const b = bulkhead(10_000);
+    setStop(b, { overrunAllowanceTokens: 0 });
+    const events = stopEvents(b);
+    // 2 input + 100 output = 102 reserved, less than the margin below.
+    const call = await start(b, {
+      reservation: { input: 2, maxOutput: 100 },
+    });
+
+    const report = call.ctx.reportUsage(
+      { input: 2, output: 0 },
+      { remainingOutputTokens: 100, safetyMarginTokens: 256 },
+    );
+
+    // The margin keeps back the whole reservation and nothing more, so the
+    // call, which used 2 tokens, is not over anything.
+    expect(report.held).toBe(102);
+    expect(report.stopped).toBeUndefined();
+    expect(call.signal!.aborted).toBe(false);
+    expect(await stillRunning(call)).toBe(true);
+    expect(events).toHaveLength(0);
+    expect(b.stats().tokenBudget!.totalOverrun).toBe(0);
+
+    // Output beyond the reserved cap is still overrun, margin or not.
+    const beyondCap = call.ctx.reportUsage(
+      { input: 2, output: 101 },
+      { remainingOutputTokens: 0, safetyMarginTokens: 256 },
+    );
+    expect(beyondCap).toMatchObject({ held: 103, stopped: true });
+    await expectStopped(call, "overrun");
+    expect(events).toHaveLength(1);
+
+    call.finish();
+    await settle();
+    expect(b.stats().tokenBudget!.inFlightTokens).toBe(0);
+  });
+
   it("stops the call one token above the allowance", async () => {
     const b = bulkhead(10_000);
     setStop(b, { overrunAllowanceTokens: 100 });

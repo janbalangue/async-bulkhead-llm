@@ -1,6 +1,6 @@
 {
   "name": "async-bulkhead-llm",
-  "version": "3.18.2",
+  "version": "3.19.0",
   "description": "Fail-fast admission control for LLM workloads built on async-bulkhead-ts.",
   "license": "Apache-2.0",
   "author": "Jan Balangue",
@@ -42,7 +42,7 @@
     "CHANGELOG.md"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "build:esm": "tsc -p tsconfig.esm.json",
@@ -55,13 +55,14 @@
     "prepack": "npm run build",
     "lint": "eslint . --max-warnings=0",
     "lint:fix": "eslint . --fix",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest",
-    "prepublishOnly": "npm run lint && npm run build && npm run test:run && npm run test:coverage && npm run smoke",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm run build && npm run test:run && npm run test:coverage && npm run smoke",
     "test:run": "vitest run",
     "test:coverage": "vitest run --coverage",
     "smoke": "node --input-type=module -e \"await import('./dist/esm/index.js')\" && node -e \"require('./dist/cjs/index.cjs')\" && node --input-type=module -e \"import { readFileSync } from 'node:fs'; const js = readFileSync('./dist/cjs/index.cjs', 'utf8'); const map = JSON.parse(readFileSync('./dist/cjs/index.cjs.map', 'utf8')); if (!js.includes('sourceMappingURL=index.cjs.map')) throw new Error('bad CJS sourceMappingURL'); if (map.file !== 'index.cjs') throw new Error('bad CJS sourcemap file');\"",
     "pack:check": "npm pack --dry-run",
-    "release:check": "npm run lint && npm run build && npm run test:run && npm run test:coverage && npm run smoke && npm run docs && npm run pack:check"
+    "release:check": "npm run lint && npm run typecheck && npm run build && npm run test:run && npm run test:coverage && npm run smoke && npm run docs && npm run pack:check"
   },
   "dependencies": {
     "async-bulkhead-ts": "^1.0.1"

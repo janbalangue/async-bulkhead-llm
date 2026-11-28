@@ -51,8 +51,15 @@ const report = ctx!.reportUsage(
 The progressive hold is:
 
 ```text
-remainingOutputTokens + safetyMarginTokens + output overrun
+min(remainingOutputTokens + safetyMarginTokens, reservation) + output overrun
 ```
+
+The safety margin keeps back tokens the call already reserved, so the first
+two terms together never exceed the call's reservation. A fixed margin that is
+larger than a small request's reservation holds that whole reservation and no
+more; it is not counted as overrun and cannot trigger an overrun stop. Only
+output beyond the reserved output cap raises a progressive hold above the
+reservation.
 
 This lets processed input and already-generated output stop occupying the
 in-flight budget. The caller must use the option only after prefill is known

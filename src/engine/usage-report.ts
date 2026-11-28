@@ -84,6 +84,12 @@ export function usageChanged(
  * known complete: it holds the caller-declared future output plus an
  * explicit safety margin. Output beyond the configured cap is added
  * back as overrun protection.
+ *
+ * The declared future output and the margin together are capped at the
+ * call's reservation. The margin keeps back tokens the call already
+ * reserved; it is not a way to hold more than the call was admitted with.
+ * Only output beyond the cap can raise a progressive hold above the
+ * reservation, so only real usage counts as overrun.
  */
 export function holdAfterReport(
   parts: ReservationParts,
@@ -91,11 +97,15 @@ export function holdAfterReport(
   reconciliation: ProgressiveReconciliationOptions | undefined,
 ): number {
   const outputOverrun = Math.max(0, cell.reported!.output - parts.maxOutput);
-  return reconciliation === undefined
-    ? cell.reported!.input + Math.max(parts.maxOutput, cell.reported!.output)
-    : reconciliation.remainingOutputTokens +
-        (reconciliation.safetyMarginTokens ?? 0) +
-        outputOverrun;
+  if (reconciliation === undefined) {
+    return (
+      cell.reported!.input + Math.max(parts.maxOutput, cell.reported!.output)
+    );
+  }
+  const declared =
+    reconciliation.remainingOutputTokens +
+    (reconciliation.safetyMarginTokens ?? 0);
+  return Math.min(declared, parts.reserved) + outputOverrun;
 }
 
 /** Event fields that mark a report as a progressive reconciliation. */

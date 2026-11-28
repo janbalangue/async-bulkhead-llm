@@ -10,6 +10,26 @@ cover what changes if you assert exact object shapes.
 For the full per-release record, see the
 [changelog](../CHANGELOG.md).
 
+## v3.18 → v3.19
+
+The minimum Node.js version is now 22. Node.js 20 reached end-of-life on
+2026-04-30 and is no longer tested. With `engine-strict` set, npm refuses to
+install 3.19 on Node.js 20; otherwise it warns.
+
+No call-site changes are required and the API surface is unchanged. Two
+results differ, for code that asserts exact token numbers or waits on
+`drain()`:
+
+- A progressive `reportUsage()` whose `remainingOutputTokens +
+  safetyMarginTokens` exceeds the call's reservation now holds the
+  reservation, not the sum. `UsageReport.held`, the `usage` event's
+  `heldTokens` and `deltaTokens`, `inFlightTokens`, and `totalOverrun` no
+  longer include the excess, and the excess no longer triggers an overrun
+  stop. The event's `safetyMarginTokens` is still the value you passed.
+- A `drain()` that was waiting while calls were queued behind
+  `maxConcurrent: 0` now resolves when the last of those calls times out or
+  is aborted. It used to stay pending although the bulkhead was idle.
+
 ## v3.17 → v3.18
 
 No call-site changes are required, and nothing is stopped unless you opt in.

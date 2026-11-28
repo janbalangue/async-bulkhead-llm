@@ -57,7 +57,7 @@ underneath all of them and answers a different question. See
 npm install async-bulkhead-llm
 ```
 
-Node.js 20+. ESM and CommonJS. TypeScript types included. One dependency
+Node.js 22+. ESM and CommonJS. TypeScript types included. One dependency
 ([`async-bulkhead-ts`](https://github.com/janbalangue/async-bulkhead-ts)).
 
 ## Quick start
@@ -284,7 +284,7 @@ also retried would defeat its own purpose.
 
 ## Compatibility
 
-- **Node.js:** 20+
+- **Node.js:** 22+
 - **Module formats:** ESM and CommonJS
 - **Types:** shipped, generated from source
 - **Public API:** only the package entry point. Deep imports into `src/`

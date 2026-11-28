@@ -7,6 +7,124 @@ and adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.19.0] - 2026-11-27
+
+Raises the minimum Node.js version to 22, which is why this is a minor
+release, and fixes three bugs: in progressive reconciliation, in the
+admission queue, and in `drain()`. No public API or dependency changed.
+
+### Fixed
+
+* **A progressive safety margin could raise a hold above the call's
+  reservation.** `reportUsage(usage, { remainingOutputTokens,
+  safetyMarginTokens })` held the two values added together, whatever the
+  call had reserved. A call that reserved 102 tokens and reported 2 used,
+  with `remainingOutputTokens: 100` and `safetyMarginTokens: 256`, held 356.
+  The 254 tokens above its reservation were counted in `totalOverrun` and
+  taken from the budget other calls are admitted against, and under
+  `stop.overrunAllowanceTokens: 0` the call was stopped with cause
+  `"overrun"` although it had used nothing beyond its reservation. A fixed
+  margin runs into this on every request whose reservation is smaller than
+  the margin.
+
+  The declared future output plus the margin is now capped at the call's
+  reservation. The progressive hold is
+  `min(remainingOutputTokens + safetyMarginTokens, reservation) + output overrun`.
+  Output beyond the reserved output cap still raises the hold and still
+  counts as overrun. A report whose two values fit inside the reservation
+  holds what it held before. On the `usage` event, `safetyMarginTokens`
+  remains the value the caller passed and `heldTokens` is the hold after the
+  cap.
+
+* **Queue waiters that gave up stayed in memory until the next release.** A
+  queued call that was aborted or timed out got its answer at once, but its
+  entry stayed in the queue until every waiter ahead of it had been served,
+  and the entry kept the caller's request reachable. While every slot was
+  held by a long call, each abandoned wait therefore left its request in
+  memory until one of those calls finished: with one slot held and 2,000
+  queued calls aborted behind it, none of the 2,000 requests could be
+  garbage-collected before the slot was released. The same held for queue
+  timeouts.
+
+  A waiter now leaves the queue the moment it settles, wherever it stands,
+  so the queue holds only the calls still waiting. Only a bulkhead with
+  `maxQueue` above 0 queues calls, so only those were affected. Admission
+  order, results, stats, and events are unchanged.
+
+* **`drain()` could stay pending on an idle bulkhead.** Lowering
+  `maxConcurrent` to 0 keeps accepted waiters queued, so the queue can
+  outlive the work in flight. If a `drain()` was waiting at that point and
+  the last waiter then timed out or was aborted, nothing was in flight and
+  nothing was pending, but the promise never resolved: a drain was woken
+  only by a release, a limits update, or `close()`, and none of those
+  followed. A `drain({ timeoutMs })` in the same position ran to its
+  deadline and reported `drained: false` with `inFlight: 0` and
+  `pending: 0`.
+
+  A waiter that leaves the queue without a slot now wakes the drains that
+  were waiting, and they resolve if the bulkhead is idle. A drain still
+  waits for the other waiters in line and for work in flight.
+
+### Changed
+
+* **Node.js 22 is now the minimum.** `engines.node` moves from `>=20` to
+  `>=22`, and CI runs on Node.js 22 and 24. Node.js 20 reached end-of-life
+  on 2026-04-30. No source change depends on the newer runtime; the package
+  is no longer tested on Node.js 20.
+
+* **The tests are type-checked.** `npm run typecheck` runs `tsc --noEmit`
+  over `src` and `test`. It is part of CI, `release:check`, and
+  `prepublishOnly`. Until now nothing checked the types of the tests: Vitest
+  runs them without checking, and the build compiles only `src`. The one
+  error it found is fixed: `test/same_tick_admission.test.ts` read
+  `detail.constraint` on a rejection without allowing for a missing
+  `detail`.
+
+### Added
+
+* **Safety-margin tests.** Two tests in `test/gateway_features.test.ts`
+  cover the cap, the hold below the cap, the `usage` event, and real output
+  overrun above a capped hold. One in `test/stop_overrun.test.ts` covers a
+  margin larger than the reservation under `overrunAllowanceTokens: 0`. All
+  three fail on 3.18.2.
+
+* **Queue-waiter tests.** `test/queue_waiter_release.test.ts` collects
+  garbage while the slot is still held and checks that the requests of
+  aborted and of timed-out waiters are gone; both tests fail on 3.18.2. Four
+  more check arrival order after the first, a middle, and the last waiter
+  left, the queue place each departure frees, and `close()` with departed
+  waiters.
+
+* **Drain tests.** `test/drain_after_waiter_leaves.test.ts` covers a waiter
+  that times out or is aborted behind a zero limit, a bounded drain in the
+  same position, several drains waiting at once, and the cases where a
+  drain must keep waiting: another waiter in line, work in flight, and
+  capacity that comes back. Five of the seven tests fail on 3.18.2.
+
+* **Updated the security support matrix.** `SECURITY.md` now identifies
+  3.19.0 as the only supported release.
+
+### Compatibility
+
+* Node.js 20 is no longer supported. With `engine-strict` set, npm refuses
+  to install this release there; otherwise it warns.
+* Two results differ from 3.18.2. A progressive report whose
+  `remainingOutputTokens + safetyMarginTokens` exceeds the call's
+  reservation no longer includes the excess in `UsageReport.held`, in the
+  `usage` event's `heldTokens` and `deltaTokens`, in `inFlightTokens`, or in
+  `totalOverrun` (pool and class), and that excess no longer triggers an
+  overrun stop. And a `drain()` that was left pending on an idle bulkhead
+  now resolves.
+* The queue change was checked by driving the 3.18.2 build and this build
+  with the same 3,000 seeded random scenarios of 150 steps each: calls with
+  and without abort signals and queue timeouts, releases, usage reports,
+  limit changes down to zero concurrency, admission classes, and token
+  budgets. Every result, rejection detail, event, and `stats()` snapshot
+  matched.
+* The runtime dependency remains `async-bulkhead-ts@^1.0.1`.
+
+---
+
 ## [3.18.2] - 2026-11-26
 
 Bug-fix release for admission classes. No public API or dependency changed.

@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 22, 24]
+        node: [22, 24]
 
     steps:
       - name: Checkout
@@ -33,6 +33,11 @@ jobs:
 
       - name: Lint
         run: npm run lint
+
+      # Type-checks src and test together. Vitest runs tests without checking
+      # their types, and the build only compiles src.
+      - name: Typecheck
+        run: npm run typecheck
 
       - name: Test
         run: npm test

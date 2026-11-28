@@ -34,52 +34,57 @@ export type GrantHook = () => boolean;
 type Waiter = {
   resolve: (result: AcquireResult) => void;
   onGrant: GrantHook | undefined;
-  cancelled: boolean;
   settled: boolean;
   abortListener: (() => void) | undefined;
   timeoutId: ReturnType<typeof setTimeout> | undefined;
+  /** True while the waiter stands in the waiting line. */
+  inLine: boolean;
+  /** Neighbors in the waiting line; both unset once the waiter left it. */
+  ahead: Waiter | undefined;
+  behind: Waiter | undefined;
 };
 
-class RingDeque<T> {
-  private buffer: Array<T | undefined>;
-  private head = 0;
-  private size = 0;
+/**
+ * The waiters still waiting for a slot, oldest first.
+ *
+ * A waiter leaves the line the moment it settles, wherever it stands: at
+ * the front when it is granted a slot, anywhere when it is aborted or times
+ * out. The line therefore never holds more than the live waiters, and a
+ * waiter that gave up is not kept reachable (with its grant hook and
+ * everything that hook closes over, the caller's request included) until
+ * the waiters ahead of it have been served. Joining, leaving and taking
+ * the first waiter are all constant-time.
+ */
+class WaitingLine {
+  private first: Waiter | undefined;
+  private last: Waiter | undefined;
 
-  constructor(capacity: number) {
-    this.buffer = new Array(Math.max(4, capacity | 0));
+  join(waiter: Waiter): void {
+    waiter.inLine = true;
+    waiter.ahead = this.last;
+    if (this.last === undefined) this.first = waiter;
+    else this.last.behind = waiter;
+    this.last = waiter;
   }
 
-  get length(): number {
-    return this.size;
+  /** Remove and return the oldest waiter, if any. */
+  takeFirst(): Waiter | undefined {
+    const waiter = this.first;
+    if (waiter !== undefined) this.leave(waiter);
+    return waiter;
   }
 
-  pushBack(item: T): void {
-    if (this.size === this.buffer.length) this.grow();
-    const index = (this.head + this.size) % this.buffer.length;
-    this.buffer[index] = item;
-    this.size++;
-  }
-
-  peekFront(): T | undefined {
-    return this.size === 0 ? undefined : this.buffer[this.head];
-  }
-
-  popFront(): T | undefined {
-    if (this.size === 0) return undefined;
-    const item = this.buffer[this.head];
-    this.buffer[this.head] = undefined;
-    this.head = (this.head + 1) % this.buffer.length;
-    this.size--;
-    return item;
-  }
-
-  private grow(): void {
-    const next = new Array<T | undefined>(this.buffer.length * 2);
-    for (let index = 0; index < this.size; index++) {
-      next[index] = this.buffer[(this.head + index) % this.buffer.length];
-    }
-    this.buffer = next;
-    this.head = 0;
+  /** Remove `waiter` wherever it stands. Does nothing if it is not in line. */
+  leave(waiter: Waiter): void {
+    if (!waiter.inLine) return;
+    waiter.inLine = false;
+    const { ahead, behind } = waiter;
+    if (ahead === undefined) this.first = behind;
+    else ahead.behind = behind;
+    if (behind === undefined) this.last = ahead;
+    else behind.ahead = ahead;
+    waiter.ahead = undefined;
+    waiter.behind = undefined;
   }
 }
 
@@ -99,7 +104,7 @@ export function createReconfigurableBulkhead(initial: ConcurrencyLimits) {
   let inFlight = 0;
   let closed = false;
   let livePending = 0;
-  const queue = new RingDeque<Waiter>(initial.maxQueue + 1);
+  const line = new WaitingLine();
   let drainWaiters: Array<() => void> = [];
 
   let totalAdmitted = 0;
@@ -121,27 +126,23 @@ export function createReconfigurableBulkhead(initial: ConcurrencyLimits) {
     waiter.timeoutId = undefined;
   };
 
+  /**
+   * Give a waiter its answer, once. Whatever the answer is, the waiter
+   * leaves the line here, so nothing keeps it after it has settled.
+   */
   const settle = (waiter: Waiter, result: AcquireResult): void => {
     if (waiter.settled) return;
     waiter.settled = true;
-    if (!waiter.cancelled && !result.ok) waiter.cancelled = true;
+    line.leave(waiter);
     cleanupWaiter(waiter);
     livePending--;
     if (result.ok) totalAdmitted++;
     else bumpRejectReason(result.reason);
     waiter.resolve(result);
-  };
-
-  const pruneCancelledFront = (): void => {
-    while (queue.length > 0) {
-      const waiter = queue.peekFront();
-      if (waiter === undefined) return;
-      if (waiter.cancelled || waiter.settled) {
-        queue.popFront();
-        continue;
-      }
-      return;
-    }
+    // A waiter that leaves without a slot can be the last thing a drain was
+    // waiting for. With `maxConcurrent` lowered to 0 the line outlives the
+    // in-flight work, so no release follows that would wake the drain.
+    if (!result.ok) notifyDrainWaiters();
   };
 
   const notifyDrainWaiters = (): void => {
@@ -197,15 +198,11 @@ export function createReconfigurableBulkhead(initial: ConcurrencyLimits) {
     return declinedToken;
   };
 
+  /** Hand free slots to the oldest waiters. Everyone in line is live. */
   const pump = (): void => {
-    pruneCancelledFront();
-    while (inFlight < limits.maxConcurrent && queue.length > 0) {
-      const waiter = queue.popFront();
+    while (inFlight < limits.maxConcurrent) {
+      const waiter = line.takeFirst();
       if (waiter === undefined) break;
-      if (waiter.cancelled || waiter.settled) {
-        pruneCancelledFront();
-        continue;
-      }
       settle(waiter, { ok: true, token: grant(waiter.onGrant) });
     }
   };
@@ -253,10 +250,12 @@ export function createReconfigurableBulkhead(initial: ConcurrencyLimits) {
       const waiter: Waiter = {
         resolve,
         onGrant,
-        cancelled: false,
         settled: false,
         abortListener: undefined,
         timeoutId: undefined,
+        inLine: false,
+        ahead: undefined,
+        behind: undefined,
       };
       livePending++;
 
@@ -266,7 +265,6 @@ export function createReconfigurableBulkhead(initial: ConcurrencyLimits) {
           return;
         }
         const onAbort = (): void => {
-          waiter.cancelled = true;
           settle(waiter, { ok: false, reason: "aborted" });
         };
         options.signal.addEventListener("abort", onAbort, { once: true });
@@ -280,12 +278,11 @@ export function createReconfigurableBulkhead(initial: ConcurrencyLimits) {
           return;
         }
         waiter.timeoutId = setTimeout(() => {
-          waiter.cancelled = true;
           settle(waiter, { ok: false, reason: "timeout" });
         }, options.timeoutMs);
       }
 
-      queue.pushBack(waiter);
+      line.join(waiter);
       if (inFlight < limits.maxConcurrent) pump();
     });
   };
@@ -293,9 +290,11 @@ export function createReconfigurableBulkhead(initial: ConcurrencyLimits) {
   const close = (): void => {
     if (closed) return;
     closed = true;
-    while (queue.length > 0) {
-      const waiter = queue.popFront();
-      if (waiter === undefined || waiter.settled || waiter.cancelled) continue;
+    for (
+      let waiter = line.takeFirst();
+      waiter !== undefined;
+      waiter = line.takeFirst()
+    ) {
       settle(waiter, { ok: false, reason: "shutdown" });
     }
     notifyDrainWaiters();

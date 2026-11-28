@@ -37,7 +37,7 @@ function floored(maxConcurrent = 4, maxQueue = 0) {
 const outcome = (result: LLMAcquireResult): string =>
   result.ok
     ? "admitted"
-    : `${result.reason}/${result.detail.constraint ?? "none"}`;
+    : `${result.reason}/${result.detail?.constraint ?? "none"}`;
 
 function releaseAll(results: LLMAcquireResult[]): void {
   for (const result of results) {

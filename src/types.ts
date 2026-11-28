@@ -1060,6 +1060,11 @@ export type LLMBulkheadOptions = {
  * `remainingOutputTokens` represents the maximum future output still expected
  * for this active request. `safetyMarginTokens` retains extra headroom until
  * final release. Both values are non-negative safe integers.
+ *
+ * Together the two are capped at the call's reservation: the margin keeps
+ * back tokens the call already reserved, so it never makes a hold larger
+ * than what the call was admitted with. A margin larger than a small
+ * reservation holds the whole reservation and no more.
  */
 export type ProgressiveReconciliationOptions = {
   remainingOutputTokens: number;

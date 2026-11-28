@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   createLLMBulkhead,
   LLMBulkheadRejectedError,
+  type LLMEventMap,
   type LLMRequest,
   type TokenEstimate,
 } from "../src/index.js";
@@ -611,6 +612,75 @@ describe("reportUsage — progressive reservation reconciliation", () => {
     expect(snap.held).toBe(300);
     expect(snap.overReservation).toBe(true);
     r.token.release({ input: 100, output: 1_200 });
+  });
+
+  it("caps future output plus the safety margin at the reservation", async () => {
+    const b = makeBulkhead(5_000);
+    const usageEvents: LLMEventMap["usage"][] = [];
+    b.on("usage", (event) => usageEvents.push(event));
+    // A small request: 2 input + 100 output = 102 reserved.
+    const r = await b.acquire(req(), {
+      reservation: { input: 2, maxOutput: 100 },
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+
+    // The margin alone is larger than everything the call reserved.
+    const snap = r.token.reportUsage(
+      { input: 2, output: 0 },
+      { remainingOutputTokens: 100, safetyMarginTokens: 256 },
+    );
+    expect(snap.held).toBe(102);
+    expect(snap.overReservation).toBe(false);
+    const held = b.stats().tokenBudget!;
+    expect(held.inFlightTokens).toBe(102);
+    expect(held.totalOverrun).toBe(0);
+
+    // The event states the margin the caller declared; `heldTokens` is the
+    // hold after the cap.
+    expect(usageEvents).toHaveLength(1);
+    expect(usageEvents[0]).toMatchObject({
+      reservedTokens: 102,
+      previousHeldTokens: 102,
+      heldTokens: 102,
+      deltaTokens: 0,
+      progressive: true,
+      remainingOutputTokens: 100,
+      safetyMarginTokens: 256,
+    });
+
+    // Below the cap the hold is the plain sum again.
+    const later = r.token.reportUsage(
+      { input: 2, output: 90 },
+      { remainingOutputTokens: 10, safetyMarginTokens: 50 },
+    );
+    expect(later.held).toBe(60);
+
+    r.token.release({ input: 2, output: 90 });
+    const settled = b.stats().tokenBudget!;
+    expect(settled.inFlightTokens).toBe(0);
+    expect(settled.totalOverrun).toBe(0);
+  });
+
+  it("adds real output overrun above a capped progressive hold", async () => {
+    const b = makeBulkhead(5_000);
+    const r = await b.acquire(req(), {
+      reservation: { input: 2, maxOutput: 100 },
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+
+    const snap = r.token.reportUsage(
+      { input: 2, output: 130 },
+      { remainingOutputTokens: 0, safetyMarginTokens: 256 },
+    );
+    // min(0 + 256, 102) + (130 - 100)
+    expect(snap.held).toBe(132);
+    expect(snap.overReservation).toBe(true);
+    expect(b.stats().tokenBudget!.totalOverrun).toBe(30);
+
+    r.token.release({ input: 2, output: 130 });
+    expect(b.stats().tokenBudget!.inFlightTokens).toBe(0);
   });
 
   it("rejects a remaining-output declaration above the reserved cap", async () => {
